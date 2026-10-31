@@ -2226,6 +2226,12 @@ L8c04f42a:;
   {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
+void f_8c04f436(SH4Ctx *c) {
+  { R(0)=0x0u; return; }
+}
+void f_8c04f43a(SH4Ctx *c) {
+  { R(0)=0x0u; return; }
+}
 void f_8c04f480(SH4Ctx *c) {
   { R(0)=0x0u; return; }
 }

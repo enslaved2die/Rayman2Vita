@@ -57,3 +57,10 @@
 8c07f8e0
 8c03b3e0
 8c03b5a0
+8c0d485e  # kmStartScene (spin on 8c2ed884 bit)
+8c0d476e  # render-done event handler (flip state machine)
+8c0dd860  # DMA queue start
+8c0dd5c0  # DMA start (SB_C2DST)
+8c0ec880  # ASIC event dispatch
+8c0dcf40  # Kamui ASIC ISR
+8c0f1420

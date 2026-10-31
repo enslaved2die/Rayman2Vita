@@ -1,5 +1,5 @@
 #include "runtime.h"
-#define SH4_NFUNCS 5702
+#define SH4_NFUNCS 5705
 void f_8c010000(SH4Ctx *c);
 void f_8c01000c(SH4Ctx *c);
 void f_8c010080(SH4Ctx *c);
@@ -1343,6 +1343,8 @@ void f_8c04f2a0(SH4Ctx *c);
 void f_8c04f340(SH4Ctx *c);
 void f_8c04f348(SH4Ctx *c);
 void f_8c04f3be(SH4Ctx *c);
+void f_8c04f436(SH4Ctx *c);
+void f_8c04f43a(SH4Ctx *c);
 void f_8c04f480(SH4Ctx *c);
 void f_8c04f484(SH4Ctx *c);
 void f_8c04f488(SH4Ctx *c);
@@ -5317,6 +5319,7 @@ void f_8c0e30f8(SH4Ctx *c);
 void f_8c0e3288(SH4Ctx *c);
 void f_8c0e3354(SH4Ctx *c);
 void f_8c0e3404(SH4Ctx *c);
+void f_8c0e35ec(SH4Ctx *c);
 void f_8c0e361c(SH4Ctx *c);
 void f_8c0e3854(SH4Ctx *c);
 void f_8c0e38ea(SH4Ctx *c);

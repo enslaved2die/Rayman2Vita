@@ -6,7 +6,9 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#if !defined(__vita__)
 #include <fenv.h>
+#endif
 
 #define SH4_RAM_SIZE   0x01000000u
 #define SH4_IMAGE_BASE 0x8C010000u
@@ -74,7 +76,15 @@ static inline void sh4_frchg(SH4Ctx *c) {
 }
 static inline void sh4_setfpscr(SH4Ctx *c, uint32_t v) {
     v &= 0x003FFFFFu;
+#if defined(__arm__)
+    uint32_t arm_fpscr;
+    __asm__ volatile("vmrs %0, fpscr" : "=r"(arm_fpscr));
+    arm_fpscr &= ~(3u << 22);
+    if ((v & SH4_FPSCR_RM) == 1) arm_fpscr |= (3u << 22);
+    __asm__ volatile("vmsr fpscr, %0" : : "r"(arm_fpscr));
+#elif !defined(__vita__)
     fesetround((v & SH4_FPSCR_RM) == 1 ? FE_TOWARDZERO : FE_TONEAREST);   /* RM=1: round to zero */
+#endif
     if ((v ^ c->fpscr) & SH4_FPSCR_FR) { for (int i = 0; i < 16; i++) { uint32_t x = c->fr[i]; c->fr[i] = c->xf[i]; c->xf[i] = x; } }
     c->fpscr = v;
 }

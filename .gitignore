@@ -3,6 +3,7 @@
 worktrees/
 transfer_for_cyberduck/
 build/
+build_vita/
 *.o
 *.a
 *.elf
@@ -23,3 +24,8 @@ tools/sh4recomp/tests/diff_host_gen_fix
 tools/sh4recomp/tests/fp_dump
 tools/sh4recomp/libr2recomp.a
 tools/sh4recomp/runtime.o
+
+# build outputs / local symlinks
+build_vita_*/
+.vitasdk
+assets

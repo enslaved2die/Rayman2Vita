@@ -59,6 +59,7 @@ extern unsigned long hle_frame_count;          /* number of kamui end-of-frame (
 uint64_t hle_time_us(void);                    /* host monotonic microseconds since boot */
 /* ta.c may register a callback at the guest "begin frame" and "end frame/flip" boundaries (Kamui 0x8C0D3AE0 / 0x8C0DFFE0). */
 void hle_set_frame_callbacks(void (*begin)(SH4Ctx *c), void (*end)(SH4Ctx *c));
+void hle_set_vblank_cb(void (*cb)(SH4Ctx *c));
 
 /* ---- store queue / DMA sinks (ta.c) ---- */
 /* boot.c implements the SQ buffers and `pref` flush: destination = QACR area bits | addr&0x03FFFFE0. System-RAM and VRAM destinations are
@@ -90,5 +91,6 @@ void hle_ta_init(void);                        /* hle/ta.c: SQ/TA packet parser,
 void hle_boot_init(SH4Ctx *c, const uint8_t *image, uint32_t len, const char *dcdata_root);
 int  hle_run_main(SH4Ctx *c);                  /* runs main under setjmp; returns 0 = returned, 1 = guest exit, 2 = fault/stop */
 void hle_stop(const char *why);                /* abort guest run from any hook (longjmp) */
+const char *hle_stop_reason(void);
 
 #endif

@@ -48,13 +48,13 @@ typedef struct TaState {
     uint8_t clamp_color;              /* tsp[21] [GAME] */
     uint8_t use_alpha;                /* tsp[20] [GAME] */
     uint8_t ignore_tex_alpha;         /* tsp[19] [DOC] */
-    uint8_t flip_v, flip_u;           /* tsp[18], tsp[17] [DOC] */
-    uint8_t clamp_v, clamp_u;         /* tsp[16], tsp[15] [DOC] */
+    uint8_t flip_v, flip_u;           /* tsp[17] = FlipV, tsp[18] = FlipU */
+    uint8_t clamp_v, clamp_u;         /* tsp[15] = ClampV, tsp[16] = ClampU */
     uint8_t filter;                   /* tsp[14:13]: 0 point 1 bilinear 2 trilinear-A 3 trilinear-B [DOC] */
     uint8_t super_sample;             /* tsp[12] [DOC] */
     uint8_t mip_adjust;               /* tsp[11:8] [DOC] */
     uint8_t shading;                  /* tsp[7:6]: 0 decal 1 modulate 2 decal-alpha 3 modulate-alpha [DOC] */
-    uint16_t tex_w, tex_h;            /* 8<<tsp[2:0] (U), 8<<tsp[5:3] (V) [DOC; low 6 bits written by game 0x8C0E0780] */
+    uint16_t tex_w, tex_h;            /* U/width = 8<<tsp[5:3], V/height = 8<<tsp[2:0] [PROVEN by the game's MENU.TEX surfaces; the earlier reading had them swapped] */
     /* TCW word */
     uint8_t mip_mapped, vq;           /* tcw[31], tcw[30] [DOC] */
     uint8_t pixel_format;             /* tcw[29:27]: 0 ARGB1555 1 RGB565 2 ARGB4444 3 YUV422 4 bump 5 pal4 6 pal8 [DOC] */
@@ -83,7 +83,9 @@ typedef struct TaStrip {
 } TaStrip;
 
 /* Modifier-volume triangle ([ASSUMED] packet layout). */
-typedef struct TaModTri { float v[3][3]; uint32_t ctl; uint32_t isp; uint8_t list; } TaModTri;
+/* vol = volume index inside the list: a volume ends after a triangle whose header ISP volume instruction (isp[31:29]) is 1 (inside last) or 2 (outside last);
+ * the game emits 51 'normal' (0) triangles and then one header with instruction 1 + 1 triangle per shadow cylinder [measured, Jail_10 / title demo]. */
+typedef struct TaModTri { float v[3][3]; uint32_t ctl; uint32_t isp; uint8_t list; uint32_t vol; } TaModTri;
 
 typedef struct TaStats {
     uint32_t chunks;                  /* 32-byte packets received */
@@ -99,6 +101,7 @@ typedef struct TaFrame {
     TaStrip *strips; uint32_t nstrips, capstrips;
     TaModTri *mods; uint32_t nmods, capmods;
     TaStats stats;
+    uint32_t shad_scale;              /* FPU_SHAD_SCALE (0xA05F8074) sampled when the frame is handed out: bit8 = 'intensity' (0 = scale applies), [7:0] = shadow scale/256 [DOC] */
 } TaFrame;
 
 typedef enum { TA_DEST_TAFIFO = 0, TA_DEST_YUV, TA_DEST_TEXTURE, TA_DEST_VRAM, TA_DEST_UNKNOWN } TaDest;
@@ -114,6 +117,7 @@ typedef struct TaCtx {
     int clip_rect[4];
     float last_face[4], last_face_off[4]; /* for intensity mode 2 [ASSUMED] */
     int cur_list; int strip_open; uint32_t strip_idx;
+    uint32_t mod_vol;                     /* running volume index within the current frame's modifier lists */
     uint32_t fifo_words[8]; int fifo_n;   /* word-wise FIFO writes */
     TaSinkFn sink; void *sink_user;
 } TaCtx;
@@ -169,6 +173,52 @@ typedef struct TaGl {
  * batches grouped by list in submission order. Modifier lists are not emitted (see TaFrame.mods). */
 int  ta_build_gl(const TaFrame *f, TaGl *out);
 void ta_gl_free(TaGl *g);
+/* Extended build: optional software culling (ISP cull modes 2/3 evaluated in screen space, y down: mode 2 drops triangles whose
+ * determinant (x1-x0)*(y2-y0)-(x2-x0)*(y1-y0) is negative (counter-clockwise on screen), mode 3 drops positive (clockwise); modes 0/1 keep all) and
+ * optional Sutherland-Hodgman clipping to the rectangle [clip_x0,clip_x1]x[clip_y0,clip_y1] done on the screen-linear quantities
+ * (x, y, 1/W, u/W, v/W, colours), which is exact for the PVR's interpolation model.  Triangles with a non-finite coordinate or 1/W <= 0 are dropped.
+ * Vertex alpha is adjusted to the TSP shading mode (modulate (1) = texture alpha only -> vertex alpha forced to 1) and use-alpha=0 forces 1. */
+typedef struct TaBuildOpts { int cull; int clip; float clip_x0, clip_y0, clip_x1, clip_y1; } TaBuildOpts;
+int  ta_build_gl_ex(const TaFrame *f, TaGl *out, const TaBuildOpts *o);
+/* Robust upper bound of "scene" 1/W: the largest vertex 1/W that is <= 64 * median 1/W (UI quads at z=512 and degenerate near-plane vertices are
+ * above it).  Depth is mapped zwin = 0.98 * invW / cut for invW <= cut and outliers are clamped to 0.995. [ASSUMED heuristic] */
+float ta_gl_depth_cut(const TaGl *g);
+
+/* ---- screen-space (x, y, 1/W) -> GL clip space with perspective-correct varyings ----
+ * The TA hands over already projected vertices: x,y in pixels, z = 1/W.  PVR interpolates 1/W, u/W, v/W linearly in screen space and divides per pixel.
+ * A GL pipeline does exactly that when each vertex has clip coordinate w_c = W (= 1/z): after the divide by w_c the screen position is
+ * recovered (x_c = x_ndc * W, y_c = y_ndc * W), 1/w_c is screen-linear and u,v are interpolated as (u/w_c)/(1/w_c) = (u/W)/(1/W).  Depth: the
+ * window depth is made linear in 1/W, zwin = s * invW (s = 0.98/cut, outliers clamped to 0.995), which with ndc_z = 2*zwin - 1 gives z_c = 2s - W: linear
+ * in W, so everything is expressed with a constant matrix on the position attribute (px,py,pz) = (x_ndc*W, y_ndc*W, W) (fixed-function GL pipelines that
+ * only take 3 position components cannot be fed a per-vertex w otherwise):  clip = (px, py, 2s - pz, pz).  Depth test GREATER then equals PVR "greater". */
+typedef struct TaClipVertex { float px, py, pz, u, v, r, g, b, a; } TaClipVertex;   /* 9 floats, tightly packed */
+void ta_gl_make_clip(const TaGlVertex *in, uint32_t n, float cut, TaClipVertex *out);
+void ta_gl_projection(float cut, float m[16]);   /* column-major 4x4: clip = M * (px,py,pz,1) */
+
+/* ---- texture decoding (PVR texture memory -> RGBA8888, R in the low byte) ---- */
+/* Environment the decoder needs besides VRAM: palette RAM (1024 words as at 0xA05F9000, may be NULL), PAL_RAM_CTRL (0xA05F8108), TEXT_CONTROL (0xA05F80E4). */
+typedef struct TaTexEnv { const uint32_t *pal; uint32_t pal_ctrl, text_control; } TaTexEnv;
+/* Texture size from TSP (U/width = 8<<tsp[5:3], V/height = 8<<tsp[2:0]). */
+void ta_tex_size(uint32_t tsp, int *w, int *h);
+/* Number of mip levels stored: 1 unless tcw[31] (then log2(w)+1, down to 1x1). Level 0 is the full size, level k is (w>>k)x(h>>k). */
+int  ta_tex_levels(uint32_t tcw, uint32_t tsp);
+/* Decode one level into rgba (size (w>>level)*(h>>level) words). `vram` is the PVR-order texture memory (linear, byte address = tcw[20:0]*8) of
+ * vram_size bytes; out-of-range reads give 0.  force_opaque sets alpha to 255 (TSP ignore-texture-alpha).  Returns 0, or -1 for unsupported (bump). */
+int  ta_tex_decode(const uint8_t *vram, uint32_t vram_size, uint32_t tcw, uint32_t tsp, const TaTexEnv *env, int level, int force_opaque, uint32_t *rgba);
+
+/* ---- fog (TSP fog control 0 = table lookup) ----
+ * FOG_DENSITY = mantissa[15:8]/128 * 2^(int8)[7:0]; z = clamp(invW * density, 1, 255.99); e = floor(log2 z); m = z*16/2^e - 16; idx = floor(m) + 16e (0..127);
+ * fog alpha = lerp(table[idx] >> 8, table[idx] & 255, frac(m)) / 255 (table entry: high byte = value at idx, low byte = value at idx+1 [PROVEN: entry n low byte == entry n+1 high byte in the game's table]).
+ * Result colour = lerp(colour, FOG_COL_RAM, alpha) [DOC; the formula follows the public PVR docs / emulators as remembered]. */
+float ta_fog_alpha(float inv_w, uint32_t fog_density, const uint32_t table[128]);
+
+/* ---- 16:9 mode (ta_hle.c) ---- the game's own "MODE 16/9" renders the scene with a wider FOV and squeezes all x by 1/k about x=320 (k patched to 4/3);
+ * renderers un-squeeze by mapping the 640x480 screen space onto the whole 16:9 display.  hle_ta_wide_active() = game currently in 16:9 mode (valid per frame). */
+void  hle_ta_wide_set(int on);       /* runtime preference: 1 = force the game's 16:9 mode (default), 0 = 4:3 */
+int   hle_ta_wide_pref(void);
+int   hle_ta_wide_active(void);
+float hle_ta_wide_k(void);
+
 /* Suggested draw order of list types: opaque, punch-through, translucent. Returns count (3). */
 int  ta_draw_order(int out_lists[3]);
 
