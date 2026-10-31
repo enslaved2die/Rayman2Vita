@@ -37,6 +37,7 @@ static void dma_sink(uint32_t dst, const uint8_t *src, uint32_t len) {
     for (uint32_t o = 0; o + 32 <= len; o += 32) ta_ext_write32(&tactx, dst + o, src + o);
 }
 
+#if !defined(__vita__)
 static void dump_binary(const TaFrame *f, unsigned long no) {
     FILE *o = fopen("build_hle/frame.bin", "wb"); if (!o) return;
     uint32_t hdr[4] = { 0x31465452u /* 'RTF1' */, f->nstrips, f->nverts, (uint32_t)no };
@@ -50,6 +51,7 @@ static void dump_binary(const TaFrame *f, unsigned long no) {
     fclose(o);
     o = fopen("build_hle/vram.bin", "wb"); if (o) { fwrite(hle_vram_ptr(), 1, 8u << 20, o); fclose(o); }
 }
+#endif
 
 static void on_startrender(SH4Ctx *c) {
     (void)c;
@@ -61,6 +63,7 @@ static void on_startrender(SH4Ctx *c) {
         hle_log("[ta] frame %lu: chunks=%u verts=%u strips=%u sprites=%u tris=%u mods=%u ends o/om/t/tm/p=%u/%u/%u/%u/%u warn(nohdr=%u unsup=%u badend=%u) sinks vram=%u yuv=%u tex=%u unk=%u",
                 ta_frames, t->chunks, t->verts, t->strips, t->sprites, t->tris_total, t->modtris, t->list_end[0], t->list_end[1], t->list_end[2], t->list_end[3], t->list_end[4],
                 t->warn_vertex_no_header, t->warn_unsupported, t->warn_bad_list_end, t->sink_vram, t->sink_yuv, t->sink_tex, t->sink_unknown);
+#if !defined(__vita__)
     const char *want = getenv("R2_FRAME");
     int pick = want ? (ta_frames == strtoul(want, 0, 10)) : (!dumped && t->verts > 0);
     if (pick && !dumped) {
@@ -70,6 +73,7 @@ static void on_startrender(SH4Ctx *c) {
         dump_binary(f, ta_frames);
         hle_log("[ta] dumped frame %lu -> build_hle/frame_menu.txt, build_hle/frame.bin, build_hle/vram.bin", ta_frames);
     }
+#endif
 #if defined(__vita__)
     vita_gl_render_frame(f);
     vita_gl_swap();

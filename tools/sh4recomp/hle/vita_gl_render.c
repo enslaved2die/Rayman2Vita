@@ -148,28 +148,30 @@ static GLuint decode_and_upload_texture(uint32_t tcw, uint32_t tsp) {
         }
     } else if (vq) {
         /* VQ texture */
-        if (vram_addr + 2048 > vram_limit) {
-            memset(s_decode_buf, 0, w * h * sizeof(uint32_t));
+        uint32_t o = 2048;
+        if (mip) {
+            for (uint32_t s = 1; s < w; s <<= 1) {
+                uint32_t half = s / 2;
+                o += (half == 0) ? 1 : (half * half);
+            }
+        }
+
+        uint32_t bw = (w + 1) / 2;
+        uint32_t bh = (h + 1) / 2;
+        uint32_t nblocks = bw * bh;
+
+        if (vram_addr + 2048 > vram_limit || vram_addr + o + nblocks > vram_limit) {
+            for (uint32_t i = 0; i < w * h; i++) {
+                s_decode_buf[i] = 0xFF808080u;
+            }
         } else {
             const uint16_t *book = (const uint16_t *)(vram + vram_addr);
-            uint32_t o = 2048;
-            if (mip) {
-                for (uint32_t s = 1; s < w; s <<= 1) {
-                    uint32_t half = s / 2;
-                    o += (half == 0) ? 1 : (half * half);
-                }
-            }
-
-            uint32_t bw = (w + 1) / 2;
-            uint32_t bh = (h + 1) / 2;
-            uint32_t nblocks = bw * bh;
-
-            const uint8_t *idx = (vram_addr + o + nblocks <= vram_limit) ? (vram + vram_addr + o) : NULL;
+            const uint8_t *idx = (const uint8_t *)(vram + vram_addr + o);
 
             for (uint32_t by = 0; by < bh; by++) {
                 for (uint32_t bx = 0; bx < bw; bx++) {
                     uint32_t tw_bidx = pvr_twiddle_rect_index(bx, by, bw, bh);
-                    uint8_t entry = (idx && tw_bidx < nblocks) ? idx[tw_bidx] : 0;
+                    uint8_t entry = (tw_bidx < nblocks) ? idx[tw_bidx] : 0;
                     const uint16_t *blk = &book[entry * 4];
 
                     uint32_t x0 = bx * 2;
@@ -195,24 +197,29 @@ static GLuint decode_and_upload_texture(uint32_t tcw, uint32_t tsp) {
             if (exp >= 0 && exp < 8) o = s_mip_offsets[exp];
         }
 
-        const uint16_t *src = (const uint16_t *)(vram + vram_addr + o);
-
-        if (nontw) {
-            /* Linear */
-            for (uint32_t y = 0; y < h; y++) {
-                for (uint32_t x = 0; x < w; x++) {
-                    uint32_t lin_idx = y * w + x;
-                    uint16_t raw = (vram_addr + o + (lin_idx + 1) * 2 <= vram_limit) ? src[lin_idx] : 0;
-                    s_decode_buf[lin_idx] = pvr_convert_pixel(raw, fmt);
-                }
+        uint32_t tex_bytes = w * h * 2;
+        if (vram_addr + o + tex_bytes > vram_limit) {
+            for (uint32_t i = 0; i < w * h; i++) {
+                s_decode_buf[i] = 0xFF808080u;
             }
         } else {
-            /* Twiddled */
-            for (uint32_t y = 0; y < h; y++) {
-                for (uint32_t x = 0; x < w; x++) {
-                    uint32_t tw_idx = pvr_twiddle_rect_index(x, y, w, h);
-                    uint16_t raw = (vram_addr + o + (tw_idx + 1) * 2 <= vram_limit) ? src[tw_idx] : 0;
-                    s_decode_buf[y * w + x] = pvr_convert_pixel(raw, fmt);
+            const uint16_t *src = (const uint16_t *)(vram + vram_addr + o);
+
+            if (nontw) {
+                /* Linear */
+                for (uint32_t y = 0; y < h; y++) {
+                    for (uint32_t x = 0; x < w; x++) {
+                        uint32_t lin_idx = y * w + x;
+                        s_decode_buf[lin_idx] = pvr_convert_pixel(src[lin_idx], fmt);
+                    }
+                }
+            } else {
+                /* Twiddled */
+                for (uint32_t y = 0; y < h; y++) {
+                    for (uint32_t x = 0; x < w; x++) {
+                        uint32_t tw_idx = pvr_twiddle_rect_index(x, y, w, h);
+                        s_decode_buf[y * w + x] = pvr_convert_pixel(src[tw_idx], fmt);
+                    }
                 }
             }
         }
@@ -258,17 +265,30 @@ GLuint vita_gl_get_or_create_texture(uint32_t tcw, uint32_t tsp) {
         uint32_t idx = (h + i) & TEX_CACHE_MASK;
         if (!s_tex_cache[idx].used) {
             GLuint tid = decode_and_upload_texture(tcw, tsp);
-            s_tex_cache[idx].tcw = tcw;
-            s_tex_cache[idx].tsp = tsp;
-            s_tex_cache[idx].tex_id = tid;
-            s_tex_cache[idx].used = 1;
+            if (tid != 0) {
+                s_tex_cache[idx].tcw = tcw;
+                s_tex_cache[idx].tsp = tsp;
+                s_tex_cache[idx].tex_id = tid;
+                s_tex_cache[idx].used = 1;
+            }
             return tid;
         }
         if (s_tex_cache[idx].tcw == tcw && s_tex_cache[idx].tsp == tsp) {
             return s_tex_cache[idx].tex_id;
         }
     }
-    return decode_and_upload_texture(tcw, tsp);
+
+    /* Cache is full: evict entry at bucket h */
+    uint32_t rep = h & TEX_CACHE_MASK;
+    if (s_tex_cache[rep].used && s_tex_cache[rep].tex_id != 0) {
+        glDeleteTextures(1, &s_tex_cache[rep].tex_id);
+    }
+    GLuint tid = decode_and_upload_texture(tcw, tsp);
+    s_tex_cache[rep].tcw = tcw;
+    s_tex_cache[rep].tsp = tsp;
+    s_tex_cache[rep].tex_id = tid;
+    s_tex_cache[rep].used = (tid != 0);
+    return tid;
 }
 
 void vita_gl_texture_cache_clear(void) {
@@ -293,6 +313,9 @@ void vita_gl_render_init(void) {
     vglInitExtended(8 * 1024 * 1024, 960, 544, 16 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
     glViewport(0, 0, 960, 544);
     glClearColor(0.2f, 0.3f, 0.5f, 1.0f);
+    glClearDepthf(0.0f);
+    glDepthMask(GL_TRUE);
+    glDepthRangef(0.0f, 1.0f);
 
     vita_gl_texture_cache_clear();
 
@@ -344,14 +367,18 @@ void vita_gl_render_frame(const TaFrame *frame) {
         return;
     }
 
-    /* Frame clear */
+    /* Frame clear: inverted depth (0.0 is farthest depth in Dreamcast PowerVR2) */
     glDepthMask(GL_TRUE);
+    glClearDepthf(0.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    /* Setup Ortho/screen projection */
+    /* Setup Ortho/screen projection:
+     * Screen space X in [0, 640], Y in [0, 480].
+     * Near = 0.0f, Far = -1.0f maps Z in [0, 1] to z_win in [0, 1].
+     */
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(0.0f, 640.0f, 480.0f, 0.0f, -10000.0f, 10000.0f);
+    glOrtho(0.0f, 640.0f, 480.0f, 0.0f, 0.0f, -1.0f);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
@@ -394,31 +421,46 @@ void vita_gl_render_frame(const TaFrame *frame) {
 
             /* Set depth mask / depth func based on batch->st.depth_mode and batch->st.z_write_disable */
             glEnable(GL_DEPTH_TEST);
-            glDepthFunc(s_gl_depth_funcs[batch->st.depth_mode & 7]);
+            if (batch->st.depth_mode == 0 || batch->st.depth_mode == 7) {
+                glDepthFunc(GL_ALWAYS);
+            } else {
+                glDepthFunc(s_gl_depth_funcs[batch->st.depth_mode & 7]);
+            }
             glDepthMask(batch->st.z_write_disable ? GL_FALSE : GL_TRUE);
 
-            /* Set blending for translucent batches */
+            /* Set blending & alpha testing */
             if (list_id == TA_L_TRANS) {
                 glEnable(GL_BLEND);
-                glBlendFunc(s_gl_src_blend[batch->st.src_blend & 7],
-                            s_gl_dst_blend[batch->st.dst_blend & 7]);
+                GLenum src = s_gl_src_blend[batch->st.src_blend & 7];
+                GLenum dst = s_gl_dst_blend[batch->st.dst_blend & 7];
+                if (src == GL_ZERO && dst == GL_ZERO) {
+                    src = GL_SRC_ALPHA;
+                    dst = GL_ONE_MINUS_SRC_ALPHA;
+                }
+                glBlendFunc(src, dst);
                 glDisable(GL_ALPHA_TEST);
             } else if (list_id == TA_L_PUNCH) {
-                glDisable(GL_BLEND);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 glEnable(GL_ALPHA_TEST);
-                glAlphaFunc(GL_GREATER, 0.5f);
+                glAlphaFunc(GL_GREATER, 0.1f);
             } else {
+                /* TA_L_OPAQUE */
                 glDisable(GL_BLEND);
                 glDisable(GL_ALPHA_TEST);
             }
 
             /* If batch->st.textured, bind the decoded GL texture; else glDisable(GL_TEXTURE_2D) */
             if (batch->st.textured) {
-                glEnable(GL_TEXTURE_2D);
                 GLuint tex_id = vita_gl_get_or_create_texture(batch->st.tcw, batch->st.tsp);
-                glBindTexture(GL_TEXTURE_2D, tex_id);
-                glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE,
-                          (batch->st.shading == 0) ? GL_DECAL : GL_MODULATE);
+                if (tex_id != 0) {
+                    glEnable(GL_TEXTURE_2D);
+                    glBindTexture(GL_TEXTURE_2D, tex_id);
+                    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE,
+                              (batch->st.shading == 0) ? GL_DECAL : GL_MODULATE);
+                } else {
+                    glDisable(GL_TEXTURE_2D);
+                }
             } else {
                 glDisable(GL_TEXTURE_2D);
             }
