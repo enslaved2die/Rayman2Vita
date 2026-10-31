@@ -1,0 +1,59 @@
+# extra functions that get a hook stub (so run_game --spy ADDR works and hle_hook() can later target them)
+8c0128be  # FileMng open
+8c012b02  # FileMng async read
+8c012b60  # FileMng poll
+8c012b78  # FileMng blocking read
+8c012acc  # FileMng close
+8c0429d2  # DirMng lookup
+8c0423c0
+8c0427c0
+8c042b96
+8c042ea0
+8c080920  # AsyncFile
+8c080a20
+8c080b60
+8c080b96
+8c0199c4  # calloc wrapper(size, file, line)
+8c0d06a2  # malloc thunk
+8c013b52  # boot sequence
+8c04b750  # frame function
+8c011650
+8c0386e0
+8c03a782
+8c0382dc
+8c098776  # sound init
+8c0635d6
+8c09c524  # strcmp
+8c082fa0  # get text by index
+8c0d06ac
+8c0d0770
+8c0d077a
+8c0d06b6
+8c0d0784
+8c0d45a6
+8c0d4540
+8c0d4676
+8c0e3e08
+8c0d030e
+8c0ccca0
+8c0d3fc0
+8c0dbc80
+8c0d394e
+8c0dcf40
+8c0d4ec0
+8c0d4b40
+8c0dffe0
+8c0ec880
+8c0dd860
+8c0dd5c0
+8c0dd9a0
+8c0d6a00
+8c0d6ac0
+8c039e00
+8c03a5aa
+8c039f80
+8c03a1c0
+8c038e44
+8c07f8e0
+8c03b3e0
+8c03b5a0

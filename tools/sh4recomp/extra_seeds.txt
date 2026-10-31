@@ -1,0 +1,20 @@
+# Mid-function entry points reached by computed jumps / function-pointer calls (found by run_game "unresolved call target").
+# Added as non-truncating duplicate windows by sh4lift.py --extra-seeds.
+# 0x8C09C338/0x8C09C344: unrolled word-copy (Duff's device); the entry points are every 4-byte step of the unrolled body
+8c09c356
+8c09c35a
+8c09c35e
+8c09c362
+8c09c366
+8c09c36a
+8c09c36e
+8c09c372
+8c09c376
+8c09c37a
+8c09c37e
+8c09c382
+8c09c386
+8c09c38a
+8c09c38e
+8c09c392
+8c09c394
