@@ -137,7 +137,9 @@ static hle_pref_fn pref_fn;
 void hle_set_pref_handler(hle_pref_fn fn) { pref_fn = fn; }
 void sh4_pref(SH4Ctx *c, uint32_t addr) { if (pref_fn) pref_fn(c, addr); }
 static void (*cb_begin)(SH4Ctx *), (*cb_end)(SH4Ctx *);
+static void (*cb_vblank)(SH4Ctx *);
 void hle_set_frame_callbacks(void (*b)(SH4Ctx *), void (*e)(SH4Ctx *)) { cb_begin = b; cb_end = e; }
+void hle_set_vblank_cb(void (*cb)(SH4Ctx *)) { cb_vblank = cb; }
 
 /* unhandled accesses: first occurrence of every (addr, dir) logged with caller PR; counts kept for the summary */
 typedef struct { uint32_t addr; uint8_t wr; uint32_t n; uint32_t pr, last, val; } UEnt;
@@ -452,6 +454,7 @@ static int asic_flush_one(void) {
 }
 static void asic_flush_all(void) { while (asic_flush_one()) {} }
 static void deliver_vblank(SH4Ctx *c) {          /* paced 60 Hz VBlank-in, as the hardware would raise while the guest waits */
+    if (cb_vblank) cb_vblank(c);
     uint64_t t = now_ns(); uint32_t pr = c->pr;
     if (t < next_vb_ns) { struct timespec ts = {0, (long)(next_vb_ns - t)}; nanosleep(&ts, 0); t = now_ns(); }
     next_vb_ns = t + FRAME_NS; vb_delivered++;

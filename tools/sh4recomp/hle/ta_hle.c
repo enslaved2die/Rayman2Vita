@@ -11,6 +11,9 @@
 #include "hle_priv.h"
 #include "ta.h"
 #include "texmap.h"
+#if defined(__vita__)
+#include "vita_gl_render.h"
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -67,6 +70,10 @@ static void on_startrender(SH4Ctx *c) {
         dump_binary(f, ta_frames);
         hle_log("[ta] dumped frame %lu -> build_hle/frame_menu.txt, build_hle/frame.bin, build_hle/vram.bin", ta_frames);
     }
+#if defined(__vita__)
+    vita_gl_render_frame(f);
+    vita_gl_swap();
+#endif
     ta_frame_free(f);
 }
 

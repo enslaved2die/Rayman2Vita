@@ -1,0 +1,141 @@
+# ==============================================================================
+# Rayman 2: The Great Escape — PS Vita Port (Dreamcast SH-4 Recompilation)
+# ==============================================================================
+
+VITASDK         ?= $(abspath .vitasdk)
+CC              := $(VITASDK)/bin/arm-vita-eabi-gcc
+CXX             := $(VITASDK)/bin/arm-vita-eabi-g++
+VITA_ELF_CREATE := $(VITASDK)/bin/vita-elf-create
+VITA_MAKE_FSELF := $(VITASDK)/bin/vita-make-fself
+VITA_MKSFOEX    := $(VITASDK)/bin/vita-mksfoex
+VITA_PACK_VPK   := $(VITASDK)/bin/vita-pack-vpk
+
+TARGET          := rayman2_recomp
+TITLE_ID        := RAYM00002
+APP_TITLE       := "Rayman 2: The Great Escape (DC Recomp)"
+APP_VER         := 01.00
+
+BUILD_DIR       := build_vita
+RECOMP_DIR      := tools/sh4recomp
+HGEN            := $(RECOMP_DIR)/gen_fix
+HLE_DIR         := $(RECOMP_DIR)/hle
+
+CFLAGS          := -O2 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
+                   -fno-strict-aliasing \
+                   -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-label \
+                   -DCPA_PLATFORM_VITA -DR2_DREAMCAST_BASELINE -D__vita__ \
+                   -I$(RECOMP_DIR) -I$(HGEN) -I$(HLE_DIR)
+
+LDFLAGS         := -Wl,-q -L$(VITASDK)/arm-vita-eabi/lib
+
+LIBS            := -lvitaGL \
+                   -lvitashark \
+                   -lSceShaccCgExt \
+                   -lSceShaccCg_stub \
+                   -ltaihen_stub \
+                   -lSceGxm_stub \
+                   -lSceDisplay_stub \
+                   -lSceCtrl_stub \
+                   -lSceKernelDmacMgr_stub \
+                   -lSceCommonDialog_stub \
+                   -lSceAppMgr_stub \
+                   -lSceLibKernel_stub \
+                   -lSceKernelThreadMgr_stub \
+                   -lSceIofilemgr_stub \
+                   -lSceAudio_stub \
+                   -lmathneon \
+                   -lstdc++ \
+                   -lm
+
+# Generated recompilation translation units
+RECOMP_SRCS     := $(wildcard $(HGEN)/recomp_[0-9]*.c)
+RECOMP_OBJS     := $(patsubst $(HGEN)/recomp_%.c,$(BUILD_DIR)/recomp_%.o,$(RECOMP_SRCS))
+
+# HLE & Runtime Sources
+HLE_SRCS        := $(HLE_DIR)/boot.c \
+                   $(HLE_DIR)/dbg.c \
+                   $(HLE_DIR)/io.c \
+                   $(HLE_DIR)/pad.c \
+                   $(HLE_DIR)/ta.c \
+                   $(HLE_DIR)/ta_hle.c \
+                   $(HLE_DIR)/texmap.c \
+                   $(HLE_DIR)/vita_gl_render.c \
+                   $(HLE_DIR)/vita_main.c
+HLE_OBJS        := $(patsubst $(HLE_DIR)/%.c,$(BUILD_DIR)/hle_%.o,$(HLE_SRCS))
+
+COMMON_OBJS     := $(BUILD_DIR)/recomp_functab.o \
+                   $(BUILD_DIR)/runtime.o \
+                   $(BUILD_DIR)/hook_stubs.o
+
+ALL_OBJS        := $(RECOMP_OBJS) $(COMMON_OBJS) $(HLE_OBJS)
+
+ELF             := $(BUILD_DIR)/$(TARGET).elf
+VELF            := $(BUILD_DIR)/$(TARGET).velf
+EBOOT           := $(BUILD_DIR)/eboot.bin
+PARAM_SFO       := $(BUILD_DIR)/param.sfo
+VPK             := $(BUILD_DIR)/Rayman2_Recomp.vpk
+
+ICON0           := sce_sys/icon0.png
+LIVEAREA_BG     := sce_sys/livearea/contents/bg.png
+LIVEAREA_START  := sce_sys/livearea/contents/startup.png
+LIVEAREA_XML    := sce_sys/livearea/contents/template.xml
+DC_IMAGE        := assets/dc/1ST_READ.BIN
+
+.PHONY: all clean stubs vpk elf velf eboot
+
+all: $(VPK)
+
+stubs: $(BUILD_DIR)/rename.sed $(BUILD_DIR)/hook_stubs.c
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/rename.sed: $(HLE_DIR)/mkstubs.py $(HGEN)/recomp_decls.h | $(BUILD_DIR)
+	cd $(RECOMP_DIR) && python3 hle/mkstubs.py gen_fix
+	cp $(RECOMP_DIR)/build_hle/rename.sed $(BUILD_DIR)/rename.sed
+	cp $(RECOMP_DIR)/build_hle/hook_stubs.c $(BUILD_DIR)/hook_stubs.c
+
+$(BUILD_DIR)/hook_stubs.c: $(BUILD_DIR)/rename.sed
+	@true
+
+$(BUILD_DIR)/recomp_%.o: $(HGEN)/recomp_%.c $(RECOMP_DIR)/runtime.h $(HGEN)/recomp_decls.h $(HLE_DIR)/enter.h $(BUILD_DIR)/rename.sed | $(BUILD_DIR)
+	sed -E -f $(BUILD_DIR)/rename.sed $< | $(CC) $(CFLAGS) -include $(HLE_DIR)/enter.h -x c - -c -o $@
+
+$(BUILD_DIR)/recomp_functab.o: $(HGEN)/recomp_functab.c $(RECOMP_DIR)/runtime.h $(HGEN)/recomp_decls.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/runtime.o: $(RECOMP_DIR)/runtime.c $(RECOMP_DIR)/runtime.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -Dsh4_pref=sh4_pref_default -c $< -o $@
+
+$(BUILD_DIR)/hook_stubs.o: $(BUILD_DIR)/hook_stubs.c $(HLE_DIR)/hle.h $(HLE_DIR)/hle_priv.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/hle_%.o: $(HLE_DIR)/%.c $(HLE_DIR)/hle.h $(HLE_DIR)/hle_priv.h $(RECOMP_DIR)/runtime.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(ELF): $(ALL_OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LIBS) -o $@
+
+$(VELF): $(ELF)
+	$(VITA_ELF_CREATE) $< $@
+
+$(EBOOT): $(VELF)
+	$(VITA_MAKE_FSELF) -c -s $< $@
+
+$(PARAM_SFO): | $(BUILD_DIR)
+	$(VITA_MKSFOEX) -s TITLE_ID=$(TITLE_ID) -s APP_VER=$(APP_VER) $(APP_TITLE) $@
+
+$(VPK): $(EBOOT) $(PARAM_SFO) $(ICON0) $(LIVEAREA_BG) $(LIVEAREA_START) $(LIVEAREA_XML) $(DC_IMAGE) | $(BUILD_DIR)
+	$(VITA_PACK_VPK) -s $(PARAM_SFO) -b $(EBOOT) \
+		-a $(ICON0)=sce_sys/icon0.png \
+		-a $(LIVEAREA_BG)=sce_sys/livearea/contents/bg.png \
+		-a $(LIVEAREA_START)=sce_sys/livearea/contents/startup.png \
+		-a $(LIVEAREA_XML)=sce_sys/livearea/contents/template.xml \
+		-a $(DC_IMAGE)=1ST_READ.BIN \
+		$@
+	@echo "=========================================================="
+	@echo "SUCCESS: Built $(VPK)"
+	@echo "=========================================================="
+
+clean:
+	rm -rf $(BUILD_DIR)
