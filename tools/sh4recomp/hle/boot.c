@@ -6,6 +6,9 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <time.h>
+#if defined(__vita__)
+#include <psp2/kernel/clib.h>
+#endif
 
 /* ---------------------------------------------------------------- globals / tracing */
 uint32_t hle_ring[256][2]; uint32_t hle_ring_pos; int hle_trace_on;
@@ -17,11 +20,46 @@ static SH4Ctx *G;                       /* the single guest context */
 static jmp_buf run_jmp; static int run_jmp_valid; static char stop_reason[256]; static int stop_code;
 static const char *g_dcdata = ".";
 
-static uint64_t now_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec; }
+/* guest-visible clock = host monotonic + skew. --fast (hle_no_pace) skips the 60 Hz sleep by adding the skipped time to skew, so the guest sees
+ * exactly the same 16.7 ms/vblank timeline as a paced run (the game's menu/fade/input logic is driven by TMU/SPG time; without this a
+ * --fast run advances guest time only ~3 ms per frame and the Main Menu never accepts NEW GAME). */
+static volatile uint64_t clock_skew_ns;
+/* Guest-clock ceiling (slow-guest handling): the guest-visible clock may not run more than `slack` ahead of the vblank timeline (next due vblank).
+ * A guest that keeps up never notices (it waits for the vblank anyway). A guest that is slower than 60 Hz (Vita / Vita3K) then sees at most
+ * ~slack extra per vblank, i.e. it runs in slow motion instead of seeing one huge time step per frame. This keeps the AICA sample clock (snd.c, slaved
+ * to this clock) consistent with the rate at which the guest can refill the music stream rings (8192 samples = 0.37 s); with a wall-clock sample clock
+ * the rings were lapped between refills and the first fraction of a second repeated. Default slack: 17 ms on Vita, off on the host;
+ * env R2_CLOCK_CAP_MS=<ms> overrides (0 = off). Only the guest thread may call now_ns()/hle_time_us(). */
+static uint64_t next_vb_ns; static unsigned long vb_delivered;
+static uint64_t clock_slack_ns, clock_lag_ns, clock_last; static int clock_cap_init;
+static uint64_t now_ns(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t r = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec + clock_skew_ns;
+    if (!clock_cap_init) {
+        clock_cap_init = 1; const char *e = getenv("R2_CLOCK_CAP_MS");
+#if defined(__vita__)
+        clock_slack_ns = e ? (uint64_t)atol(e) * 1000000ull : 17000000ull;
+#else
+        clock_slack_ns = e ? (uint64_t)atol(e) * 1000000ull : 0;
+#endif
+    }
+    r -= clock_lag_ns;
+    if (clock_slack_ns && vb_delivered) { uint64_t ceil = next_vb_ns + clock_slack_ns; if (r > ceil && ceil >= clock_last) { clock_lag_ns += r - ceil; r = ceil; } }
+    if (r < clock_last) r = clock_last;
+    clock_last = r; return r;
+}
 static uint64_t t0_ns;
 uint64_t hle_time_us(void) { return (now_ns() - t0_ns) / 1000; }
 
-void hle_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap); fputc('\n', stderr); }
+void hle_log(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+#if defined(__vita__)
+    char buf[512]; vsnprintf(buf, sizeof buf, fmt, ap);
+    sceClibPrintf("%s\n", buf);
+#else
+    vfprintf(stderr, fmt, ap); fputc('\n', stderr);
+#endif
+    va_end(ap);
+}
 const char *hle_cstr(uint32_t a) {
     if (!hle_is_ram(a)) return "<bad>";
     return (const char *)hle_ptr(a);
@@ -105,9 +143,16 @@ void hle_call(SH4Ctx *c, uint32_t addr) { uint32_t pr = c->pr; sh4_call(c, addr)
 #define BIOS_RESET   0x8C008300u
 
 /* ---------------------------------------------------------------- stop / fault */
+unsigned long hle_frames_limit, hle_trace_from_frame; void (*hle_frame_hook)(unsigned long frame);   /* run_game --frames N / --trace-from-frame N */
+static void hle_finish(const char *why) {                  /* clean stop (frame limit reached): hle_run_main returns 3 */
+    snprintf(stop_reason, sizeof stop_reason, "%s", why);
+    stop_code = 3;
+    if (run_jmp_valid) longjmp(run_jmp, 1);
+}
 void hle_stop(const char *why) {
     snprintf(stop_reason, sizeof stop_reason, "%s", why);
     stop_code = 2;
+    hle_log("[hle] STOP: %s", why);
     if (run_jmp_valid) longjmp(run_jmp, 1);
     fprintf(stderr, "hle_stop outside run: %s\n", why); exit(9);
 }
@@ -172,6 +217,41 @@ static uint8_t vram[8 << 20], waveram[2 << 20];
  * 32-bit offset = (A&3) | ((A&0x7FFFF8)>>1) | (((A>>2)&1)<<22). Kamui's texture upload (CPU stores to 0xA5xxxxxx) lands here. */
 static uint32_t vram_off(uint32_t k) { uint32_t o = k & 0x7FFFFF; if ((k >> 24) == 5) o = (o & 3) | ((o & 0x7FFFF8) >> 1) | (((o >> 2) & 1) << 22); return o; }
 uint8_t *hle_vram_ptr(void) { return vram; }
+/* Frame-buffer regions.  The PVR renders into / scans out of FB_W_SOFn / FB_R_SOFn (64-bit-area byte offsets), and we never render into VRAM (the TA stream is drawn by the host
+ * renderer), so these regions are not part of the VRAM image the texture decoder sees.  Games still touch them with the CPU: Rayman 2 copies the displayed buffer (R_SOF1 = 0x0aa000) into the
+ * render buffer (W_SOF1 = 0x4aa000) through 0xA5xxxxxx at every level start.  In the 32-bit view `vram` (= texture view) that 0x96000-byte stream lands on L = 0x255000..0x2a0000 and
+ * 0x655000..0x6a0000, i.e. on Rayman's character textures (surfaces 0x2852c0..0x292ac0: torso, hair, ...), which then rendered black (see re_analysis/dc/notes_textures.md).
+ * CPU accesses to the 64-bit area inside any FB region seen in the SOF registers are therefore kept in a separate shadow buffer. */
+static uint8_t fbshadow[8 << 20];
+static struct { uint32_t lo, hi; } fb_rng[8]; static int fb_nrng; 
+static void fb_note1(uint32_t sof, uint32_t len) {
+    uint32_t lo = sof & 0x7FFFFF, hi = lo + len; if (hi > 0x800000u) hi = 0x800000u;
+    for (int i = 0; i < fb_nrng; i++) if (fb_rng[i].lo == lo) { if (hi > fb_rng[i].hi) fb_rng[i].hi = hi; return; }
+    if (fb_nrng < 8) { fb_rng[fb_nrng].lo = lo; fb_rng[fb_nrng].hi = hi; fb_nrng++; }
+}
+/* Kamui keeps the double buffer as two 0x96000-byte buffers 4 MiB apart (R=0x0aa000, W=0x4aa000 in this game) and clears/copies BOTH from the very first frame, before the SOF
+ * registers have been programmed with the second one, so each SOF also reserves its +-4 MiB twin. */
+static void fb_note(uint32_t sof, uint32_t len) { fb_note1(sof, len); fb_note1(sof ^ 0x400000u, len); }
+static void fb_refresh(void) {
+    static int off = -1; if (off < 0) { const char *e = getenv("R2_FBSHADOW"); off = e && *e == '0'; } if (off) return;       /* A/B switch for tests */
+    uint32_t rc = hle_reg_get(0xA05F8044u), wc = hle_reg_get(0xA05F8048u);                  /* FB_R_CTRL, FB_W_CTRL */
+    uint32_t rlen = 0x96000u * (((rc >> 2) & 3) == 3 ? 2 : 1), wlen = 0x96000u * (((wc & 7) >= 5) ? 2 : 1);   /* 640x480 x 16/32 bpp (R_CTRL bit3:2 = 3 -> 32bpp) */
+    uint32_t r1 = hle_reg_get(0xA05F8050u), r2 = hle_reg_get(0xA05F8054u), w1 = hle_reg_get(0xA05F8060u), w2 = hle_reg_get(0xA05F8064u);
+    if (r1 || r2) { fb_note(r1, rlen); if (r2) fb_note(r2, rlen); }
+    if (w1) fb_note(w1, wlen);
+    if (w2) fb_note(w2, wlen);
+}
+/* returns the shadow byte pointer if the 64-bit-area address k (0x05xxxxxx) lies in a frame-buffer region, else NULL */
+static int fb_all = -1;
+static uint8_t *fb_shadow(uint32_t k) {
+    if ((k >> 24) != 5) return 0;
+    if (fb_all < 0) { const char *e = getenv("R2_FBSHADOW"); fb_all = e && *e == '2'; }
+    if (fb_all) return &fbshadow[k & 0x7FFFFF];
+    uint32_t o = k & 0x7FFFFF;
+    for (int i = 0; i < fb_nrng; i++) if (o >= fb_rng[i].lo && o < fb_rng[i].hi) return &fbshadow[o];
+    return 0;
+}
+static void (*listinit_cb)(SH4Ctx *); void hle_set_listinit_cb(void (*fn)(SH4Ctx *)) { listinit_cb = fn; }
 static void (*startrender_cb)(SH4Ctx *); void hle_set_startrender_cb(void (*fn)(SH4Ctx *)) { startrender_cb = fn; }
 static uint64_t tmu_base_ns; static uint32_t tmu_base_cnt;
 static const uint32_t TMU_DIV[8] = {4, 16, 64, 256, 1024, 1, 1, 1};
@@ -212,7 +292,7 @@ static void count_reg(RegEnt *r, int wr, uint32_t v, int size) {
 static uint32_t def_read(uint32_t a, int size) {
     uint32_t k = norm(a), v;
     if (k >= 0x0C000000u && k < 0x0D000000u) { uint32_t x = 0; memcpy(&x, &sh4_ram[k & 0xFFFFFF], size); return x; }
-    if (k >= 0x04000000u && k < 0x06000000u) { uint32_t x = 0; memcpy(&x, &vram[vram_off(k)], size); return x; }
+    if (k >= 0x04000000u && k < 0x06000000u) { uint32_t x = 0; uint8_t *fs = fb_shadow(k); memcpy(&x, fs ? fs : &vram[vram_off(k)], size); return x; }
     if (k >= 0x00800000u && k < 0x00A00000u) { uint32_t x = 0; memcpy(&x, &waveram[k & 0x1FFFFF], size); return x; }
     if (!is_modelled_reg(k)) { hle_unhandled("rd", a, size, 0); poll_check(a, 0, 1); return 0; }
     RegEnt *r = reg_slot(k & ~3u);
@@ -316,7 +396,7 @@ static void def_write(uint32_t a, int size, uint32_t v) {
     uint32_t k = norm(a);
     poll_check(a, v, 0);
     if (k >= 0x0C000000u && k < 0x0D000000u) { memcpy(&sh4_ram[k & 0xFFFFFF], &v, size); return; }
-    if (k >= 0x04000000u && k < 0x06000000u) { vram_cpu_n[(k >> 24) & 3]++; { unsigned a = (k >> 24) & 1; uint32_t o = k & 0x7FFFFF; if (o < vram_min[a]) vram_min[a] = o; if (o > vram_max[a]) vram_max[a] = o; } memcpy(&vram[vram_off(k)], &v, size); return; }
+    if (k >= 0x04000000u && k < 0x06000000u) { vram_cpu_n[(k >> 24) & 3]++; { unsigned a = (k >> 24) & 1; uint32_t o = k & 0x7FFFFF; if (o < vram_min[a]) vram_min[a] = o; if (o > vram_max[a]) vram_max[a] = o; } { uint8_t *fs = fb_shadow(k); memcpy(fs ? fs : &vram[vram_off(k)], &v, size); } return; }
     if (k >= 0x00800000u && k < 0x00A00000u) { memcpy(&waveram[k & 0x1FFFFF], &v, size); return; }
     if (!is_modelled_reg(k)) { hle_unhandled("wr", a, size, v); return; }
     RegEnt *r = reg_slot(k & ~3u);
@@ -328,6 +408,8 @@ static void def_write(uint32_t a, int size, uint32_t v) {
     case 0xFFD8000Cu: tmu_base_cnt = v; tmu_base_ns = now_ns(); break;              /* TCNT0 write */
     case 0x005F8014u:                                                              /* STARTRENDER: render finishes instantly on the host */
         startrender_n++; if (startrender_cb) startrender_cb(G); hle_asic_raise_later((1u << 0) | (1u << 1)); hle_asic_raise_later(1u << 2); break;
+    case 0x005F8144u: if ((v & 0x80000000u) && listinit_cb) listinit_cb(G); break;      /* TA_LIST_INIT: new TA stream (scene) starts */
+    case 0x005F8044u: case 0x005F8048u: case 0x005F8050u: case 0x005F8054u: case 0x005F8060u: case 0x005F8064u: fb_refresh(); break;   /* FB_R/W_CTRL, FB_R/W_SOFn: remember frame-buffer regions */
     case 0x005F6808u: if (v & 1) dma_ch2(); break;                                 /* SB_C2DST: ch2 DMA start */
     case 0x005F7C18u: if (v & 1) dma_pvr(); break;                                 /* SB_PDST: PVR-IF DMA start */
     default: break;
@@ -407,13 +489,18 @@ static void h_nop(SH4Ctx *c) { R(0) = 0; }
 /* gdFs/GD-ROM driver bring-up (0x8C0CF158 gdFsInit, 0x8C0CD916 init-wait server). Replaced: the real driver state machine needs a faithful
  * GD-ROM BIOS (cmd 0x18/0x28/0x11 TOC/session reads); game file access is redirected at the FileMng/gdFs entry points by hle/io.c instead. */
 static void h_ret0(SH4Ctx *c) { R(0) = 0; }
+static void h_8c0e35ec(SH4Ctx *c) {
+    uint32_t r4 = c->r[4];
+    c->r[4] = LD32(r4 + 4);
+    sh4_call(c, 0x8C0EF9A0u);
+}
 /* pdExecPeripheralServer: Maple DMA server loop. Replaced by a host poll; the peripheral table (stride 0x34 at DAT_8C0CF668) is filled
  * with "no device" for now (see TODO: map host pad -> +0x04 button mask, +0x0C.. axes). */
 /* Kamui frame control. Originals are kept (they initialise the per-list SQ write-pointer tables the game's SQ code reads via 0x8C0FA82C);
  * we only add what the missing ASIC interrupt would have done: kmRender (0x8C0E0080) submits the scene -> render completes instantly ->
  * Kamui "type 0" (EOR) callback fires (game clears its render-busy bit @0x8C0C5400) and the TA module gets a frame-end notification. */
 static void asic_flush_all(void);
-static void h_kamui_begin(SH4Ctx *c) { asic_flush_all(); uint32_t pr = c->pr; hle_orig(c, 0x8C0D3AE0); c->pr = pr; if (cb_begin) cb_begin(c); }
+static void h_kamui_begin(SH4Ctx *c) { if (hle_verbose >= 2) hle_log("[kamui] begin (kmBeginScene) pr=%08x", c->pr); asic_flush_all(); uint32_t pr = c->pr; hle_orig(c, 0x8C0D3AE0); c->pr = pr; if (cb_begin) cb_begin(c); }
 static void h_kamui_render(SH4Ctx *c) {
     asic_flush_all();
     uint32_t pr = c->pr; hle_orig(c, 0x8C0E0080); uint32_t r0 = R(0); c->pr = pr;
@@ -421,12 +508,14 @@ static void h_kamui_render(SH4Ctx *c) {
     hle_frame_count++;
     if (hle_verbose) hle_log("[kamui] frame %lu submitted (render done), pr=%08x", hle_frame_count, pr);
     R(0) = r0;
+    if (hle_frame_hook) hle_frame_hook(hle_frame_count);
+    if (hle_trace_from_frame && hle_frame_count == hle_trace_from_frame) hle_set_trace(1);
+    if (hle_frames_limit && hle_frame_count >= hle_frames_limit) { asic_flush_all(); hle_finish("frame limit reached"); }
 }
 /* Interrupt delivery model. The SDK (syInt, 0x8C0D0160) keeps handler lists indexed by event code>>4; 0x8C0D030E(code) walks and calls them.
  * VBlank-in is event 0xA60 (ASIC bit 3). There is no preemption in the host build, so interrupts are delivered at known wait points:
  * the Kamui idle callback (0x8C0D2BA0 type 7, called from every spin-wait in the Kamui layer). Pacing: at most one vblank per 1/60 s of host time;
  * a waiting guest sleeps until the next vblank is due. */
-static uint64_t next_vb_ns; static unsigned long vb_delivered;
 static void irq_deliver(SH4Ctx *c, uint32_t code) {
     SH4Ctx save = *c;
     c->r[4] = code; c->r[15] -= 0x80;
@@ -453,10 +542,14 @@ static int asic_flush_one(void) {
     uint32_t m = asic_q[0]; memmove(asic_q, asic_q + 1, (--asic_qn) * sizeof asic_q[0]); hle_asic_raise(m); return 1;
 }
 static void asic_flush_all(void) { while (asic_flush_one()) {} }
+int hle_no_pace;                                   /* run_game --fast: do not sleep to hold 60 Hz (guest-visible time via TMU/SPG stays wall-clock) */
 static void deliver_vblank(SH4Ctx *c) {          /* paced 60 Hz VBlank-in, as the hardware would raise while the guest waits */
     if (cb_vblank) cb_vblank(c);
     uint64_t t = now_ns(); uint32_t pr = c->pr;
-    if (t < next_vb_ns) { struct timespec ts = {0, (long)(next_vb_ns - t)}; nanosleep(&ts, 0); t = now_ns(); }
+    if (t < next_vb_ns) {
+        if (!hle_no_pace) { struct timespec ts = {0, (long)(next_vb_ns - t)}; nanosleep(&ts, 0); t = now_ns(); }
+        else { clock_skew_ns += next_vb_ns - t; t = now_ns(); }
+    }
     next_vb_ns = t + FRAME_NS; vb_delivered++;
     if (vb_delivered < 4) hle_log("[irq] vblank #%lu: list[0xA6]=%08x list[0xA8]=%08x flag884=%08x", vb_delivered, LD32(0x8C2EC5ACu + 0xA6 * 4), LD32(0x8C2EC5ACu + 0xA8 * 4), LD32(0x8C2ED884u));
     uint32_t f0 = LD32(0x8C2ED884u);
@@ -520,6 +613,7 @@ void hle_boot_init(SH4Ctx *c, const uint8_t *image, uint32_t len, const char *dc
     hle_hook(0x8C0D2BA0, h_kamui_idle); hle_hook(0x8C0385D8, h_render_wait); hle_hook(0x8C0386E0, h_render_wait2);
     hle_hook(0x8C0D3AE0, h_kamui_begin); hle_hook(0x8C0E0080, h_kamui_render);
     hle_hook(0x8C0CD916, h_ret0);
+    sh4_register_hook(0x8C0E35ECu, h_8c0e35ec);
     hle_io_init(dcdata_root);
     { extern void hle_pad_init(void); hle_pad_init(); }
     hle_ta_init();

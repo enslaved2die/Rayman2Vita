@@ -7984,6 +7984,12 @@ L8c0e35d6:;
   {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
+void f_8c0e35ec(SH4Ctx *c) {
+  {uint32_t v=R(4);R(15)-=4;ST32(R(15),v);}
+  R(3)=0x8c0ef9a0u;
+  R(4)=LD32(R(4)+4);
+  { R(15)+=0x4u; { f_8c0ef9a0(c); return; } }
+}
 void f_8c0e361c(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}

@@ -26,12 +26,12 @@ enum {
 
 /* ---------------------------------------------------------------- state */
 typedef struct { char path[1024]; uint32_t size; } RegFile;
-typedef struct { int used; int fd; int reg; } GdEnt;
-typedef struct { int reg; uint64_t stamp; } DirEnt;
+typedef struct { int used; int fd; int reg; uint32_t base; } GdEnt;   /* base = first sector of the range inside the host file (DCZ members) */
+typedef struct { int reg; uint32_t base; uint64_t stamp; } DirEnt;
 #define MAX_REG 16384
 #define MAX_GD  64
 #define MAX_DIRENT 64
-static char g_root[900];
+static char g_root[900]; static int g_idx_ready;
 static RegFile *g_reg; static int g_nreg;
 static GdEnt g_gd[MAX_GD]; static unsigned g_ngd = 10;
 static DirEnt g_dir[MAX_DIRENT]; static unsigned g_ndir = 14; static uint64_t g_stamp;
@@ -42,10 +42,10 @@ void hle_io_set_scratch(uint32_t gd_base, unsigned n_gd, uint32_t dirent_base, u
     g_gd_base = gd_base; g_ngd = n_gd > MAX_GD ? MAX_GD : n_gd;
     g_dir_base = dirent_base; g_ndir = n_dirent > MAX_DIRENT ? MAX_DIRENT : n_dirent;
 }
-void hle_io_set_root(const char *root) { snprintf(g_root, sizeof g_root, "%s", root ? root : "."); size_t n = strlen(g_root); while (n > 1 && g_root[n - 1] == '/') g_root[--n] = 0; }
+void hle_io_set_root(const char *root) { g_idx_ready = 0; snprintf(g_root, sizeof g_root, "%s", root ? root : "."); size_t n = strlen(g_root); while (n > 1 && g_root[n - 1] == '/') g_root[--n] = 0; }
 void hle_io_reset(void) {
     for (unsigned i = 0; i < MAX_GD; i++) { if (g_gd[i].used && g_gd[i].fd >= 0) close(g_gd[i].fd); g_gd[i].used = 0; g_gd[i].fd = -1; }
-    free(g_reg); g_reg = 0; g_nreg = 0; memset(g_dir, 0, sizeof g_dir); g_stamp = 0;
+    free(g_reg); g_reg = 0; g_nreg = 0; memset(g_dir, 0, sizeof g_dir); g_stamp = 0; g_idx_ready = 0;
 }
 
 /* ---------------------------------------------------------------- guest memory helpers */
@@ -57,54 +57,201 @@ static void guest_write(uint32_t dst, const uint8_t *src, uint32_t n) {
 static void put16(uint32_t a, uint32_t v) { ST16(a, v); }
 static void put32(uint32_t a, uint32_t v) { ST32(a, v); }
 
-/* ---------------------------------------------------------------- path mapping */
+/* ---------------------------------------------------------------- directory index + path mapping
+ * The whole data root is scanned ONCE (lazily, on first lookup after hle_io_set_root) into an in-memory tree. Every later
+ * lookup (the game probes lots of names that do not exist on the disc: Banks\ before Music\, ~70 demo000.sav, MM01..10.wav ...)
+ * is resolved case-insensitively against that tree with ZERO syscalls, so misses neither cost time nor spam the emulator log.
+ * Aliases (symlinks in the PC/mac extraction that FAT cannot hold) come from <root>/ALIASES.TXT ("link<TAB>target", paths
+ * relative to the root, written by tools/vita/stage_data.sh) plus a built-in list of the known ones. */
+typedef struct { char *name; uint32_t size; int parent, child, next; unsigned char is_dir; int dcz; uint32_t dcz_lba; } INode;   /* dcz >= 0: virtual file inside container node dcz at sector dcz_lba */
+static INode *g_idx; static int g_nidx, g_capidx;
+int hle_io_stat_calls;      /* syscall counters (tests/diagnostics) */
+unsigned long hle_io_lookups, hle_io_misses;
+
 static int is_sep(char ch) { return ch == '\\' || ch == '/'; }
 
-static int find_ci(const char *dirpath, const char *comp, char *out, size_t cap) {
-    DIR *d = opendir(dirpath); if (!d) return -1;
-    struct dirent *e; int rc = -1;
-    while ((e = readdir(d))) if (!strcasecmp(e->d_name, comp)) { snprintf(out, cap, "%s", e->d_name); rc = 0; break; }
-    closedir(d); return rc;
+static int idx_add(int parent, const char *name, uint32_t size, int is_dir) {
+    if (g_nidx == g_capidx) { int nc = g_capidx ? g_capidx * 2 : 1024; INode *n = realloc(g_idx, (size_t)nc * sizeof *n); if (!n) return -1; g_idx = n; g_capidx = nc; }
+    INode *n = &g_idx[g_nidx]; n->name = strdup(name); if (!n->name) return -1;
+    n->size = size; n->parent = parent; n->child = -1; n->is_dir = (unsigned char)is_dir; n->dcz = -1; n->dcz_lba = 0;
+    n->next = -1;
+    if (parent >= 0) { n->next = g_idx[parent].child; g_idx[parent].child = g_nidx; }
+    return g_nidx++;
 }
-
-/* append one logical component to the host path in cur (cap bytes); returns 0 ok */
-static int append_comp(char *cur, size_t cap, const char *comp, size_t root_len) {
-    if (!strcmp(comp, ".") || !*comp) return 0;
-    if (!strcmp(comp, "..")) { char *s = strrchr(cur, '/'); if (s && (size_t)(s - cur) >= root_len) *s = 0; return 0; }
-    char tmp[1100], real[300]; struct stat st;
-    size_t n = strlen(cur);
-    if (n + 2 + strlen(comp) >= cap) return -1;
-    if (!hle_io_force_scan) { snprintf(tmp, sizeof tmp, "%s/%s", cur, comp); if (!stat(tmp, &st)) { strcat(cur, "/"); strcat(cur, comp); return 0; } }
-    if (find_ci(cur, comp, real, sizeof real) == 0) { strcat(cur, "/"); strcat(cur, real); return 0; }
-    /* strip an ISO9660 ";1" version suffix, e.g. "FOO.DAT;1" */
-    char *semi = strchr((char *)comp, ';');
-    if (semi) { char nm[300]; size_t l = (size_t)(semi - comp); if (l < sizeof nm) { memcpy(nm, comp, l); nm[l] = 0; if (find_ci(cur, nm, real, sizeof real) == 0) { strcat(cur, "/"); strcat(cur, real); return 0; } } }
+static int idx_child(int dir, const char *comp) {
+    for (int c = g_idx[dir].child; c >= 0; c = g_idx[c].next) if (!strcasecmp(g_idx[c].name, comp)) return c;
     return -1;
 }
 
-static int walk(const char *s, char *cur, size_t cap, size_t root_len) {
+#ifdef __vita__
+#include <psp2/io/dirent.h>
+#include <psp2/io/stat.h>
+#include <psp2/io/fcntl.h>
+static void idx_scan(int node, const char *path, int depth) {
+    SceUID d = sceIoDopen(path); if (d < 0 || depth > 12) return;
+    SceIoDirent *e = malloc(sizeof *e); if (!e) { sceIoDclose(d); return; }
+    for (;;) {
+        memset(e, 0, sizeof *e);
+        if (sceIoDread(d, e) <= 0) break;
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        int dirf = SCE_S_ISDIR(e->d_stat.st_mode) != 0;
+        int id = idx_add(node, e->d_name, dirf ? 0 : (uint32_t)e->d_stat.st_size, dirf);
+        if (id >= 0 && dirf) { char sub[1024]; snprintf(sub, sizeof sub, "%s/%s", path, e->d_name); idx_scan(id, sub, depth + 1); }
+    }
+    free(e); sceIoDclose(d);
+}
+#else
+static void idx_scan(int node, const char *path, int depth) {
+    DIR *d = opendir(path); if (!d || depth > 12) { if (d) closedir(d); return; }
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char full[1024]; struct stat st; snprintf(full, sizeof full, "%s/%s", path, e->d_name);
+        hle_io_stat_calls++; if (stat(full, &st)) continue;                  /* follows symlinks; dangling ones are skipped */
+        int dirf = S_ISDIR(st.st_mode) != 0;
+        int id = idx_add(node, e->d_name, dirf ? 0 : (uint32_t)st.st_size, dirf);
+        if (id >= 0 && dirf) idx_scan(id, full, depth + 1);
+    }
+    closedir(d);
+}
+#endif
+
+static int idx_find_path(const char *rel) {                 /* rel: '/' separated, relative to root; exact walk, case-insensitive */
+    int cur = 0; char comp[300]; size_t k = 0;
+    for (const char *p = rel;; p++) {
+        if (!*p || is_sep(*p)) { comp[k] = 0; if (k) { cur = idx_child(cur, comp); if (cur < 0) return -1; } k = 0; if (!*p) break; }
+        else if (k + 1 < sizeof comp) comp[k++] = *p; else return -1;
+    }
+    return cur;
+}
+static void idx_alias(const char *link, const char *target) {
+    char dirpart[300]; const char *base = link; const char *sl = strrchr(link, '/');
+    int parent = 0;
+    if (sl) { size_t l = (size_t)(sl - link); if (l >= sizeof dirpart) return; memcpy(dirpart, link, l); dirpart[l] = 0; base = sl + 1; parent = idx_find_path(dirpart); }
+    int t = idx_find_path(target);
+    if (parent < 0 || t < 0 || !*base || idx_child(parent, base) >= 0) return;          /* already a real file / target missing */
+    /* the alias node holds the TARGET path in its name via a second node pointing at it: store as a file whose host path is resolved
+     * through g_alias[]; simplest: mark with size and remember the target index in child (files have no children). */
+    int id = idx_add(parent, base, g_idx[t].size, g_idx[t].is_dir);
+    if (id >= 0) g_idx[id].child = -2 - t;                                              /* child < -1 : alias of node (-2 - child) */
+}
+static const char *const k_alias[][2] = {              /* symlinks of the extracted disc tree (FAT has none) */
+    { "DCDATA/FIX.SNA", "DCDATA/FIX.DAT" }, { "DCDATA/LEARN_10/LEARN_10.SNA", "DCDATA/LEARN_10/LEARN_10.DAT" },
+    { "DCDATA/MAPMONDE2/MAPMONDE2.SNA", "DCDATA/MAPMONDE2/MAPMONDE2.DAT" },
+    { "DCDATA/SOUND/BANKS/FIX.DAT", "DCDATA/SOUND/BANKS/BNK_0.DAT" }, { "DCDATA/SOUND/BANKS/FIX.OSB", "DCDATA/SOUND/BANKS/BNK_0.OSB" },
+    { "FIX.SNA", "DCDATA/FIX.DAT" }, { "LEARN_10.SNA", "DCDATA/LEARN_10/LEARN_10.DAT" },
+    { "MAPMONDE2.SNA", "DCDATA/MAPMONDE2/MAPMONDE2.DAT" }, { "MAP_10.SNA", "DCDATA/MAPMONDE2/MAPMONDE2.DAT" },
+};
+/* DirMng.c treats every *.DCZ file as a transparent directory (FUN_8c0430b6 = name has ".DCZ", FUN_8c042ea0 loads its header and relocates
+ * the entry LBAs by the container's LBA, FUN_8c043074 searches it): members appear as if they were files of the directory that holds the .DCZ.
+ * Header layout (PROVEN from FUN_8c042ea0 + hexdump of MM.DCZ/ENGLISH.DCZ): u32 +0 = header bytes, u32 +8 = member count, members at +0x10, 0x2C
+ * bytes each {u32 sector offset inside the .DCZ, u32 size in bytes, u8 flag@8, char name[]@10}. Members are plain files (WAV for the music).
+ * This is how Music\MM01.wav .. MM10.wav, level streams etc. are found; before this the lookups missed and no music was ever started. */
+static void idx_hostpath(int n, char *out, size_t cap);
+static size_t read_head(const char *p, uint8_t *buf, size_t n) {
+#ifdef __vita__
+    SceUID fd = sceIoOpen(p, SCE_O_RDONLY, 0); if (fd < 0) return 0; int r = sceIoRead(fd, buf, (SceSize)n); sceIoClose(fd); return r > 0 ? (size_t)r : 0;
+#else
+    FILE *fp = fopen(p, "rb"); if (!fp) return 0; size_t r = fread(buf, 1, n, fp); fclose(fp); return r;
+#endif
+}
+static void idx_expand_dcz(void) {
+    int n0 = g_nidx; const char *off = getenv("R2_IO_NODCZ"); if (off && *off == '1') return;     /* A/B switch for tests */
+    for (int i = 1; i < n0; i++) {
+        INode *f = &g_idx[i];
+        if (f->is_dir || f->dcz >= 0 || f->child < -1) continue;
+        size_t nl = strlen(f->name);
+        if (nl < 4 || strcasecmp(f->name + nl - 4, ".DCZ")) continue;
+        char p[1024]; idx_hostpath(i, p, sizeof p);
+        static uint8_t hdr[0x30000]; size_t got = read_head(p, hdr, 0x10);      /* header = 0x10 + count*0x2C bytes and may span several sectors (WH.DCZ: 3536) */
+        if (got < 0x10) continue;
+        uint32_t hbytes = hdr[0] | hdr[1] << 8 | hdr[2] << 16 | (uint32_t)hdr[3] << 24, cnt = hdr[8] | hdr[9] << 8 | hdr[10] << 16 | (uint32_t)hdr[11] << 24;
+        if (cnt == 0 || cnt > 4000 || hbytes > sizeof hdr || (got = read_head(p, hdr, 0x10 + (size_t)cnt * 0x2C)) < 0x10 + (size_t)cnt * 0x2C) { hle_log("[io] DCZ %s: header not parsed (hbytes %u cnt %u)", p, hbytes, cnt); continue; }
+        int parent = f->parent, added = 0; char cname[300]; snprintf(cname, sizeof cname, "%s", f->name);
+        for (uint32_t k = 0; k < cnt; k++) {
+            const uint8_t *e = hdr + 0x10 + k * 0x2C;
+            uint32_t lba = e[0] | e[1] << 8 | e[2] << 16 | (uint32_t)e[3] << 24, size = e[4] | e[5] << 8 | e[6] << 16 | (uint32_t)e[7] << 24;
+            char nm[40]; memcpy(nm, e + 10, 31); nm[31] = 0;
+            if (e[8] || !nm[0]) continue;
+            int ex = idx_child(parent, nm);
+            if (ex >= 0) {   /* same name twice: DirMng walks the (ISO sorted) directory, the first entry that has it wins: plain file or the earlier-sorting .DCZ */
+                const char *exn = g_idx[ex].dcz >= 0 ? g_idx[g_idx[ex].dcz].name : g_idx[ex].name;
+                if (g_idx[ex].is_dir || g_idx[ex].child < -1 || strcasecmp(cname, exn) >= 0) continue;
+                g_idx[ex].size = size; g_idx[ex].dcz = i; g_idx[ex].dcz_lba = lba; added++; continue;
+            }
+            int id = idx_add(parent, nm, size, 0);
+            if (id >= 0) { g_idx[id].dcz = i; g_idx[id].dcz_lba = lba; added++; }
+        }
+        if (hle_verbose >= 2) hle_log("[io] DCZ %s: %d members", cname, added);
+    }
+}
+static void idx_build(void) {
+    for (int i = 0; i < g_nidx; i++) free(g_idx[i].name);
+    g_nidx = 0; g_idx_ready = 1;
+    if (idx_add(-1, "", 0, 1) < 0) return;
+    idx_scan(0, g_root, 0);
+    for (size_t i = 0; i < sizeof k_alias / sizeof k_alias[0]; i++) idx_alias(k_alias[i][0], k_alias[i][1]);
+    int a = idx_find_path("ALIASES.TXT");
+    if (a >= 0 && !g_idx[a].is_dir) {
+        char p[1024]; snprintf(p, sizeof p, "%s/%s", g_root, g_idx[a].name);
+        FILE *f = fopen(p, "rb");
+        if (f) { char line[700]; while (fgets(line, sizeof line, f)) {
+            char *t = strchr(line, '\t'); if (!t) continue; *t++ = 0; size_t n = strlen(t); while (n && (t[n - 1] == '\n' || t[n - 1] == '\r')) t[--n] = 0;
+            idx_alias(line, t); } fclose(f); }
+    }
+    idx_expand_dcz();
+    hle_log("[io] index of %s: %d entries (%d stat calls)", g_root, g_nidx, hle_io_stat_calls);
+}
+void hle_io_rescan(void) { g_idx_ready = 0; }
+
+/* walk one logical path into the index starting at node cur; returns node or -1 */
+static int idx_walk(const char *s, int cur) {
     char comp[300]; size_t k = 0;
     for (const char *p = s;; p++) {
         if (*p == 0 || is_sep(*p)) {
             comp[k] = 0;
-            if (k && append_comp(cur, cap, comp, root_len)) return -1;
+            if (k) {
+                if (!strcmp(comp, ".")) { /* nothing */ }
+                else if (!strcmp(comp, "..")) { if (g_idx[cur].parent >= 0) cur = g_idx[cur].parent; }
+                else {
+                    if (!g_idx[cur].is_dir || g_idx[cur].child < -1) return -1;
+                    int c = idx_child(cur, comp);
+                    if (c < 0) { char *semi = strchr(comp, ';'); if (semi) { *semi = 0; c = idx_child(cur, comp); } }  /* ISO ";1" suffix */
+                    if (c < 0) return -1;
+                    cur = c;
+                }
+            }
             k = 0; if (!*p) break;
         } else if (k + 1 < sizeof comp) comp[k++] = *p;
         else return -1;
     }
-    return 0;
+    return cur;
+}
+static void idx_hostpath(int n, char *out, size_t cap) {      /* real-case host path of node (aliases resolve to their target) */
+    if (g_idx[n].child < -1) n = -2 - g_idx[n].child;
+    if (g_idx[n].dcz >= 0) n = g_idx[n].dcz;
+    int chain[16], d = 0;
+    for (int c = n; c > 0 && d < 16; c = g_idx[c].parent) chain[d++] = c;
+    snprintf(out, cap, "%s", g_root);
+    while (d--) { size_t l = strlen(out); snprintf(out + l, cap - l, "/%s", g_idx[chain[d]].name); }
 }
 
-int hle_io_resolve(const char *dir, const char *name, char *out, size_t cap) {
+static int resolve_ex(const char *dir, const char *name, char *out, size_t cap, uint32_t *size, uint32_t *base) {
+    if (base) *base = 0;
     if (!name || !*name) return -1;
-    char cur[1024]; size_t root_len = strlen(g_root);
-    snprintf(cur, sizeof cur, "%s", g_root);
-    if (dir && walk(dir, cur, sizeof cur, root_len)) return -1;
-    if (walk(name, cur, sizeof cur, root_len)) return -1;
-    struct stat st; if (stat(cur, &st) || !S_ISREG(st.st_mode)) return -1;
-    if (strlen(cur) >= cap) return -1;
-    strcpy(out, cur); return 0;
+    hle_io_lookups++;
+    if (!g_idx_ready) idx_build();
+    if (g_nidx < 1) return -1;
+    int cur = 0;
+    if (dir) { cur = idx_walk(dir, 0); if (cur < 0) { hle_io_misses++; return -1; } }
+    cur = idx_walk(name, cur); if (cur < 0 || g_idx[cur].is_dir) { hle_io_misses++; return -1; }
+    char p[1024]; idx_hostpath(cur, p, sizeof p);
+    if (strlen(p) >= cap) return -1;
+    strcpy(out, p); if (size) *size = g_idx[cur].child < -1 ? g_idx[-2 - g_idx[cur].child].size : g_idx[cur].size;
+    { int t = g_idx[cur].child < -1 ? -2 - g_idx[cur].child : cur; if (base && g_idx[t].dcz >= 0) *base = g_idx[t].dcz_lba; }
+    return 0;
 }
+int hle_io_resolve(const char *dir, const char *name, char *out, size_t cap) { return resolve_ex(dir, name, out, cap, NULL, NULL); }
 
 /* ---------------------------------------------------------------- registry (host file <-> synthetic LBA) */
 static int reg_find(const char *path, uint32_t size) {
@@ -114,7 +261,10 @@ static int reg_find(const char *path, uint32_t size) {
     if (!g_reg) return -1;
     snprintf(g_reg[g_nreg].path, sizeof g_reg[0].path, "%s", path); g_reg[g_nreg].size = size; return g_nreg++;
 }
-static uint32_t reg_size(const char *path) { struct stat st; return stat(path, &st) ? 0 : (uint32_t)st.st_size; }
+static uint32_t reg_size(const char *path) {          /* size from the index (path is a resolved host path); stat only as a fallback */
+    size_t rl = strlen(g_root);
+    if (g_idx_ready && !strncmp(path, g_root, rl) && path[rl] == '/') { int n = idx_find_path(path + rl + 1); if (n >= 0) return g_idx[n].size; }
+    struct stat st; hle_io_stat_calls++; return stat(path, &st) ? 0 : (uint32_t)st.st_size; }
 
 /* ---------------------------------------------------------------- fake gdFs handles */
 static uint32_t gd_addr(unsigned i) { return g_gd_base + i * HLE_IO_GD_STRIDE; }
@@ -133,10 +283,10 @@ static uint32_t gd_open_range(uint32_t fad, int32_t nsect) {
     if (i == g_ngd) { hle_log("[io] out of fake gdFs handles (%u)", g_ngd); return 0; }
     int fd = open(g_reg[id].path, O_RDONLY);
     if (fd < 0) { hle_log("[io] open(%s): %s", g_reg[id].path, strerror(errno)); return 0; }
-    g_gd[i].used = 1; g_gd[i].fd = fd; g_gd[i].reg = id;
+    g_gd[i].used = 1; g_gd[i].fd = fd; g_gd[i].reg = id; g_gd[i].base = lba & ((1u << LBA_SHIFT) - 1);
     uint32_t h = gd_addr(i);
     for (uint32_t o = 0; o < HLE_IO_GD_STRIDE; o += 4) put32(h + o, 0);
-    put32(h + G_FAD, fad); put32(h + G_NSECT, (uint32_t)nsect); put32(h + G_CUR, ((lba & ((1u << LBA_SHIFT) - 1))));
+    put32(h + G_FAD, fad); put32(h + G_NSECT, (uint32_t)nsect); put32(h + G_CUR, 0);                                  /* cursor is relative to the range start; g->base is the range's first sector in the host file */
     put16(h + G_VALID, 1); put16(h + G_STAT, ST_IDLE);
     if (hle_verbose >= 2) hle_log("[io] gd open %s -> 0x%08x (%d sectors)", g_reg[id].path, h, nsect);
     return h;
@@ -146,13 +296,25 @@ static void gd_close(uint32_t h) {
     close(g->fd); g->fd = -1; g->used = 0; put16(h + G_VALID, 0);
 }
 /* read n sectors at the handle's current sector offset into guest buf; zero-fill past EOF like the padded last disc sector */
+/* read up to n bytes at file offset off into dst in large (1 MiB) chunks; returns bytes read */
+static size_t read_chunks(int fd, uint8_t *dst, size_t n, off_t off) {
+    size_t got = 0;
+    while (got < n) { size_t want = n - got; if (want > (1u << 20)) want = 1u << 20; ssize_t r = pread(fd, dst + got, want, off + (off_t)got); if (r <= 0) break; got += (size_t)r; }
+    return got;
+}
+/* read n sectors at the handle's current sector offset into guest buf; zero-fill past EOF like the padded last disc sector */
 static void gd_do_read(uint32_t h, GdEnt *g, uint32_t cur, int32_t n, uint32_t buf) {
     uint32_t bytes = (uint32_t)n * SECTOR;
-    uint8_t *tmp = malloc(bytes); if (!tmp) { hle_log("[io] OOM %u", bytes); return; }
-    uint64_t off = (uint64_t)cur * SECTOR; size_t got = 0;
-    while (got < bytes) { ssize_t r = pread(g->fd, tmp + got, bytes - got, (off_t)(off + got)); if (r <= 0) break; got += (size_t)r; }
-    if (got < bytes) memset(tmp + got, 0, bytes - got);
-    guest_write(buf, tmp, bytes); free(tmp);
+    uint64_t off = ((uint64_t)g->base + cur) * SECTOR;
+    if (ram_range_ok(buf, bytes)) {                        /* fast path: straight into guest RAM, no bounce buffer */
+        uint8_t *d = hle_ptr(buf); size_t got = read_chunks(g->fd, d, bytes, (off_t)off);
+        if (got < bytes) memset(d + got, 0, bytes - got);
+    } else {
+        uint8_t *tmp = malloc(bytes); if (!tmp) { hle_log("[io] OOM %u", bytes); return; }
+        size_t got = read_chunks(g->fd, tmp, bytes, (off_t)off);
+        if (got < bytes) memset(tmp + got, 0, bytes - got);
+        guest_write(buf, tmp, bytes); free(tmp);
+    }
     put32(h + G_CUR, cur + (uint32_t)n); put32(h + G_XFER, bytes); put32(h + G_REQN, (uint32_t)n);
     put16(h + G_STAT, ST_DONE);
 }
@@ -174,12 +336,14 @@ static int32_t gd_reqrd(uint32_t h, int32_t nsect, uint32_t buf, int enforce_ali
 void hle_io_h_open(SH4Ctx *c) {
     uint32_t pname = R(4), pdir = R(5), slot = R(6);
     const char *name = pname ? hle_cstr(pname) : 0, *dir = pdir ? hle_cstr(pdir) : 0; char host[1024];
-    if (!name || hle_io_resolve(dir, name, host, sizeof host)) {
+    uint32_t size = 0, base = 0;
+    if (!name || resolve_ex(dir, name, host, sizeof host, &size, &base)) {
         if (hle_verbose) hle_log("[io] open FAIL dir='%s' name='%s'", dir ? dir : "", name ? name : "(null)");
         R(0) = 0xFFFFFFFFu; return;
     }
-    uint32_t size = reg_size(host); int id = reg_find(host, size);
-    uint32_t gd = id < 0 ? 0 : gd_open_range(((uint32_t)(id + 1) << LBA_SHIFT) + FAD_BIAS, (int32_t)((size + 2047) >> 11));
+    if (!base) size = reg_size(host);                     /* plain file: authoritative size from the index; DCZ member: size from its header */
+    int id = reg_find(host, size);
+    uint32_t gd = id < 0 ? 0 : gd_open_range((((uint32_t)(id + 1) << LBA_SHIFT) + base) + FAD_BIAS, (int32_t)((size + 2047) >> 11));
     put32(slot + O_GD, gd);
     put32(slot + O_SIZE, size);
     put32(slot + O_CACHELEN, SECTOR);
@@ -211,11 +375,15 @@ void hle_io_h_read_block(SH4Ctx *c) {
     uint32_t gd = LD32(slot + O_GD); GdEnt *g = gd_lookup(gd);
     if (!(pos < size) || want == 0 || !g) { R(0) = 0; return; }
     int32_t n = size - pos; if (want < n) n = want;
-    uint8_t *tmp = malloc((size_t)n); if (!tmp) { R(0) = 0; return; }
-    size_t got = 0;
-    while (got < (size_t)n) { ssize_t r = pread(g->fd, tmp + got, (size_t)n - got, (off_t)pos + (off_t)got); if (r <= 0) break; got += (size_t)r; }
-    if (got < (size_t)n) memset(tmp + got, 0, (size_t)n - got);
-    guest_write(buf, tmp, (uint32_t)n); free(tmp);
+    if (ram_range_ok(buf, (uint32_t)n)) {
+        uint8_t *d = hle_ptr(buf); size_t got = read_chunks(g->fd, d, (size_t)n, (off_t)((uint64_t)g->base * SECTOR + (uint32_t)pos));
+        if (got < (size_t)n) memset(d + got, 0, (size_t)n - got);
+    } else {
+        uint8_t *tmp = malloc((size_t)n); if (!tmp) { R(0) = 0; return; }
+        size_t got = read_chunks(g->fd, tmp, (size_t)n, (off_t)((uint64_t)g->base * SECTOR + (uint32_t)pos));
+        if (got < (size_t)n) memset(tmp + got, 0, (size_t)n - got);
+        guest_write(buf, tmp, (uint32_t)n); free(tmp);
+    }
     pos += n;
     put32(slot + O_POS, (uint32_t)pos);
     put32(slot + O_CACHEIDX, 0xFFFFFFFFu);                         /* no sector cache is ever kept */
@@ -233,36 +401,38 @@ void hle_io_h_close(SH4Ctx *c) {
 }
 
 /* ---------------------------------------------------------------- DirMng lookups -> synthetic directory entries */
-static uint32_t dirent_for(const char *host) {
-    uint32_t size = reg_size(host); int id = reg_find(host, size); if (id < 0 || !g_ndir) return 0;
+static uint32_t dirent_for(const char *host, uint32_t size, uint32_t base, const char *qname) {
+    if (!base) size = reg_size(host);
+    int id = reg_find(host, size); if (id < 0 || !g_ndir) return 0;
     unsigned slot = g_ndir, lru = 0;
     for (unsigned i = 0; i < g_ndir; i++) {
-        if (g_dir[i].stamp && g_dir[i].reg == id) { slot = i; break; }
+        if (g_dir[i].stamp && g_dir[i].reg == id && g_dir[i].base == base) { slot = i; break; }
         if (g_dir[i].stamp < g_dir[lru].stamp) lru = i;
     }
     if (slot == g_ndir) {
         slot = lru; if (g_dir[slot].stamp) hle_log("[io] synthetic dirent table full (%u), recycling slot %u", g_ndir, slot);
-        g_dir[slot].reg = id;
+        g_dir[slot].reg = id; g_dir[slot].base = base;
     }
     g_dir[slot].stamp = ++g_stamp;
     uint32_t e = g_dir_base + slot * 0x2C;
     for (uint32_t o = 0; o < 0x2C; o += 4) put32(e + o, 0);
-    put32(e + 0, (uint32_t)(id + 1) << LBA_SHIFT);                 /* lba (the game adds 150 before calling gdFs) */
+    put32(e + 0, ((uint32_t)(id + 1) << LBA_SHIFT) + base);                 /* lba (the game adds 150 before calling gdFs) */
     put32(e + 4, size);
     ST8(e + 8, 0);                                                  /* flag 0 = file */
-    const char *base = strrchr(host, '/'); base = base ? base + 1 : host;
-    for (int i = 0; i < 31 && base[i]; i++) ST8(e + 10 + i, (uint8_t)base[i]);
+    const char *bn = strrchr(base ? qname : host, base ? '\\' : '/'); const char *bs = base ? qname : host; if (bn) bs = bn + 1;
+    if (base) { const char *sl = strrchr(bs, '/'); if (sl) bs = sl + 1; }
+    for (int i = 0; i < 31 && bs[i]; i++) ST8(e + 10 + i, (uint8_t)bs[i]);
     return e;
 }
 void hle_io_h_dir_find(SH4Ctx *c) {
-    const char *name = R(4) ? hle_cstr(R(4)) : 0, *dir = R(5) ? hle_cstr(R(5)) : 0; char host[1024];
-    if (!name || hle_io_resolve(dir, name, host, sizeof host)) { R(0) = 0; return; }
-    R(0) = dirent_for(host);
+    const char *name = R(4) ? hle_cstr(R(4)) : 0, *dir = R(5) ? hle_cstr(R(5)) : 0; char host[1024]; uint32_t size, base;
+    if (!name || resolve_ex(dir, name, host, sizeof host, &size, &base)) { R(0) = 0; return; }
+    R(0) = dirent_for(host, size, base, name);
 }
 void hle_io_h_dir_find_path(SH4Ctx *c) {
-    const char *path = R(4) ? hle_cstr(R(4)) : 0; char host[1024];
-    if (!path || hle_io_resolve(0, path, host, sizeof host)) { if (hle_verbose) hle_log("[io] dir lookup FAIL '%s'", path ? path : ""); R(0) = 0; return; }
-    R(0) = dirent_for(host);
+    const char *path = R(4) ? hle_cstr(R(4)) : 0; char host[1024]; uint32_t size, base;
+    if (!path || resolve_ex(0, path, host, sizeof host, &size, &base)) { if (hle_verbose) hle_log("[io] dir lookup FAIL '%s'", path ? path : ""); R(0) = 0; return; }
+    R(0) = dirent_for(host, size, base, path);
 }
 
 /* ---------------------------------------------------------------- gdFs entry points */

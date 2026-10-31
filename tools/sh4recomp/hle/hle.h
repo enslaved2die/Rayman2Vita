@@ -91,5 +91,6 @@ void hle_ta_init(void);                        /* hle/ta.c: SQ/TA packet parser,
 void hle_boot_init(SH4Ctx *c, const uint8_t *image, uint32_t len, const char *dcdata_root);
 int  hle_run_main(SH4Ctx *c);                  /* runs main under setjmp; returns 0 = returned, 1 = guest exit, 2 = fault/stop */
 void hle_stop(const char *why);                /* abort guest run from any hook (longjmp) */
+const char *hle_stop_reason(void);
 
 #endif

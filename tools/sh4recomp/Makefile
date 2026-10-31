@@ -23,7 +23,7 @@ export HGEN
 ifneq ($(filter hle build_hle/run_game,$(MAKECMDGOALS)),)
 $(shell python3 hle/mkstubs.py $(HGEN) >/dev/null)
 endif
-HLE_SRC := $(if $(HLE_MODS),$(addprefix hle/,$(addsuffix .c,$(HLE_MODS))),$(wildcard hle/*.c))   # make hle HLE_MODS="boot run_game io" to pick modules
+HLE_SRC := $(if $(HLE_MODS),$(addprefix hle/,$(addsuffix .c,$(HLE_MODS))),$(filter-out hle/vita_main.c hle/vita_gl_render.c,$(wildcard hle/*.c)))   # make hle HLE_MODS="boot run_game io" to pick modules
 HLE_OBJ := $(patsubst hle/%.c,$(HLEDIR)/%.o,$(HLE_SRC))
 HLE_GEN := $(patsubst $(HGEN)/recomp_%.c,$(HLEDIR)/recomp_%.o,$(wildcard $(HGEN)/recomp_[0-9]*.c))
 HLE_CFLAGS := -I$(HGEN) $(CFLAGS) -g -Ihle
