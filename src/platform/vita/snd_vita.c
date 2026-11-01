@@ -201,6 +201,17 @@ static SND_Vita_BGM         g_bgm;
 static SND_Vita_Bank        g_fix_bank;
 static SND_Vita_Bank        g_level_bank;
 
+/* Streaming Audio Ring Buffer (BGM / Speech Chunks) */
+#define SND_STREAM_RING_MASK        (SND_STREAM_RING_FRAMES - 1)
+
+static int16_t              g_stream_ring[SND_STREAM_RING_FRAMES * 2];
+static uint32_t             g_stream_write_pos[2] = {0, 0};
+static uint32_t             g_stream_read_pos     = 0;
+static uint32_t             g_stream_read_frac    = 0;
+static uint32_t             g_stream_sample_rate  = 22050;
+static int32_t              s_stream_pred[2]      = {0, 0};
+static int32_t              s_stream_step[2]      = {127, 127};
+
 /* ----------------------------------------------------------------------------
  * 4. Synchronization Primitives
  * ---------------------------------------------------------------------------- */
@@ -529,7 +540,9 @@ static void SND_FreeBank(SND_Vita_Bank *pBank) {
     /* Immediately stop and deactivate any voices using this bank's samples */
     for (int i = 0; i < SND_VITA_NUM_VOICES; i++) {
         if (g_voices[i].active) {
-            int match = (g_voices[i].bank_id == pBank->bank_id);
+            int match = (pBank == &g_fix_bank && g_voices[i].bank_id == 0) ||
+                        (pBank == &g_level_bank && g_voices[i].bank_id >= 1) ||
+                        (g_voices[i].bank_id == pBank->bank_id);
             if (!match && pBank->sounds) {
                 for (uint32_t s = 0; s < pBank->num_sounds; s++) {
                     if (g_voices[i].pcm_data == pBank->sounds[s].pcm_data) {
@@ -566,12 +579,12 @@ static void SND_FreeBank(SND_Vita_Bank *pBank) {
 int SND_Vita_LoadBankData(uint32_t bank_id, const uint8_t *data, size_t size, const char *name) {
     if (!data || size < 16) return -1;
 
-    SND_Vita_Bank *pTargetBank = (bank_id == 0 && !g_fix_bank.loaded) ? &g_fix_bank : &g_level_bank;
+    SND_Vita_Bank *pTargetBank = (bank_id == 0) ? &g_fix_bank : &g_level_bank;
     SND_FreeBank(pTargetBank);
 
     SND_Vita_Lock();
     pTargetBank->bank_id = bank_id;
-    int res = SND_ParseOSBData(data, size, pTargetBank, name ? name : "level_bank");
+    int res = SND_ParseOSBData(data, size, pTargetBank, name ? name : (bank_id == 0 ? "FIX.OSB" : "LEVEL.OSB"));
     SND_Vita_Unlock();
     return res;
 }
@@ -976,6 +989,97 @@ int SND_Vita_GetBGMStatus(void) {
 }
 
 /* ----------------------------------------------------------------------------
+ * 9.5. Streaming Audio Ring Buffer (BGM / Speech Chunks)
+ * ---------------------------------------------------------------------------- */
+
+void SND_Vita_FeedStreamChunk(int ch, const uint8_t *data, uint32_t bytes, int fmt, uint32_t sample_rate) {
+    if (!data || bytes == 0) return;
+    int channel = (ch == 1) ? 1 : 0;
+
+    SND_Vita_Lock();
+    if (sample_rate > 0) {
+        g_stream_sample_rate = sample_rate;
+    }
+
+    if (fmt == 1) {
+        /* Format 1: 16-bit signed PCM */
+        uint32_t num_samples = bytes / sizeof(int16_t);
+        const int16_t *pcm = (const int16_t *)data;
+        uint32_t wp = g_stream_write_pos[channel];
+        for (uint32_t i = 0; i < num_samples; i++) {
+            uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
+            g_stream_ring[idx * 2 + channel] = pcm[i];
+            if (channel == 0 && g_stream_write_pos[1] <= wp) {
+                g_stream_ring[idx * 2 + 1] = pcm[i];
+            }
+        }
+        g_stream_write_pos[channel] = wp + num_samples;
+    } else if (fmt == 2) {
+        /* Format 2: Yamaha AICA ADPCM */
+        uint32_t num_samples = bytes * 2;
+        int32_t pred = s_stream_pred[channel];
+        int32_t step = s_stream_step[channel];
+        if (step < 127) step = 127;
+
+        uint32_t wp = g_stream_write_pos[channel];
+        for (uint32_t i = 0; i < num_samples; i++) {
+            uint8_t byte = data[i >> 1];
+            uint8_t nib = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+
+            pred += (yam_diff[nib] * step) / 8;
+            if (pred > 32767) pred = 32767;
+            else if (pred < -32768) pred = -32768;
+
+            uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
+            g_stream_ring[idx * 2 + channel] = (int16_t)pred;
+            if (channel == 0 && g_stream_write_pos[1] <= wp) {
+                g_stream_ring[idx * 2 + 1] = (int16_t)pred;
+            }
+
+            int32_t st = (step * yam_scale[nib & 7]) >> 8;
+            step = (st < 127) ? 127 : ((st > 24576) ? 24576 : st);
+        }
+        s_stream_pred[channel] = pred;
+        s_stream_step[channel] = step;
+        g_stream_write_pos[channel] = wp + num_samples;
+    }
+    SND_Vita_Unlock();
+}
+
+uint32_t SND_Vita_GetStreamQueuedFrames(void) {
+    SND_Vita_Lock();
+    uint32_t write_head = (g_stream_write_pos[0] < g_stream_write_pos[1]) ? g_stream_write_pos[0] : g_stream_write_pos[1];
+    if (g_stream_write_pos[1] == 0 && g_stream_write_pos[0] > 0) {
+        write_head = g_stream_write_pos[0];
+    }
+    uint32_t queued = 0;
+    if (write_head > g_stream_read_pos) {
+        queued = write_head - g_stream_read_pos;
+    }
+    SND_Vita_Unlock();
+    return queued;
+}
+
+uint32_t SND_Vita_GetStreamFreeFrames(void) {
+    uint32_t queued = SND_Vita_GetStreamQueuedFrames();
+    return (queued < SND_STREAM_RING_FRAMES) ? (SND_STREAM_RING_FRAMES - queued) : 0;
+}
+
+void SND_Vita_ClearStream(void) {
+    SND_Vita_Lock();
+    g_stream_write_pos[0] = 0;
+    g_stream_write_pos[1] = 0;
+    g_stream_read_pos = 0;
+    g_stream_read_frac = 0;
+    s_stream_pred[0] = 0;
+    s_stream_pred[1] = 0;
+    s_stream_step[0] = 127;
+    s_stream_step[1] = 127;
+    memset(g_stream_ring, 0, sizeof(g_stream_ring));
+    SND_Vita_Unlock();
+}
+
+/* ----------------------------------------------------------------------------
  * 10. Sound Effect (SFX) Playback Control
  * ---------------------------------------------------------------------------- */
 
@@ -1004,20 +1108,28 @@ const SND_Vita_Sample *SND_Vita_GetBankSoundDescriptor(int bLevelBank, uint32_t 
     return pSample;
 }
 
-int SND_Vita_PlaySoundEx(int slot_id, uint32_t ulSoundId, float fVolume, float fPan) {
+int SND_Vita_PlaySoundEx(int voice_idx, uint32_t bank_id, uint32_t sound_id, float fVolume, float fPan, float fPitch) {
     SND_Vita_Lock();
 
     /* 1. Locate sample descriptor in loaded banks */
     const SND_Vita_Sample *pSample = NULL;
-    uint32_t bank_id = 0;
-    if (g_level_bank.loaded && ulSoundId < g_level_bank.num_sounds &&
-        g_level_bank.sounds[ulSoundId].pcm_data) {
-        pSample = &g_level_bank.sounds[ulSoundId];
-        bank_id = g_level_bank.bank_id;
-    } else if (g_fix_bank.loaded && ulSoundId < g_fix_bank.num_sounds &&
-               g_fix_bank.sounds[ulSoundId].pcm_data) {
-        pSample = &g_fix_bank.sounds[ulSoundId];
-        bank_id = g_fix_bank.bank_id;
+    uint32_t actual_bank_id = bank_id;
+    if (bank_id == 0) {
+        if (g_fix_bank.loaded && sound_id < g_fix_bank.num_sounds &&
+            g_fix_bank.sounds[sound_id].pcm_data) {
+            pSample = &g_fix_bank.sounds[sound_id];
+            actual_bank_id = 0;
+        }
+    } else {
+        if (g_level_bank.loaded && sound_id < g_level_bank.num_sounds &&
+            g_level_bank.sounds[sound_id].pcm_data) {
+            pSample = &g_level_bank.sounds[sound_id];
+            actual_bank_id = g_level_bank.bank_id ? g_level_bank.bank_id : 1;
+        } else if (g_fix_bank.loaded && sound_id < g_fix_bank.num_sounds &&
+                   g_fix_bank.sounds[sound_id].pcm_data) {
+            pSample = &g_fix_bank.sounds[sound_id];
+            actual_bank_id = 0;
+        }
     }
 
     if (!pSample || !pSample->pcm_data || pSample->num_samples == 0) {
@@ -1027,8 +1139,8 @@ int SND_Vita_PlaySoundEx(int slot_id, uint32_t ulSoundId, float fVolume, float f
 
     /* 2. Find an available voice slot (or steal the lowest volume voice) */
     int chosen_slot = -1;
-    if (slot_id >= 0 && slot_id < SND_VITA_NUM_VOICES) {
-        chosen_slot = slot_id;
+    if (voice_idx >= 0 && voice_idx < SND_VITA_NUM_VOICES) {
+        chosen_slot = voice_idx;
     } else {
         float lowest_vol = 999.0f;
         int lowest_slot = 0;
@@ -1052,16 +1164,17 @@ int SND_Vita_PlaySoundEx(int slot_id, uint32_t ulSoundId, float fVolume, float f
     /* 3. Assign voice parameters */
     SND_Vita_Voice *v = &g_voices[chosen_slot];
     v->active           = 0;
-    v->bank_id          = bank_id;
-    v->sound_id         = ulSoundId;
+    v->bank_id          = actual_bank_id;
+    v->sound_id         = sound_id;
     v->pcm_data         = pSample->pcm_data;
     v->num_samples      = pSample->num_samples;
-    v->sample_rate      = pSample->sample_rate ? pSample->sample_rate : 22050;
+    uint32_t srate      = pSample->sample_rate ? pSample->sample_rate : 22050;
+    v->sample_rate      = srate;
     v->sample_pos       = 0;
     v->sample_pos_frac  = 0;
-    float pitch         = 1.0f;
-    v->pitch            = pitch;
-    v->rate_step        = (uint32_t)(((uint64_t)(v->sample_rate * pitch) << 16) / g_nOutputSampleRate);
+    v->pitch            = fPitch > 0.0f ? fPitch : 1.0f;
+    uint32_t out_rate   = g_nOutputSampleRate ? g_nOutputSampleRate : SND_VITA_OUTPUT_RATE;
+    v->rate_step        = (uint32_t)(((uint64_t)srate * (uint64_t)(v->pitch * 65536.0f)) / (uint64_t)out_rate);
     v->volume           = (fVolume < 0.0f) ? 0.0f : ((fVolume > 1.0f) ? 1.0f : fVolume);
     v->pan              = (fPan < -1.0f) ? -1.0f : ((fPan > 1.0f) ? 1.0f : fPan);
     v->loop             = pSample->loop;
@@ -1074,7 +1187,7 @@ int SND_Vita_PlaySoundEx(int slot_id, uint32_t ulSoundId, float fVolume, float f
 }
 
 int SND_Vita_PlaySound(uint32_t ulSoundId, float fVolume, float fPan) {
-    return SND_Vita_PlaySoundEx(-1, ulSoundId, fVolume, fPan);
+    return SND_Vita_PlaySoundEx(-1, 1, ulSoundId, fVolume, fPan, 1.0f);
 }
 
 void SND_Vita_SetVoicePan(int voice_index, float fPan) {
@@ -1104,7 +1217,8 @@ void SND_Vita_SetVoicePitch(int voice_index, float fPitch) {
             float pitch = (fPitch <= 0.05f) ? 0.05f : fPitch;
             g_voices[voice_index].pitch = pitch;
             uint32_t srate = g_voices[voice_index].sample_rate ? g_voices[voice_index].sample_rate : 22050;
-            g_voices[voice_index].rate_step = (uint32_t)(((uint64_t)(srate * pitch) << 16) / g_nOutputSampleRate);
+            uint32_t out_rate = g_nOutputSampleRate ? g_nOutputSampleRate : SND_VITA_OUTPUT_RATE;
+            g_voices[voice_index].rate_step = (uint32_t)(((uint64_t)srate * (uint64_t)(pitch * 65536.0f)) / (uint64_t)out_rate);
         }
         SND_Vita_Unlock();
     }
@@ -1114,7 +1228,7 @@ int SND_Vita_SendCommand(uint8_t uCmd, uint8_t uHandle, int32_t lParam1, int32_t
     (void)lParam2;
     switch (uCmd) {
         case 0x11: /* Key-On / Trigger */
-            return SND_Vita_PlaySoundEx((int)uHandle, (uint32_t)lParam1, 1.0f, 0.0f);
+            return SND_Vita_PlaySoundEx((int)uHandle, 1, (uint32_t)lParam1, 1.0f, 0.0f, 1.0f);
         case 0x12: /* Key-Off / Stop */
             SND_Vita_StopVoice((int)uHandle);
             return 0;
@@ -1330,6 +1444,50 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
 
         g_bgm.current_frame = curr_frame;
         g_bgm.frame_frac    = frac;
+    }
+
+    /* Mix Streaming Ring Buffer (BGM / Speech Chunks) */
+    uint32_t stream_write_head = (g_stream_write_pos[0] < g_stream_write_pos[1]) ? g_stream_write_pos[0] : g_stream_write_pos[1];
+    if (g_stream_write_pos[1] == 0 && g_stream_write_pos[0] > 0) {
+        stream_write_head = g_stream_write_pos[0];
+    }
+    if (stream_write_head > g_stream_read_pos) {
+        float effective_stream_vol = g_fBGMVolume * master_vol;
+        int32_t igain = (int32_t)(effective_stream_vol * 32768.0f);
+
+        uint32_t out_rate = g_nOutputSampleRate ? g_nOutputSampleRate : SND_VITA_OUTPUT_RATE;
+        uint32_t srate = g_stream_sample_rate ? g_stream_sample_rate : 22050;
+        uint32_t step = (uint32_t)(((uint64_t)srate << 16) / out_rate);
+
+        uint32_t curr_pos = g_stream_read_pos;
+        uint32_t frac = g_stream_read_frac;
+
+        for (uint32_t i = 0; i < frames_to_process; i++) {
+            if (curr_pos >= stream_write_head) {
+                break;
+            }
+
+            uint32_t f0 = curr_pos & SND_STREAM_RING_MASK;
+            uint32_t f1 = (curr_pos + 1 < stream_write_head) ? ((curr_pos + 1) & SND_STREAM_RING_MASK) : f0;
+
+            int32_t sl0 = g_stream_ring[f0 * 2 + 0];
+            int32_t sr0 = g_stream_ring[f0 * 2 + 1];
+            int32_t sl1 = g_stream_ring[f1 * 2 + 0];
+            int32_t sr1 = g_stream_ring[f1 * 2 + 1];
+
+            int32_t interp_l = sl0 + (((sl1 - sl0) * (int32_t)(frac >> 8)) >> 8);
+            int32_t interp_r = sr0 + (((sr1 - sr0) * (int32_t)(frac >> 8)) >> 8);
+
+            mix_l[i] += (interp_l * igain) >> 15;
+            mix_r[i] += (interp_r * igain) >> 15;
+
+            frac += step;
+            curr_pos += (frac >> 16);
+            frac &= 0xFFFF;
+        }
+
+        g_stream_read_pos  = curr_pos;
+        g_stream_read_frac = frac;
     }
 
     /* 2. Mix 16 Active SFX Voices */
@@ -1590,7 +1748,7 @@ int SND_Vita_InitEx(int spawn_thread) {
     OS_Vita_LogInfo("[SND] Initializing Yamaha AICA audio streamer subsystem (spawn_thread=%d)...", spawn_thread);
 
 #if defined(__vita__)
-    g_hAudioMutex = sceKernelCreateMutex("Rayman2_AudioMutex", 0, 0, NULL);
+    g_hAudioMutex = sceKernelCreateMutex("Rayman2_AudioMutex", 2, 0, NULL); /* 2 = SCE_KERNEL_MUTEX_ATTR_RECURSIVE */
     if (g_hAudioMutex < 0) {
         OS_Vita_LogError("[SND] Failed to create audio mutex: 0x%08X", g_hAudioMutex);
         return -1;
@@ -1599,11 +1757,17 @@ int SND_Vita_InitEx(int spawn_thread) {
 
     SND_Vita_Lock();
 
-    /* Reset voices and channels */
+    /* Reset voices, channels, and stream ring */
     memset(g_voices, 0, sizeof(g_voices));
     memset(&g_bgm, 0, sizeof(g_bgm));
     memset(&g_fix_bank, 0, sizeof(g_fix_bank));
     memset(&g_level_bank, 0, sizeof(g_level_bank));
+    memset(g_stream_ring, 0, sizeof(g_stream_ring));
+    g_stream_write_pos[0] = g_stream_write_pos[1] = 0;
+    g_stream_read_pos = g_stream_read_frac = 0;
+    s_stream_pred[0] = s_stream_pred[1] = 0;
+    s_stream_step[0] = s_stream_step[1] = 127;
+    g_stream_sample_rate = 22050;
 
     g_nOutputSampleRate = SND_VITA_OUTPUT_RATE;
     g_fMasterVolume = 1.0f;
@@ -1664,6 +1828,7 @@ void SND_Vita_Shutdown(void) {
     /* Stop music and voices */
     SND_StopMusic_Locked();
     SND_StopAllVoices_Locked();
+    SND_Vita_ClearStream();
 
     /* Unload banks */
     SND_Vita_UnloadBank();

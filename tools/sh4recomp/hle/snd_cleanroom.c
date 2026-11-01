@@ -62,10 +62,12 @@ typedef struct SndSlotState {
     float       volume;         /* Normalized linear volume [0.0f, 1.0f] */
     float       pan;            /* Stereo panning [-1.0f (left), +1.0f (right)] */
     int16_t     pitch;          /* Raw pitch/detune delta */
+    float       pitch_ratio;    /* Pitch scale ratio */
     int         voice_index;    /* Cleanroom voice index assigned (0..7) */
 } SndSlotState;
 
 static SndSlotState s_slots[SND_HLE_MAX_SLOTS];
+static uint32_t     s_handle_to_slot[SND_HLE_MAX_SLOTS];
 static uint32_t     s_slot_counter = 0;
 static int          s_cleanroom_inited = 0;
 static float        s_cleanroom_master_vol = 1.0f;
@@ -91,7 +93,7 @@ __attribute__((weak)) int SND_Vita_LoadBankData(uint32_t bank_id, const uint8_t 
 __attribute__((weak)) void SND_Vita_UnloadBank(void) {}
 __attribute__((weak)) void SND_Vita_UnloadFixBank(void) {}
 __attribute__((weak)) int SND_Vita_PlaySound(uint32_t id, float v, float p) { (void)id; (void)v; (void)p; return 0; }
-__attribute__((weak)) int SND_Vita_PlaySoundEx(int slot, uint32_t id, float v, float p) { (void)slot; (void)id; (void)v; (void)p; return 0; }
+__attribute__((weak)) int SND_Vita_PlaySoundEx(int slot, uint32_t bank, uint32_t id, float v, float p, float pitch) { (void)slot; (void)bank; (void)id; (void)v; (void)p; (void)pitch; return 0; }
 __attribute__((weak)) int SND_Vita_IsVoicePlaying(int voice_idx) { (void)voice_idx; return 0; }
 __attribute__((weak)) void SND_Vita_StopVoice(int idx) { (void)idx; }
 __attribute__((weak)) void SND_Vita_StopAllVoices(void) {}
@@ -102,6 +104,10 @@ __attribute__((weak)) int SND_Vita_PlayMusic(const char *path, int loop) { (void
 __attribute__((weak)) void SND_Vita_StopMusic(void) {}
 __attribute__((weak)) void SND_Vita_PauseMusic(void) {}
 __attribute__((weak)) void SND_Vita_ResumeMusic(void) {}
+__attribute__((weak)) void SND_Vita_FeedStreamChunk(int ch, const uint8_t *data, uint32_t bytes, int fmt, uint32_t sample_rate) { (void)ch; (void)data; (void)bytes; (void)fmt; (void)sample_rate; }
+__attribute__((weak)) uint32_t SND_Vita_GetStreamQueuedFrames(void) { return 0; }
+__attribute__((weak)) uint32_t SND_Vita_GetStreamFreeFrames(void) { return 65536; }
+__attribute__((weak)) void SND_Vita_ClearStream(void) {}
 __attribute__((weak)) void SND_Vita_SetMasterVolume(float v) { (void)v; }
 __attribute__((weak)) void SND_Vita_SetBGMVolume(float v) { (void)v; }
 __attribute__((weak)) void SND_Vita_SetSFXVolume(float v) { (void)v; }
@@ -116,8 +122,13 @@ static inline uint8_t get_slot_id(uint32_t handle) {
     if (handle >= 0x8C2E2CD8u && handle < 0x8C2E34D8u) {
         return (uint8_t)((handle - 0x8C2E2CD8u) >> 8);
     }
+    for (int i = 0; i < SND_HLE_MAX_SLOTS; i++) {
+        if (s_handle_to_slot[i] != 0 && s_handle_to_slot[i] == handle) {
+            return (uint8_t)i;
+        }
+    }
     if (handle) {
-        return (uint8_t)(LD8(handle + 1) & (SND_HLE_MAX_SLOTS - 1));
+        return (uint8_t)(LD8(handle + 1) & 7);
     }
     return 0;
 }
@@ -133,10 +144,12 @@ static void hle_sdLibInit(SH4Ctx *c) {
         LOG_INFO("sdLibInit (0x8C0F0A48): initializing cleanroom audio engine");
         SND_Vita_Init();
         memset(s_slots, 0, sizeof(s_slots));
+        memset(s_handle_to_slot, 0, sizeof(s_handle_to_slot));
         for (int i = 0; i < SND_HLE_MAX_SLOTS; i++) {
             s_slots[i].voice_index = i;
             s_slots[i].volume = 1.0f;
             s_slots[i].pan = 0.0f;
+            s_slots[i].pitch_ratio = 1.0f;
         }
         s_cleanroom_inited = 1;
     }
@@ -144,9 +157,9 @@ static void hle_sdLibInit(SH4Ctx *c) {
 
 /* sdDrvInit (0x8C0F0948): Sega sound driver upload and release */
 static void hle_sdDrvInit(SH4Ctx *c) {
-    LOG_INFO("sdDrvInit (0x8C0F0948): loading FIX.OSB sound bank");
+    LOG_INFO("sdDrvInit (0x8C0F0948): initializing driver tables and loading FIX.OSB");
+    hle_orig(c, 0x8C0F0948);
     SND_Vita_LoadFixBank();
-    c->r[0] = 0; /* Return 0: Success */
 }
 
 /* Game sound init (0x8C098776): Rayman 2 sound manager initialization */
@@ -158,11 +171,17 @@ static void hle_game_sound_init(SH4Ctx *c) {
 
 /* sdHandleSlotCreate (0x8C0F066C): creates a 0x100-byte voice handle slot */
 static void hle_sdHandleSlotCreate(SH4Ctx *c) {
-    uint32_t handle = c->r[4];
+    uint32_t out_handle_ptr = c->r[4];
+    uint8_t slot_id = (out_handle_ptr >= 0x8C2E2CD8u && out_handle_ptr < 0x8C2E34D8u)
+                          ? (uint8_t)((out_handle_ptr - 0x8C2E2CD8u) >> 8)
+                          : (uint8_t)(s_slot_counter++ & 7);
     hle_orig(c, 0x8C0F066C);
-    uint8_t slot_id = get_slot_id(handle);
-    if (handle) {
-        ST8(handle + 1, slot_id);
+    if (out_handle_ptr) {
+        uint32_t real_handle = LD32(out_handle_ptr);
+        if (real_handle) {
+            s_handle_to_slot[slot_id] = real_handle;
+            ST8(real_handle + 1, slot_id);
+        }
     }
 }
 
@@ -196,7 +215,20 @@ static void hle_sdBankLoad(SH4Ctx *c) {
 
 /* sdBankUploadHelper (0x8C0EFC44): helper called during bank upload */
 static void hle_sdBankUploadHelper(SH4Ctx *c) {
-    c->r[0] = 0; /* Return 0: Success */
+    uint32_t desc_ptr = c->r[4];
+    uint32_t magic    = c->r[5];
+    uint32_t bank_idx = c->r[6];
+    (void)magic;
+
+    if (desc_ptr) {
+        uint32_t sosb_ptr = LD32(desc_ptr + 8);
+        uint32_t sosb_sz  = LD32(desc_ptr + 12);
+        if (sosb_ptr && sosb_sz > 0) {
+            SND_Vita_LoadBankData(bank_idx, (const uint8_t *)hle_ptr(sosb_ptr), sosb_sz,
+                                  bank_idx == 0 ? "FIX.OSB" : "LEVEL.OSB");
+        }
+    }
+    hle_orig(c, 0x8C0EFC44);
 }
 
 /* ----------------------------------------------------------------------------
@@ -220,7 +252,8 @@ static void hle_sdVoiceStart(SH4Ctx *c) {
     slot->sample_pos = 0;
 
     /* Trigger voice playback via cleanroom mixer */
-    SND_Vita_PlaySoundEx(slot_id, sound_id, slot->volume, slot->pan);
+    float pitch = slot->pitch_ratio > 0.0f ? slot->pitch_ratio : 1.0f;
+    SND_Vita_PlaySoundEx(slot_id, bank_id, sound_id, slot->volume, slot->pan, pitch);
 
     c->r[0] = 0; /* Return 0: Success */
 }
@@ -264,9 +297,11 @@ static void hle_sdVoiceVol(SH4Ctx *c) {
     int8_t   vol_val = (int8_t)(c->r[5] & 0xFF);
 
     s_stat_vol_updates++;
-    /* Convert Dreamcast attenuation: 0 = max volume, negative = attenuation in dB */
+    /* Convert Dreamcast attenuation: 0 dB = max volume, negative = attenuation in dB */
     float fVol;
-    if (vol_val >= 0) {
+    if (vol_val == 0) {
+        fVol = 1.0f;
+    } else if (vol_val > 0) {
         fVol = (float)vol_val / 127.0f;
     } else if (vol_val <= -120) {
         fVol = 0.0f;
@@ -290,6 +325,9 @@ static void hle_sdVoicePitch(SH4Ctx *c) {
     int16_t  pitch   = (int16_t)(c->r[5] & 0xFFFF);
 
     s_slots[slot_id].pitch = pitch;
+    float ratio = powf(2.0f, (float)pitch / 3072.0f);
+    s_slots[slot_id].pitch_ratio = ratio;
+    SND_Vita_SetVoicePitch(slot_id, ratio);
 
     c->r[0] = 0; /* Return 0: Success */
 }
@@ -359,17 +397,19 @@ static void hle_sdGetPos(SH4Ctx *c) {
 static void hle_stream_open(SH4Ctx *c) {
     hle_orig(c, 0x8C06262C);
     uint32_t state = LD32(STREAM_CTX_ADDR);
-    if (state == 1) {
-        /* Extract volume from stream context (+0x15 byte) */
-        uint8_t vol_byte = LD8(STREAM_CTX_ADDR + 0x15);
+    if (state != 0) {
+        /* Extract volume from stream context (+0x54 byte) */
+        uint8_t vol_byte = LD8(STREAM_CTX_ADDR + 0x54);
         float vol = (float)vol_byte / 100.0f;
+        if (vol > 1.0f) vol = 1.0f;
         SND_Vita_SetBGMVolume(vol);
-        LOG_INFO("stream_open (0x8C06262C): stream active, initial BGM volume: %.2f", vol);
+        LOG_INFO("stream_open (0x8C06262C): stream active (state=%u), initial BGM volume: %.2f", state, vol);
     }
 }
 
 /* Stream Stop (0x8C0628A8): stops streaming BGM and invokes end callback */
 static void hle_stream_stop(SH4Ctx *c) {
+    SND_Vita_ClearStream();
     SND_Vita_StopMusic();
     hle_orig(c, 0x8C0628A8);
 }
@@ -392,6 +432,7 @@ static void hle_stream_volume(SH4Ctx *c) {
     if (arg) {
         uint8_t vol_byte = LD8(arg + 4);
         float vol = (float)vol_byte / 100.0f;
+        if (vol > 1.0f) vol = 1.0f;
         SND_Vita_SetBGMVolume(vol);
     }
     hle_orig(c, 0x8C062870);
@@ -401,6 +442,61 @@ static void hle_stream_volume(SH4Ctx *c) {
 static void hle_stream_feed(SH4Ctx *c) {
     s_stat_stream_feeds++;
     hle_orig(c, 0x8C062F60);
+}
+
+/* sdStreamTransferChunk (0x8C0E3404): transfers a stream chunk to channel buffer */
+static void hle_sdStreamTransferChunk(SH4Ctx *c) {
+    uint32_t handle   = c->r[4];
+    uint32_t ch       = c->r[5];
+    uint32_t src_addr = c->r[6];
+    uint32_t byte_len = c->r[7];
+    (void)handle;
+
+    uint32_t fmt = LD32(STREAM_CTX_ADDR + 0x1C);
+    uint32_t sample_rate = 22050;
+    uint32_t sound_def = LD32(STREAM_CTX_ADDR + 0x24);
+    if (sound_def) {
+        uint32_t srate = LD32(sound_def + 0x4C);
+        if (srate >= 8000 && srate <= 48000) {
+            sample_rate = srate;
+        }
+    }
+
+    if (src_addr && byte_len > 0) {
+        SND_Vita_FeedStreamChunk((int)ch, (const uint8_t *)hle_ptr(src_addr), byte_len, (int)fmt, sample_rate);
+    }
+
+    hle_orig(c, 0x8C0E3404);
+}
+
+/* sdStreamCheckRoom (0x8C0E2D50): checks available space in stream ring buffer */
+static void hle_sdStreamCheckRoom(SH4Ctx *c) {
+    uint32_t req_bytes    = c->r[6];
+    uint32_t out_room_ptr = c->r[7];
+
+    if (out_room_ptr) {
+        if (SND_Vita_GetStreamFreeFrames() >= 2048) {
+            ST32(out_room_ptr, req_bytes);
+        } else {
+            ST32(out_room_ptr, 0);
+        }
+    }
+    c->r[0] = 0;
+}
+
+/* sdStreamGetPos (0x8C0E2CC0): returns playback position for stream EOF detection */
+static void hle_sdStreamGetPos(SH4Ctx *c) {
+    uint32_t out_pos_ptr = c->r[6];
+
+    if (out_pos_ptr) {
+        if (SND_Vita_GetStreamQueuedFrames() > 0) {
+            ST32(out_pos_ptr, 0);
+        } else {
+            uint32_t eof_thresh = LD32(STREAM_CTX_ADDR + 0x14);
+            ST32(out_pos_ptr, eof_thresh + 1);
+        }
+    }
+    c->r[0] = 0;
 }
 
 /* Stream Tick Dispatcher (0x8C0625B8): steady-state stream catch-up loop */
@@ -467,6 +563,9 @@ __attribute__((constructor)) static void snd_cleanroom_register_hooks(void) {
     hle_hook(0x8C062870, hle_stream_volume);
     hle_hook(0x8C0625B8, hle_stream_tick);
     hle_hook(0x8C062F60, hle_stream_feed);
+    hle_hook(0x8C0E3404, hle_sdStreamTransferChunk);
+    hle_hook(0x8C0E2D50, hle_sdStreamCheckRoom);
+    hle_hook(0x8C0E2CC0, hle_sdStreamGetPos);
 }
 
 /* ----------------------------------------------------------------------------

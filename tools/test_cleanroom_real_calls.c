@@ -325,6 +325,38 @@ static bool test_streaming_bgm_lifecycle(void) {
     assert(SND_Vita_GetBGMStatus() == 0);
     printf(" - Stop BGM: status=%d [OK]\n", SND_Vita_GetBGMStatus());
 
+    /* 7. Stream Ring Buffer Verification (Chunk-based streaming engine) */
+    SND_Vita_ClearStream();
+    assert(SND_Vita_GetStreamQueuedFrames() == 0);
+    assert(SND_Vita_GetStreamFreeFrames() == 65536);
+
+    /* Feed 2048 bytes of PCM16 (1024 frames) to L and R */
+    int16_t dummy_pcm[1024];
+    for (int i = 0; i < 1024; i++) dummy_pcm[i] = (int16_t)(sinf(i * 0.05f) * 10000.0f);
+    SND_Vita_FeedStreamChunk(0, (const uint8_t *)dummy_pcm, sizeof(dummy_pcm), 1, 22050);
+    SND_Vita_FeedStreamChunk(1, (const uint8_t *)dummy_pcm, sizeof(dummy_pcm), 1, 22050);
+    assert(SND_Vita_GetStreamQueuedFrames() == 1024);
+    assert(SND_Vita_GetStreamFreeFrames() == 65536 - 1024);
+
+    /* Feed 2048 bytes of Yamaha ADPCM (4096 frames) to L and R */
+    uint8_t dummy_adpcm[2048];
+    memset(dummy_adpcm, 0x11, sizeof(dummy_adpcm));
+    SND_Vita_FeedStreamChunk(0, dummy_adpcm, sizeof(dummy_adpcm), 2, 22050);
+    SND_Vita_FeedStreamChunk(1, dummy_adpcm, sizeof(dummy_adpcm), 2, 22050);
+    assert(SND_Vita_GetStreamQueuedFrames() == 1024 + 4096);
+
+    /* Mix audio and ensure frames are consumed */
+    int16_t stream_test_buf[2048];
+    SND_Vita_MixStereoBuffer(stream_test_buf, 1024);
+    int64_t stream_energy = 0;
+    for (int i = 0; i < 2048; i++) stream_energy += abs(stream_test_buf[i]);
+    assert(stream_energy > 0);
+    assert(SND_Vita_GetStreamQueuedFrames() < 1024 + 4096);
+
+    SND_Vita_ClearStream();
+    assert(SND_Vita_GetStreamQueuedFrames() == 0);
+    printf(" - Stream Ring Buffer (Feed, ADPCM, Mix & Reset): PASS [OK]\n");
+
     printf(COLOR_GREEN "Streaming BGM lifecycle: PASS [OK]" COLOR_RESET "\n\n");
     return true;
 }

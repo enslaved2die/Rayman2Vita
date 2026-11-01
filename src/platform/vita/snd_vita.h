@@ -288,13 +288,15 @@ const SND_Vita_Sample *SND_Vita_GetBankSoundDescriptor(int bLevelBank, uint32_t 
 /**
  * @brief Plays a sound effect with explicit slot targeting or auto-allocation.
  *
- * @param slot_id   Target voice slot (0..15), or -1 for auto-allocation / stealing.
- * @param ulSoundId Sound index in the bank.
+ * @param voice_idx Target voice slot (0..15), or -1 for auto-allocation / stealing.
+ * @param bank_id   Sound bank ID (0 = FIX bank, >= 1 = level bank).
+ * @param sound_id  Sound index in the bank.
  * @param fVolume   Voice volume (0.0f silent to 1.0f full).
  * @param fPan      Stereo panning (-1.0f left, 0.0f center, +1.0f right).
+ * @param fPitch    Pitch scale ratio (1.0f = normal).
  * @return Allocated voice index (0..15), or -1 if no voice could be assigned.
  */
-int     SND_Vita_PlaySoundEx(int slot_id, uint32_t ulSoundId, float fVolume, float fPan);
+int     SND_Vita_PlaySoundEx(int voice_idx, uint32_t bank_id, uint32_t sound_id, float fVolume, float fPan, float fPitch);
 
 /**
  * @brief Triggers a sound effect voice using a bank-relative Sound ID.
@@ -419,6 +421,37 @@ void    SND_Vita_PauseMusic(void);
  * @brief Resumes paused BGM playback.
  */
 void    SND_Vita_ResumeMusic(void);
+
+/* ----------------------------------------------------------------------------
+ * 8. Streaming Audio Ring Buffer (BGM / Speech Chunks)
+ * ---------------------------------------------------------------------------- */
+#define SND_STREAM_RING_FRAMES      65536
+
+/**
+ * @brief Feeds a decompressed/compressed audio stream chunk into the ring buffer.
+ *
+ * @param ch          Channel index (0 = Left, 1 = Right).
+ * @param data        Raw chunk bytes.
+ * @param bytes       Number of bytes in data.
+ * @param fmt         Audio format: 1 = PCM16, 2 = Yamaha ADPCM.
+ * @param sample_rate Sample rate in Hz (e.g. 22050).
+ */
+void    SND_Vita_FeedStreamChunk(int ch, const uint8_t *data, uint32_t bytes, int fmt, uint32_t sample_rate);
+
+/**
+ * @brief Returns total number of stereo frames currently queued in stream ring buffer.
+ */
+uint32_t SND_Vita_GetStreamQueuedFrames(void);
+
+/**
+ * @brief Returns total number of free stereo frames available in stream ring buffer.
+ */
+uint32_t SND_Vita_GetStreamFreeFrames(void);
+
+/**
+ * @brief Resets stream ring buffer and per-channel decoder state.
+ */
+void    SND_Vita_ClearStream(void);
 
 /* ----------------------------------------------------------------------------
  * 8. Volume & Panning Control
