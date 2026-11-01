@@ -1567,12 +1567,12 @@ int SND_Vita_AudioThreadFunc(uint32_t args, void *argp) {
 }
 #endif
 
-int SND_Vita_Init(void) {
+int SND_Vita_InitEx(int spawn_thread) {
     if (g_bAudioInitialized) {
         return 0;
     }
 
-    OS_Vita_LogInfo("[SND] Initializing Yamaha AICA audio streamer subsystem...");
+    OS_Vita_LogInfo("[SND] Initializing Yamaha AICA audio streamer subsystem (spawn_thread=%d)...", spawn_thread);
 
 #if defined(__vita__)
     g_hAudioMutex = sceKernelCreateMutex("Rayman2_AudioMutex", 0, 0, NULL);
@@ -1599,24 +1599,35 @@ int SND_Vita_Init(void) {
     SND_Vita_Unlock();
 
 #if defined(__vita__)
-    g_hAudioThread = sceKernelCreateThread("Rayman2_AudioThread",
-                                           SND_Vita_AudioThreadFunc,
-                                           SND_VITA_THREAD_PRIORITY,
-                                           SND_VITA_THREAD_STACK_SIZE,
-                                           0, 0, NULL);
-    if (g_hAudioThread >= 0) {
-        sceKernelStartThread(g_hAudioThread, 0, NULL);
-        OS_Vita_LogInfo("[SND] Spawned audio thread 'Rayman2_AudioThread' (UID: 0x%08X, prio: 0x%X)",
-                        g_hAudioThread, SND_VITA_THREAD_PRIORITY);
+    if (spawn_thread) {
+        g_hAudioThread = sceKernelCreateThread("Rayman2_AudioThread",
+                                               SND_Vita_AudioThreadFunc,
+                                               SND_VITA_THREAD_PRIORITY,
+                                               SND_VITA_THREAD_STACK_SIZE,
+                                               0, 0, NULL);
+        if (g_hAudioThread >= 0) {
+            sceKernelStartThread(g_hAudioThread, 0, NULL);
+            OS_Vita_LogInfo("[SND] Spawned audio thread 'Rayman2_AudioThread' (UID: 0x%08X, prio: 0x%X)",
+                            g_hAudioThread, SND_VITA_THREAD_PRIORITY);
+        } else {
+            OS_Vita_LogError("[SND] Failed to spawn audio thread: 0x%08X", g_hAudioThread);
+            return -1;
+        }
     } else {
-        OS_Vita_LogError("[SND] Failed to spawn audio thread: 0x%08X", g_hAudioThread);
-        return -1;
+        g_hAudioThread = -1;
+        OS_Vita_LogInfo("[SND] External audio thread mode (Rayman2_AudioThread not spawned)");
     }
+#else
+    (void)spawn_thread;
 #endif
 
     g_bAudioInitialized = 1;
     OS_Vita_LogInfo("[SND] Audio subsystem successfully initialized");
     return 0;
+}
+
+int SND_Vita_Init(void) {
+    return SND_Vita_InitEx(0);
 }
 
 void SND_Vita_Shutdown(void) {

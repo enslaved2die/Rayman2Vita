@@ -161,8 +161,16 @@ void    SND_Vita_DecodeAICA_Stereo(const uint8_t *src, int16_t *dst, uint32_t nu
  * ---------------------------------------------------------------------------- */
 
 /**
+ * @brief Initializes the PS Vita audio subsystem with option to spawn worker thread.
+ * @param spawn_thread If non-zero, spawns dedicated Rayman2_AudioThread. If 0,
+ *                     mixing is driven externally (e.g. via snd_mix).
+ * @return 0 on success, negative error code on failure.
+ */
+int     SND_Vita_InitEx(int spawn_thread);
+
+/**
  * @brief Initializes the PS Vita audio subsystem, allocates voice pools,
- *        creates thread mutex, and spawns the dedicated high-priority audio worker thread.
+ *        creates thread mutex, and delegates mixing to an external thread (spawn_thread = 0).
  * @return 0 on success, negative error code on failure.
  */
 int     SND_Vita_Init(void);

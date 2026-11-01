@@ -81,6 +81,7 @@ static uint64_t     s_stat_stream_feeds = 0;
 
 /* Weak fallbacks for cleanroom API if compiled in standalone mode */
 #if !defined(__vita__)
+__attribute__((weak)) int SND_Vita_InitEx(int spawn_thread) { (void)spawn_thread; return 0; }
 __attribute__((weak)) int SND_Vita_Init(void) { return 0; }
 __attribute__((weak)) void SND_Vita_Shutdown(void) {}
 __attribute__((weak)) int SND_Vita_IsInitialized(void) { return 1; }
