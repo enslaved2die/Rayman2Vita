@@ -88,12 +88,19 @@ COLD_FILTER     := python3 $(HLE_DIR)/coldmark.py $(HOT_LIST)
 else
 COLD_FILTER     := python3 $(HLE_DIR)/coldmark.py $(HOT_LIST) '$(OPT_COLD)'
 endif
+
+# Render thread (R2_RENDER_THREAD): 1 (default) = dedicated GL thread; 0 = inline on game thread
+RENDER_THREAD   ?= 1
+ifeq ($(RENDER_THREAD),0)
+V_DEFS          += -DR2_RENDER_THREAD=0
+endif
+
 CFLAGS          := $(OPT) -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
                    -fno-strict-aliasing -ffunction-sections -fdata-sections \
                    $(V_DEFS) $(EXTRA_CFLAGS) \
                    -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-label \
                    -DCPA_PLATFORM_VITA -DR2_DREAMCAST_BASELINE -D__vita__ \
-                   -I$(RECOMP_DIR) -I$(HGEN) -I$(HLE_DIR)
+                   -I$(RECOMP_DIR) -I$(HGEN) -I$(HLE_DIR) -Iinclude -Isrc/platform/vita
 
 LDFLAGS         := -Wl,-q -Wl,--gc-sections -L$(VITASDK)/arm-vita-eabi/lib
 # V_ORDER=1 (variants *_packed): a linker script (default script + hot list, hotorder.py) puts the .text.f_<addr> sections of the profiled hot functions (hot_funcs.txt, most-called first) contiguously at the
@@ -129,8 +136,14 @@ LIBS            := -lvitaGL \
                    -lstdc++ \
                    -lm
 
-# Audio module (owned elsewhere): linked when present; build with SND_SRC= to leave it out.
+# Audio module: cleanroom audio engine (0 = fallback to AICA emulator snd.c, 1 = cleanroom audio)
+USE_CLEANROOM_AUDIO ?= 0
+ifeq ($(USE_CLEANROOM_AUDIO),1)
+SND_SRC         ?= $(HLE_DIR)/snd_cleanroom.c
+EXTRA_OBJS      += $(BUILD_DIR)/snd_vita.o
+else
 SND_SRC         ?= $(wildcard $(HLE_DIR)/snd.c)
+endif
 
 # Generated recompilation translation units
 RECOMP_SRCS     := $(wildcard $(HGEN)/recomp_[0-9]*.c)
@@ -156,7 +169,7 @@ COMMON_OBJS     := $(BUILD_DIR)/recomp_functab.o \
                    $(BUILD_DIR)/hook_stubs.o
 
 COMMON_OBJS     += $(BUILD_DIR)/variant.o
-ALL_OBJS        := $(RECOMP_OBJS) $(COMMON_OBJS) $(HLE_OBJS)
+ALL_OBJS        := $(RECOMP_OBJS) $(COMMON_OBJS) $(HLE_OBJS) $(EXTRA_OBJS)
 
 ELF             := $(BUILD_DIR)/$(TARGET).elf
 VELF            := $(BUILD_DIR)/$(TARGET).velf
@@ -181,7 +194,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 # variant.c: name + flags of this build (rewritten only when the text changes, so make stays quiet); linked into the binary and logged by vita_main.c / perf.c
-VARIANT_FLAGS   := OPT_HOT=[$(OPT_HOT)] OPT_COLD=[$(OPT_COLD)] V_DEFS=[$(V_DEFS)] EXTRA_CFLAGS=[$(EXTRA_CFLAGS)] ORDER=$(if $(V_ORDER),hot-first,none) PROFILE=$(PROFILE)
+VARIANT_FLAGS   := OPT_HOT=[$(OPT_HOT)] OPT_COLD=[$(OPT_COLD)] V_DEFS=[$(V_DEFS)] EXTRA_CFLAGS=[$(EXTRA_CFLAGS)] ORDER=$(if $(V_ORDER),hot-first,none) PROFILE=$(PROFILE) AUDIO=$(if $(filter 1,$(USE_CLEANROOM_AUDIO)),cleanroom,aica)
 VAR_ESC         = $(subst ",\",$(subst \,\\,$(1)))
 .PHONY: FORCE
 FORCE:
@@ -216,6 +229,8 @@ $(BUILD_DIR)/hook_stubs.o: $(BUILD_DIR)/hook_stubs.c $(HLE_DIR)/hle.h $(HLE_DIR)
 $(BUILD_DIR)/hle_%.o: $(HLE_DIR)/%.c $(HLE_DIR)/hle.h $(HLE_DIR)/hle_priv.h $(RECOMP_DIR)/runtime.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/snd_vita.o: src/platform/vita/snd_vita.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
 $(ELF): $(ALL_OBJS) $(if $(V_ORDER),$(HOT_ORDER)) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(filter-out %.ld,$^) $(LIBS) -o $@
 

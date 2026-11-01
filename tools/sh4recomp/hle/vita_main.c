@@ -344,15 +344,18 @@ static int audio_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
     int port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, 1024, 48000, SCE_AUDIO_OUT_MODE_STEREO);
     if (port < 0) { vita_log_aud("[vita] audio: sceAudioOutOpenPort failed 0x%08x", port); return 0; }
-    static int16_t buf[1024 * 2];
+    static int16_t buf[2][1024 * 2] __attribute__((aligned(64)));
+    int buf_idx = 0;
     unsigned long blocks = 0; int peak = 0, gpeak = 0; uint32_t aud_win_max = 0;
     uint64_t last = sceKernelGetProcessTimeWide();
     vita_log_aud("[vita] audio thread running (port %d)", port);
     for (;;) {
-        { uint64_t tm0 = sceKernelGetProcessTimeWide(); snd_mix(buf, 1024); uint32_t d = (uint32_t)(sceKernelGetProcessTimeWide() - tm0);
+        int16_t *cur_buf = buf[buf_idx];
+        { uint64_t tm0 = sceKernelGetProcessTimeWide(); snd_mix(cur_buf, 1024); uint32_t d = (uint32_t)(sceKernelGetProcessTimeWide() - tm0);
           g_perf.aud_us_tot += d; g_perf.aud_blocks++; if (d > aud_win_max) aud_win_max = d; }
-        for (int i = 0; i < 2048; i++) { int v = buf[i] < 0 ? -buf[i] : buf[i]; if (v > peak) peak = v; }
-        sceAudioOutOutput(port, buf);
+        for (int i = 0; i < 2048; i++) { int v = cur_buf[i] < 0 ? -cur_buf[i] : cur_buf[i]; if (v > peak) peak = v; }
+        sceAudioOutOutput(port, cur_buf);
+        buf_idx ^= 1;
         blocks++;
         uint64_t now = sceKernelGetProcessTimeWide();
         if (now - last >= 5000000) {

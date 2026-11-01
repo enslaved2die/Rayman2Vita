@@ -86,7 +86,13 @@ LIVEAREA_BG     := sce_sys/livearea/contents/bg.png
 LIVEAREA_START  := sce_sys/livearea/contents/startup.png
 LIVEAREA_XML    := sce_sys/livearea/contents/template.xml
 
-.PHONY: all clean elf velf self vpk Rayman2.vpk
+.PHONY: all clean elf velf self vpk Rayman2.vpk test_cleanroom_real_calls
+
+# Host tools and verification targets
+HOST_CC         ?= clang
+HOST_CFLAGS     ?= -O2 -Wall -Wextra \
+                   -DCPA_PLATFORM_HOST -DR2_DREAMCAST_BASELINE \
+                   -Iinclude -Iinclude/vita_shim -Isrc/engine -Isrc/platform/vita
 
 all: $(VPK)
 
@@ -152,5 +158,9 @@ $(VPK): $(EBOOT) $(PARAM_SFO) $(ICON0) $(LIVEAREA_BG) $(LIVEAREA_START) $(LIVEAR
 		-a $(LIVEAREA_XML)=sce_sys/livearea/contents/template.xml \
 		$@
 
+test_cleanroom_real_calls: tools/test_cleanroom_real_calls.c $(SRC_DIR)/platform/vita/snd_vita.c $(SRC_DIR)/platform/vita/vfs_vita.c $(SRC_DIR)/platform/vita/os_vita.c | $(BUILD_DIR)
+	$(HOST_CC) $(HOST_CFLAGS) $^ -lm -o $(BUILD_DIR)/$@
+	./$(BUILD_DIR)/$@
+
 clean:
-	rm -f $(OBJECTS) $(ELF) $(VELF) $(EBOOT) $(VPK)
+	rm -f $(OBJECTS) $(ELF) $(VELF) $(EBOOT) $(VPK) $(BUILD_DIR)/test_cleanroom_real_calls $(BUILD_DIR)/cleanroom_test.wav
