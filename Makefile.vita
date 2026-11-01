@@ -22,7 +22,10 @@ HLE_DIR         := $(RECOMP_DIR)/hle
 
 # EXTRA_CFLAGS: e.g. EXTRA_CFLAGS=-fstack-usage to measure recompiled frame sizes.
 # -ffunction-sections/--gc-sections drops unused generated functions; -fno-strict-aliasing is needed by the guest-memory casts.
-CFLAGS          := -O2 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
+# OPT: -O3 + -fno-math-errno (sqrtf -> single vsqrt.f32 instead of the errno-setting newlib wrapper). Deliberately NOT -funsafe-math-optimizations/-ffast-math: they allow
+# reassociation, reciprocal-division and NEON float vectorisation (NEON ignores FPSCR RMode and always flushes), which would change the bit-exact SH-4 FPU semantics.
+OPT             ?= -O3 -fno-math-errno -fomit-frame-pointer
+CFLAGS          := $(OPT) -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
                    -fno-strict-aliasing -ffunction-sections -fdata-sections \
                    $(EXTRA_CFLAGS) \
                    -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-label \

@@ -71,6 +71,13 @@ void hle_set_ta_dma_sink(void (*fn)(uint32_t dst, const uint8_t *src, uint32_t l
 /* ---- PVR core hooks (boot.c -> ta glue) ---- */
 void hle_set_startrender_cb(void (*fn)(SH4Ctx *c));   /* called when the guest writes PVR STARTRENDER (0xA05F8014), before the EOR interrupt is queued */
 uint8_t *hle_vram_ptr(void);                          /* 8 MiB host VRAM image (physical 0x04000000 + offset, 32-bit area view) */
+/* VRAM dirty-page epochs: newest write stamp over vram[off, off+len) (4 KiB pages); calling it opens a new epoch, so equal values at two calls mean "no byte of the range
+ * changed in between" (writes that do not change a byte, and frame-buffer-shadow writes, do not count). Used by the texture cache (texmap.c / vita_gl_render.c). */
+uint32_t hle_vram_max_epoch(uint32_t off, uint32_t len);
+/* Flat PVR register file 0x005F8000..0x005F9FFF (2048 words; word index = (addr-0x005F8000)/4, palette RAM = words 0x400..0x7FF) and change epochs. */
+const uint32_t *hle_pvr_regs(void);
+uint32_t hle_pvr_pal_epoch(void);                     /* bumps when palette RAM, PAL_RAM_CTRL or TEXT_CONTROL change value */
+uint32_t hle_pvr_fog_epoch(void);                     /* bumps when the fog table or FOG_COL_RAM/FOG_COL_VERT/FOG_DENSITY/FOG_CLAMP_* change value */
 
 /* ---- ASIC interrupts ---- */
 /* Raise SB_ISTNRM bits and run the guest's ASIC ISR (Kamui, 0x8C0DCF40) synchronously. Bits: 2=EOR_TSP (render done), 3=VBlank-in,

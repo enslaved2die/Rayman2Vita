@@ -22,4 +22,14 @@ unsigned hle_texmap_epoch(void);                     /* total create/load count:
 void hle_ta_pvr_snapshot(uint32_t *out);             /* 1040 words: palette RAM + selected PVR registers, see texmap.c */
 void hle_ta_fog_table(uint32_t out[128]);            /* 128 fog table entries (16 bit) */
 int hle_ta_background(float col[3][4], uint32_t *isp, uint32_t *tsp, uint32_t *tcw);   /* ISP_BACKGND plane vertex colours (a,r,g,b) */
+
+/* ---- texture-cache validity stamps (see texmap.c) ----
+ * Cache key of a decoded texture = (tcw, tsp & HLE_TEX_KEY_TSP): the TSP bits that change the decoded texels (size [5:0], ignore-texture-alpha [19]); filter / wrap / blend / shading
+ * are applied at bind time. */
+#define HLE_TEX_KEY_TSP 0x8003Fu
+typedef struct HleTexStamp { uint32_t vram_epoch, pal_epoch, content_hash, pal_hash; } HleTexStamp;
+void hle_texstamp_set(HleTexStamp *s, uint32_t tcw, uint32_t tsp);     /* record the state a texture was just decoded from */
+int  hle_texstamp_valid(HleTexStamp *s, uint32_t tcw, uint32_t tsp);   /* 1 = decode still matches VRAM (+ palette); refreshes the stamp when only the epoch moved */
+typedef struct HleTexStats { uint64_t checks, epoch_hits, hash_same, invalid, hash_bytes, hash_calls, pal_hashes; } HleTexStats;
+extern HleTexStats hle_texstats;
 #endif

@@ -27,3 +27,4 @@ tools/sh4recomp/runtime.o
 build_vita_*/
 .vitasdk
 assets
+tools/sh4recomp/build_hle*/

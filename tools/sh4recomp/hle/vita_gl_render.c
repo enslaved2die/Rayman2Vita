@@ -41,23 +41,23 @@
 #define TEX_CACHE_SIZE 4096
 #define TEX_CACHE_MASK (TEX_CACHE_SIZE - 1)
 
+/* Decoded-texture cache.  Key = (tcw, tsp & HLE_TEX_KEY_TSP): only the TSP size bits and ignore-texture-alpha change the decoded texels; blend / shading / fog bits never did,
+ * and filter / wrap are applied to the GL texture object at bind time (apply_tex_params), so one decode + one upload serves every way the same surface is drawn.  Validity:
+ * hle_texstamp_valid() (texmap.c): VRAM page epochs first (O(1)), content hash only when a page of the texture was written, palette epoch for 4/8bpp. */
 typedef struct {
-    uint32_t tcw, tsp;
-    uint32_t gen;                       /* (unused: validity is by content hash) */
-    uint32_t epoch;
-    uint32_t content_hash;              /* hash of the texture bytes in VRAM at decode time */
+    uint32_t tcw, tsp;                  /* key (tsp already masked) */
+    HleTexStamp stamp;                  /* VRAM epoch / palette epoch / content hash at decode time */
     int chk_frame;                      /* frame number of the last successful validity check (once per frame) */
-    uint32_t pal_hash;                  /* palette textures: hash of the palette entries used */
     GLuint tex_id;
     uint8_t used;
     int dec_frame;
+    GLint minf, magf, wrap_s, wrap_t;   /* parameters currently set on the GL texture object (0 = unknown) */
 } TexCacheEntry;
 
 static TexCacheEntry s_tex_cache[TEX_CACHE_SIZE];
 static uint32_t *s_decode_buf = NULL;   /* 1024x1024 RGBA8 */
-static uint32_t s_pal[1040];            /* palette RAM + registers snapshot */
-static int s_pal_valid_frame = -1;
 static int s_frame_no = 0;
+static GLuint s_cur_tex = (GLuint)-1;   /* texture bound to GL_TEXTURE_2D as far as this file knows ((GLuint)-1 = unknown) */
 #define DUMP_DIR "ux0:data/rayman2/"
 static void gl_logf(const char *fmt, ...);
 #ifndef R2_TEX_AGE
@@ -83,61 +83,42 @@ static void gl_logf(const char *fmt, ...);
 #ifndef R2_TFOG
 #define R2_TFOG 1
 #endif
-static uint32_t s_tex_misses, s_tex_redecodes, s_tex_hash_bytes;
+#ifndef R2_GL_DEBUG
+#define R2_GL_DEBUG 0                   /* 1: log translucent-list batches every 60th frame (each gl_logf is an SD-card fopen) */
+#endif
+static uint32_t s_tex_misses, s_tex_redecodes;
+VitaGlPerf vita_gl_perf;
+
+/* PVR registers read straight from the flat register file (boot.c), no snapshot copy. */
+#define PVR_REG(addr) (hle_pvr_regs()[((addr) - 0x005F8000u) >> 2])
 
 /* ----------------------------------------------------------------------------
  * Texture decode & upload (decoder lives in ta.c)
  * ---------------------------------------------------------------------------- */
 
-static uint32_t palette_hash(uint32_t tcw)
+static inline void bind_tex(GLuint id)
 {
-    int fmt = (int)((tcw >> 27) & 7);
-    uint32_t h = 2166136261u;
-    if (fmt == 5) { uint32_t b = ((tcw >> 21) & 63) << 4; for (uint32_t i = 0; i < 16; i++) { h ^= s_pal[(b + i) & 1023]; h *= 16777619u; } }
-    else if (fmt == 6) { uint32_t b = ((tcw >> 25) & 3) << 8; for (uint32_t i = 0; i < 256; i++) { h ^= s_pal[(b + i) & 1023]; h *= 16777619u; } }
-    return h ^ s_pal[1024];
+    if (s_cur_tex == id) return;
+    glBindTexture(GL_TEXTURE_2D, id); s_cur_tex = id; vita_gl_perf.tex_binds++;
 }
 
-static void snapshot_palette_once_per_frame(void)
+/* filter / wrap of the texture object for a given TSP word.  PVR2 TSP: bit15 ClampV, bit16 ClampU, bit17 FlipV, bit18 FlipU (same as TaState.clamp_v/clamp_u/flip_v/flip_u; the old
+ * u/v swap smeared planks/rock and cut Lum glows in half).  Only touches GL when a value differs from what the object already has. */
+static void apply_tex_params(TexCacheEntry *e, uint32_t tsp)
 {
-    if (s_pal_valid_frame == s_frame_no) return;
-    hle_ta_pvr_snapshot(s_pal);
-    s_pal_valid_frame = s_frame_no;
-}
-
-
-/* Conservative byte length of the texture data in VRAM (linear view at tcw*8): pixel data (+mip chain) (+VQ codebook). */
-static uint32_t tex_byte_len(uint32_t tcw, uint32_t tsp)
-{
-    int w, h; ta_tex_size(tsp, &w, &h);
-    int mip = (int)(tcw >> 31), vq = (int)((tcw >> 30) & 1), fmt = (int)((tcw >> 27) & 7);
-    if (mip) h = w;
-    uint32_t n;
-    if (vq) n = 2048u + (uint32_t)(w * h) / 4u;
-    else if (fmt == 5) n = (uint32_t)(w * h) / 2u;
-    else if (fmt == 6) n = (uint32_t)(w * h);
-    else n = (uint32_t)(w * h) * 2u;
-    if (mip) n = n + n / 3u + 64u;
-    return n;
-}
-
-/* 4-lane multiplicative hash of the texture bytes (catches textures written without kmLoadTexture, partial overwrites, overlapping surfaces). */
-static uint32_t tex_content_hash(uint32_t tcw, uint32_t tsp)
-{
-    const uint8_t *vram = hle_vram_ptr();
-    uint32_t off = (tcw & 0x1FFFFFu) << 3, n = tex_byte_len(tcw, tsp);
-    if (!vram || off >= (8u << 20)) return 0;
-    if (off + n > (8u << 20)) n = (8u << 20) - off;
-    const uint32_t *p = (const uint32_t *)(vram + off);
-    uint32_t words = n >> 2, i = 0;
-    uint32_t a = 2166136261u, b = 0x9E3779B9u, c = 0x85EBCA6Bu, d = 0xC2B2AE35u;
-    for (; i + 4 <= words; i += 4) {
-        a = (a ^ p[i]) * 16777619u; b = (b ^ p[i + 1]) * 16777619u; c = (c ^ p[i + 2]) * 16777619u; d = (d ^ p[i + 3]) * 16777619u;
-        a ^= a >> 15; b ^= b >> 15; c ^= c >> 15; d ^= d >> 15;
-    }
-    for (; i < words; i++) { a = (a ^ p[i]) * 16777619u; a ^= a >> 15; }
-    s_tex_hash_bytes += n;
-    return a ^ (b * 3u) ^ (c * 5u) ^ (d * 7u) ^ n;
+    int filt = (int)((tsp >> 13) & 3);                /* 0 point, 1 bilinear, 2/3 trilinear */
+    int levels = ta_tex_levels(e->tcw, e->tsp);
+    GLint magf = filt ? GL_LINEAR : GL_NEAREST, minf;
+    if (levels > 1) minf = filt == 0 ? GL_NEAREST_MIPMAP_NEAREST : filt == 1 ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR;
+    else minf = magf;
+    int clamp_v = (int)((tsp >> 15) & 1), clamp_u = (int)((tsp >> 16) & 1), flip_v = (int)((tsp >> 17) & 1), flip_u = (int)((tsp >> 18) & 1);
+    GLint ws = clamp_u ? GL_CLAMP_TO_EDGE : flip_u ? GL_MIRRORED_REPEAT : GL_REPEAT, wt = clamp_v ? GL_CLAMP_TO_EDGE : flip_v ? GL_MIRRORED_REPEAT : GL_REPEAT;
+    if (e->minf == minf && e->magf == magf && e->wrap_s == ws && e->wrap_t == wt) return;
+    bind_tex(e->tex_id);
+    if (e->minf != minf) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minf); e->minf = minf; vita_gl_perf.tex_params++; }
+    if (e->magf != magf) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magf); e->magf = magf; vita_gl_perf.tex_params++; }
+    if (e->wrap_s != ws) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ws); e->wrap_s = ws; vita_gl_perf.tex_params++; }
+    if (e->wrap_t != wt) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt); e->wrap_t = wt; vita_gl_perf.tex_params++; }
 }
 
 static int decode_and_upload_texture(TexCacheEntry *e, uint32_t tcw, uint32_t tsp)
@@ -153,36 +134,23 @@ static int decode_and_upload_texture(TexCacheEntry *e, uint32_t tcw, uint32_t ts
     int mip = (int)(tcw >> 31);
     if (mip) h = w;                                   /* mip chains are square */
 
-    TaTexEnv env = { NULL, 0, 0 };
+    const uint32_t *pr = hle_pvr_regs();
+    TaTexEnv env = { pr + 0x400, PVR_REG(0x005F8108u), PVR_REG(0x005F80E4u) };   /* palette RAM, PAL_RAM_CTRL, TEXT_CONTROL */
     int fmt = (int)((tcw >> 27) & 7);
-    snapshot_palette_once_per_frame();
-    env.text_control = s_pal[1025];
-    if (fmt == 5 || fmt == 6) { env.pal = s_pal; env.pal_ctrl = s_pal[1024]; e->pal_hash = palette_hash(tcw); } else e->pal_hash = 0;
+    if (!(fmt == 5 || fmt == 6)) env.pal = NULL;
 
     ta_tex_decode(vram, 8u << 20, tcw, tsp, &env, 0, (int)((tsp >> 19) & 1), s_decode_buf);
 
     e->dec_frame = s_frame_no;
-    e->content_hash = tex_content_hash(tcw, tsp);
+    hle_texstamp_set(&e->stamp, tcw, tsp);
     e->chk_frame = s_frame_no;
     if (e->tex_id == 0) glGenTextures(1, &e->tex_id);
     if (e->tex_id == 0) return 0;
-    glBindTexture(GL_TEXTURE_2D, e->tex_id);
+    bind_tex(e->tex_id);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, s_decode_buf);
-
-    int filt = (int)((tsp >> 13) & 3);                /* 0 point, 1 bilinear, 2/3 trilinear */
-    int levels = ta_tex_levels(tcw, tsp);
-    GLint minf, magf = filt ? GL_LINEAR : GL_NEAREST;
-    if (levels > 1) {
-        glGenerateMipmap(GL_TEXTURE_2D);              /* the PVR mip levels are box-filtered versions of level 0 in the source files */
-        minf = filt == 0 ? GL_NEAREST_MIPMAP_NEAREST : filt == 1 ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR;
-    } else minf = magf;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minf);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magf);
-
-    /* PVR2 TSP: bit15 ClampV, bit16 ClampU, bit17 FlipV, bit18 FlipU (same as TaState.clamp_v/clamp_u/flip_v/flip_u; the old u/v swap smeared planks/rock and cut Lum glows in half) */
-    int clamp_v = (int)((tsp >> 15) & 1), clamp_u = (int)((tsp >> 16) & 1), flip_v = (int)((tsp >> 17) & 1), flip_u = (int)((tsp >> 18) & 1);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, clamp_u ? GL_CLAMP_TO_EDGE : flip_u ? GL_MIRRORED_REPEAT : GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, clamp_v ? GL_CLAMP_TO_EDGE : flip_v ? GL_MIRRORED_REPEAT : GL_REPEAT);
+    vita_gl_perf.tex_uploads++;
+    if (ta_tex_levels(tcw, tsp) > 1) glGenerateMipmap(GL_TEXTURE_2D);   /* the PVR mip levels are box-filtered versions of level 0 in the source files */
+    e->minf = e->magf = e->wrap_s = e->wrap_t = 0;    /* (re)apply filter / wrap for the TSP the caller draws with */
     return 1;
 }
 
@@ -193,44 +161,44 @@ static inline uint32_t tex_hash(uint32_t tcw, uint32_t tsp)
     return h & TEX_CACHE_MASK;
 }
 
-/* Is the cached decode still valid?  Checked at most once per frame per texture: the texture bytes in VRAM are hashed (the game writes
- * textures through paths that never call kmLoadTexture and surfaces overlap, so the per-surface generation counter missed updates and left textures stale/black);
- * palettes are compared by hash. */
+/* Is the cached decode still valid?  Checked at most once per frame per texture (the guest cannot write VRAM while a frame is rendered).  The game writes textures through paths
+ * that never call kmLoadTexture and surfaces overlap, so the per-surface generation counter missed updates and left textures stale/black; the VRAM page epochs see every write
+ * path, and the content hash backs them up whenever a page of the texture was written (identical rewrites and neighbouring-texture writes do not force a re-decode). */
 static int entry_valid(TexCacheEntry *e)
 {
     if (R2_TEX_AGE && s_frame_no - e->dec_frame > R2_TEX_AGE) return 0;   /* DEBUG experiment */
     if (e->chk_frame == s_frame_no) return 1;
-    int fmt = (int)((e->tcw >> 27) & 7);
-    if (fmt == 5 || fmt == 6) { snapshot_palette_once_per_frame(); if (palette_hash(e->tcw) != e->pal_hash) return 0; }
-    if (tex_content_hash(e->tcw, e->tsp) != e->content_hash) return 0;
+    if (!hle_texstamp_valid(&e->stamp, e->tcw, e->tsp)) return 0;
     e->chk_frame = s_frame_no;
     return 1;
 }
 
-GLuint vita_gl_get_or_create_texture(uint32_t tcw, uint32_t tsp)
+/* Returns the GL texture for (tcw, tsp), decoding it if needed, with filter / wrap set for this tsp.  The texture may or may not be left bound: callers bind it themselves. */
+GLuint vita_gl_get_or_create_texture(uint32_t tcw, uint32_t tsp_full)
 {
+    const uint32_t tsp = tsp_full & HLE_TEX_KEY_TSP;
     uint32_t h = tex_hash(tcw, tsp);
     TexCacheEntry *slot = NULL;
     for (uint32_t i = 0; i < TEX_CACHE_SIZE; i++) {
         TexCacheEntry *e = &s_tex_cache[(h + i) & TEX_CACHE_MASK];
         if (!e->used) { slot = e; break; }
         if (e->tcw == tcw && e->tsp == tsp) {
-            if (entry_valid(e)) return e->tex_id;
-            s_tex_redecodes++;
-            decode_and_upload_texture(e, tcw, tsp);
+            if (!entry_valid(e)) { s_tex_redecodes++; decode_and_upload_texture(e, tcw, tsp); }
+            apply_tex_params(e, tsp_full);
             return e->tex_id;
         }
     }
     if (!slot) {                                      /* cache full: evict the home bucket */
         slot = &s_tex_cache[h];
-        if (slot->tex_id) glDeleteTextures(1, &slot->tex_id);
+        if (slot->tex_id) { glDeleteTextures(1, &slot->tex_id); s_cur_tex = (GLuint)-1; }
         memset(slot, 0, sizeof *slot);
     }
     s_tex_misses++;
     memset(slot, 0, sizeof *slot);
     slot->tcw = tcw; slot->tsp = tsp;
     if (decode_and_upload_texture(slot, tcw, tsp)) slot->used = 1;
-    else { if (slot->tex_id) glDeleteTextures(1, &slot->tex_id); memset(slot, 0, sizeof *slot); return 0; }
+    else { if (slot->tex_id) { glDeleteTextures(1, &slot->tex_id); s_cur_tex = (GLuint)-1; } memset(slot, 0, sizeof *slot); return 0; }
+    apply_tex_params(slot, tsp_full);
     return slot->tex_id;
 }
 
@@ -240,6 +208,7 @@ void vita_gl_texture_cache_clear(void)
         if (s_tex_cache[i].used && s_tex_cache[i].tex_id) glDeleteTextures(1, &s_tex_cache[i].tex_id);
         memset(&s_tex_cache[i], 0, sizeof s_tex_cache[i]);
     }
+    s_cur_tex = (GLuint)-1;
 }
 
 /* ----------------------------------------------------------------------------
@@ -338,12 +307,42 @@ static void dump_shot_ppm(void)
     free(px);
 }
 static uint32_t s_only_tcw;
+#ifdef R2_DEBUG_POLL
+/* build with -DR2_DEBUG_POLL to enable the SD-card trigger files (two fopen() per poll on the render thread, every 16 frames) */
 static void debug_capture_poll(void)
 {
     if ((s_frame_no & 15) != 0) return;
     { FILE *q = fopen(DUMP_DIR "ONLY.TXT", "rb"); s_only_tcw = 0; if (q) { char b[32] = {0}; fread(b, 1, 31, q); fclose(q); s_only_tcw = (uint32_t)strtoul(b, NULL, 16); } }   /* debug: draw only translucent batches with this TCW */
     FILE *t = fopen(DUMP_DIR "SHOT.TXT", "rb");
     if (t) { fclose(t); remove(DUMP_DIR "SHOT.TXT"); s_dump_pending = 1; }
+}
+#else
+#define debug_capture_poll() ((void)0)
+#endif
+
+/* ----------------------------------------------------------------------------
+ * GL state cache.  vitaGL marks the fixed-function vertex/fragment programs dirty on every glEnable/glDisable/glTexEnvi/glBlendFunc/glAlphaFunc/glColorPointer call, even when the
+ * value is unchanged, which forces a shader reload + uniform upload on the next glDrawArrays.  All state set in the batch loop goes through these wrappers and reaches GL only
+ * when it differs from what GL already has.  Everything is reset to "unknown" at the start of a frame and after code that talks to GL directly (shadow pass).
+ * ---------------------------------------------------------------------------- */
+static struct { int depth_test, depth_func, depth_mask, blend, bsrc, bdst, alpha_test, alpha_ref, tex2d, env; const void *colptr; } gc;
+static void gc_reset(void) { memset(&gc, 0xFF, sizeof gc); gc.colptr = (const void *)(uintptr_t)~(uintptr_t)0; }
+#define GC_SET(field, val, call) do { int _v = (int)(val); if (gc.field != _v) { gc.field = _v; call; vita_gl_perf.state_calls++; } else vita_gl_perf.state_skipped++; } while (0)
+static inline void gc_depth_test(int on) { GC_SET(depth_test, on, if (on) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST)); }
+static inline void gc_depth_func(GLenum f) { GC_SET(depth_func, f, glDepthFunc(f)); }
+static inline void gc_depth_mask(int m) { GC_SET(depth_mask, m, glDepthMask(m ? GL_TRUE : GL_FALSE)); }
+static inline void gc_blend(int on) { GC_SET(blend, on, if (on) glEnable(GL_BLEND); else glDisable(GL_BLEND)); }
+static inline void gc_blend_func(GLenum s, GLenum d)
+{
+    if (gc.bsrc != (int)s || gc.bdst != (int)d) { gc.bsrc = (int)s; gc.bdst = (int)d; glBlendFunc(s, d); vita_gl_perf.state_calls++; } else vita_gl_perf.state_skipped++;
+}
+static inline void gc_alpha_test(int on) { GC_SET(alpha_test, on, if (on) glEnable(GL_ALPHA_TEST); else glDisable(GL_ALPHA_TEST)); }
+static inline void gc_alpha_ref(int ref255) { GC_SET(alpha_ref, ref255, glAlphaFunc(GL_GEQUAL, (float)ref255 / 255.0f)); }
+static inline void gc_tex2d(int on) { GC_SET(tex2d, on, if (on) glEnable(GL_TEXTURE_2D); else glDisable(GL_TEXTURE_2D)); }
+static inline void gc_texenv(GLint m) { GC_SET(env, m, glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, m)); }
+static inline void gc_color_ptr(const void *p)
+{
+    if (gc.colptr != p) { gc.colptr = p; glColorPointer(4, GL_FLOAT, sizeof(TaClipVertex), p); vita_gl_perf.state_calls++; } else vita_gl_perf.state_skipped++;
 }
 
 static TaClipVertex *s_cv = NULL, *s_fv = NULL;   /* s_fv: fog-pass colours (fog colour, per-vertex fog alpha) parallel to s_cv */
@@ -433,50 +432,60 @@ void vita_gl_render_frame(const TaFrame *frame_in)
     if (s_dump_pending) dump_frame_bin(frame);
 
     if (s_frame_no <= 12) gl_logf("[vita] render_frame call #%d strips=%u verts=%u hle_frame_count=%lu", s_frame_no, (unsigned)frame->nstrips, (unsigned)frame->nverts, (unsigned long)hle_frame_count);
-    TaGl gl;
-    TaBuildOpts opts = { 1, 1, -2.0f, -2.0f, 642.0f, 482.0f };   /* software cull + clip to the screen (+2 px) */
-    if (ta_build_gl_ex(frame, &gl, &opts) != 0) return;
-    static int s_dbg_once; if (!s_dbg_once) { s_dbg_once = 1; gl_logf("[vita] vita_gl_render build marker: " __DATE__ " " __TIME__ " sort+nozwrite-trans v5"); }
-    if (gl.nverts == 0 || gl.nbatches == 0) { ta_gl_free(&gl); return; }
+    static TaGl gl;                                   /* persistent: vertex / batch arrays keep their capacity from frame to frame */
+    TaBuildOpts opts = { 1, 1, -2.0f, -2.0f, 642.0f, 482.0f, 0 };   /* software cull + clip to the screen (+2 px) */
+    if (ta_build_gl_reuse(frame, &gl, &opts) != 0) return;
+    static int s_dbg_once; if (!s_dbg_once) { s_dbg_once = 1; gl_logf("[vita] vita_gl_render build marker: " __DATE__ " " __TIME__ " sort+nozwrite-trans v5 perf-gl"); }
+    if (gl.nverts == 0 || gl.nbatches == 0) return;
 
     if (s_cv_cap < gl.nverts) {
         free(s_cv); free(s_fv); s_cv_cap = gl.nverts + 4096;
         s_cv = (TaClipVertex *)malloc(s_cv_cap * sizeof(TaClipVertex));
         s_fv = (TaClipVertex *)malloc(s_cv_cap * sizeof(TaClipVertex));
-        if (!s_cv || !s_fv) { free(s_cv); free(s_fv); s_cv = s_fv = NULL; s_cv_cap = 0; ta_gl_free(&gl); return; }
+        if (!s_cv || !s_fv) { free(s_cv); free(s_fv); s_cv = s_fv = NULL; s_cv_cap = 0; return; }
     }
     float cut = ta_gl_depth_cut(&gl);
     ta_gl_make_clip(gl.verts, gl.nverts, cut, s_cv);
-    snapshot_palette_once_per_frame();
-    uint32_t fog_table[128]; hle_ta_fog_table(fog_table);
-    const uint32_t fog_den = s_pal[1030], fog_ram = s_pal[1028];
+    static uint32_t fog_table[128]; static uint32_t s_fog_epoch_seen;
+    if (hle_pvr_fog_epoch() != s_fog_epoch_seen || s_frame_no == 1) { hle_ta_fog_table(fog_table); s_fog_epoch_seen = hle_pvr_fog_epoch(); }   /* fog table only re-read when a fog register changed */
+    const uint32_t fog_den = PVR_REG(0x005F80B8u), fog_ram = PVR_REG(0x005F80B0u);
     const float fog_r = ((fog_ram >> 16) & 255) / 255.0f, fog_g = ((fog_ram >> 8) & 255) / 255.0f, fog_b = (fog_ram & 255) / 255.0f;
+    vita_gl_perf.frames++; vita_gl_perf.batches += gl.nbatches;
+    gc_reset();
 
-    /* Frame clear: whole display black (4:3 pillarbox bars), then restrict drawing to the viewport (full screen in 16:9 mode, centred 4:3 area otherwise). */
-    const int vp_x = hle_ta_wide_active() ? 0 : VIEW_X, vp_w = hle_ta_wide_active() ? SCREEN_W : VIEW_W;
+    /* Frame clear. Wide mode (default): the viewport is the whole display, so one glClear covers it (colour = ISP_BACKGND plane colour when the game defines one).
+     * 4:3: whole display black first (pillarbox bars), then the viewport area only with the background colour. */
+    const int wide = hle_ta_wide_active();
+    const int vp_x = wide ? 0 : VIEW_X, vp_w = wide ? SCREEN_W : VIEW_W;
     glDisable(GL_SCISSOR_TEST);
     glViewport(vp_x, 0, vp_w, SCREEN_H);
     glDepthMask(GL_TRUE);
     glClearDepthf(0.0f);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);                 /* pillarbox stays black */
     int have_shadow = 0;                              /* any opaque-mod volume this frame -> maintain the receiver stencil bit while drawing */
     for (uint32_t i = 0; i < frame->nmods; i++) if (frame->mods[i].list == TA_L_OPAQUE_MOD) { have_shadow = 1; break; }
 #ifdef R2_FORCE_STENCIL
     have_shadow = 1;
 #endif
     if (have_shadow && !R2_NOCLEARST) { glStencilMask(0xFF); glClearStencil(0); }
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | ((have_shadow && !R2_NOCLEARST) ? GL_STENCIL_BUFFER_BIT : 0));
+    const GLbitfield clear_bits = GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | ((have_shadow && !R2_NOCLEARST) ? GL_STENCIL_BUFFER_BIT : 0);
     {   /* ISP_BACKGND plane: the game sets an untextured flat plane (0x8080ff on the menu, brown in the lava level); it fills the 4:3 area behind everything. */
         float bg[3][4]; uint32_t bisp, btsp, btcw;
-        if (hle_ta_background(bg, &bisp, &btsp, &btcw)) {
-            glEnable(GL_SCISSOR_TEST); glScissor(vp_x, 0, vp_w, SCREEN_H);
-            { static int once; if (!once) { once = 1; gl_logf("[vita] ISP_BACKGND plane colour a=%.2f r=%.2f g=%.2f b=%.2f isp=%08x tsp=%08x tcw=%08x", bg[0][0], bg[0][1], bg[0][2], bg[0][3], (unsigned)bisp, (unsigned)btsp, (unsigned)btcw); } }
+        int have_bg = hle_ta_background(bg, &bisp, &btsp, &btcw);
 #ifndef R2_BG_BLACK
 #define R2_BG_BLACK 0
 #endif
-            if (R2_BG_BLACK) glClearColor(0.0f, 0.0f, 0.0f, 1.0f); else
-            glClearColor(bg[0][1], bg[0][2], bg[0][3], 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
+        if (have_bg) { static int once; if (!once) { once = 1; gl_logf("[vita] ISP_BACKGND plane colour a=%.2f r=%.2f g=%.2f b=%.2f isp=%08x tsp=%08x tcw=%08x", bg[0][0], bg[0][1], bg[0][2], bg[0][3], (unsigned)bisp, (unsigned)btsp, (unsigned)btcw); } }
+        if (wide) {
+            if (have_bg && !R2_BG_BLACK) glClearColor(bg[0][1], bg[0][2], bg[0][3], 1.0f); else glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(clear_bits);
+        } else {
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);         /* pillarbox stays black */
+            glClear(clear_bits);
+            if (have_bg) {
+                glEnable(GL_SCISSOR_TEST); glScissor(vp_x, 0, vp_w, SCREEN_H);
+                if (R2_BG_BLACK) glClearColor(0.0f, 0.0f, 0.0f, 1.0f); else glClearColor(bg[0][1], bg[0][2], bg[0][3], 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+            }
         }
     }
     glEnable(GL_SCISSOR_TEST);
@@ -491,7 +500,7 @@ void vita_gl_render_frame(const TaFrame *frame_in)
 
     glVertexPointer(3, GL_FLOAT, sizeof(TaClipVertex), &s_cv[0].px);
     glTexCoordPointer(2, GL_FLOAT, sizeof(TaClipVertex), &s_cv[0].u);
-    glColorPointer(4, GL_FLOAT, sizeof(TaClipVertex), &s_cv[0].r);
+    gc_color_ptr(&s_cv[0].r);
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
@@ -499,57 +508,58 @@ void vita_gl_render_frame(const TaFrame *frame_in)
 
     if (s_frame_no <= 12) gl_logf("[vita] frame %d nmods=%u have_shadow=%d shad=%x", s_frame_no, (unsigned)frame->nmods, have_shadow, (unsigned)frame->shad_scale);
     int st_cur = 0;                                   /* current stencil state of the batch loop (see below) */
-    uint32_t pt_ref = hle_reg_get(0xA05F811Cu) & 255;   /* PT_ALPHA_REF; 0 (never written) -> alpha > 0 */
+    uint32_t pt_ref = PVR_REG(0x005F811Cu) & 255;     /* PT_ALPHA_REF; 0 (never written) -> alpha > 0 */
+    const int trans_sorted = !(PVR_REG(0x005F8098u) & 1);   /* ISP_FEED_CFG bit0 = 0: translucent list is depth-sorted */
 
     /* Draw order: opaque, punch-through, translucent (submission order inside a list). */
     static const int s_draw_lists[3] = { TA_L_OPAQUE, TA_L_PUNCH, TA_L_TRANS };
     for (int li = 0; li < 3; li++) {
         int list_id = s_draw_lists[li];
-        if (list_id == TA_L_TRANS && have_shadow) { draw_shadow_volumes(frame, cut, s_cv); st_cur = 0; }
+        if (list_id == TA_L_TRANS && have_shadow) { draw_shadow_volumes(frame, cut, s_cv); st_cur = 0; gc_reset(); }
         uint32_t first_b = gl.list_first[list_id], n_b = gl.list_count[list_id];
         /* Translucent list: ISP_FEED_CFG bit0 = 0 -> the PVR sorts back-to-front (farthest = smallest 1/W first); translucent polygons never write depth
          * (otherwise a transparent texel of a near layer, e.g. foliage, would reject the sky behind it: that was the "periwinkle cut-outs" bug). */
         static uint32_t s_ord[4096]; static float s_key[4096];
-        const int dbg = (s_frame_no % 60 == 0 || s_frame_no <= 12) && list_id == TA_L_TRANS;
+        const int dbg = (s_frame_no <= 12 || (R2_GL_DEBUG && s_frame_no % 60 == 0)) && list_id == TA_L_TRANS;
         uint32_t n_ord = n_b < 4096 ? n_b : 4096;
-        for (uint32_t b = 0; b < n_ord; b++) s_ord[b] = b;
-        if (list_id == TA_L_TRANS && !(hle_reg_get(0xA05F8098u) & 1)) {
+        const int sorted = list_id == TA_L_TRANS && trans_sorted;
+        if (sorted) {
             for (uint32_t b = 0; b < n_ord; b++) {
                 const TaBatch *bt = &gl.batches[first_b + b]; float zm = 1e30f;
                 for (uint32_t i = 0; i < bt->count; i++) if (gl.verts[bt->first + i].z < zm) zm = gl.verts[bt->first + i].z;
-                s_key[b] = zm;
+                s_key[b] = zm; s_ord[b] = b;
             }
             for (uint32_t i = 1; i < n_ord; i++) { uint32_t o = s_ord[i]; float k = s_key[o]; uint32_t j = i; while (j > 0 && s_key[s_ord[j - 1]] > k) { s_ord[j] = s_ord[j - 1]; j--; } s_ord[j] = o; }   /* stable insertion sort */
         }
         if (dbg) {
-            uint32_t feed = hle_reg_get(0xA05F8098u);
+            uint32_t feed = PVR_REG(0x005F8098u);
             gl_logf("[vita] frame %d wide_active=%d pref=%d vp_x=%d vp_w=%d ISP_FEED_CFG=%08x sorted=%d trans_batches=%u (of %u) nverts=%u", s_frame_no, hle_ta_wide_active(), hle_ta_wide_pref(), vp_x, vp_w, (unsigned)feed, !(feed & 1), (unsigned)n_b, gl.nbatches, gl.nverts);
-            for (uint32_t i = 0; i < n_ord && i < 8; i++) gl_logf("[vita]   ord[%u]=%u key=%g", i, s_ord[i], s_key[s_ord[i]]);
+            for (uint32_t i = 0; sorted && i < n_ord && i < 8; i++) gl_logf("[vita]   ord[%u]=%u key=%g", i, s_ord[i], s_key[s_ord[i]]);
         }
         for (uint32_t bi = 0; bi < n_ord; bi++) {
-            uint32_t b = s_ord[bi];
+            uint32_t b = sorted ? s_ord[bi] : bi;
             const TaBatch *batch = &gl.batches[first_b + b];
             if (batch->count == 0) continue;
             const TaState *st = &batch->st;
             if (s_only_tcw && list_id == TA_L_TRANS && st->tcw != s_only_tcw) continue;
 
-            glEnable(GL_DEPTH_TEST);
-            glDepthFunc(s_gl_depth_funcs[st->depth_mode & 7]);
-            glDepthMask((st->z_write_disable || list_id == TA_L_TRANS) ? GL_FALSE : GL_TRUE);
+            gc_depth_test(1);
+            gc_depth_func(s_gl_depth_funcs[st->depth_mode & 7]);
+            gc_depth_mask(!(st->z_write_disable || list_id == TA_L_TRANS));
             if (dbg && bi < 8) { const TaGlVertex *v0 = &gl.verts[batch->first]; gl_logf("[vita]     tcw=%08x tsp=%08x shade=%d tex=%d v0 col=%.2f,%.2f,%.2f,%.2f v1 col=%.2f,%.2f,%.2f,%.2f", (unsigned)st->tcw, (unsigned)st->tsp, st->shading, st->textured, v0[0].r, v0[0].g, v0[0].b, v0[0].a, v0[1].r, v0[1].g, v0[1].b, v0[1].a); }
             if (dbg && bi < 8) gl_logf("[vita]   trans b=%u cnt=%u depth_mode=%d zwd=%d mask=%d func=%d", b, batch->count, st->depth_mode, st->z_write_disable, (st->z_write_disable || list_id == TA_L_TRANS) ? 0 : 1, (int)s_gl_depth_funcs[st->depth_mode & 7]);
 
             if (list_id == TA_L_TRANS) {
-                glEnable(GL_BLEND);
-                glBlendFunc(src_factor(st->src_blend, st->use_alpha), dst_factor(st->dst_blend, st->use_alpha));
-                glDisable(GL_ALPHA_TEST);
+                gc_blend(1);
+                gc_blend_func(src_factor(st->src_blend, st->use_alpha), dst_factor(st->dst_blend, st->use_alpha));
+                gc_alpha_test(0);
             } else if (list_id == TA_L_PUNCH) {
-                glDisable(GL_BLEND);
-                glEnable(GL_ALPHA_TEST);
-                glAlphaFunc(GL_GEQUAL, (float)(pt_ref ? pt_ref : 1) / 255.0f);
+                gc_blend(0);
+                gc_alpha_test(1);
+                gc_alpha_ref((int)(pt_ref ? pt_ref : 1));
             } else {                                  /* opaque: texture/vertex alpha ignored */
-                glDisable(GL_BLEND);
-                glDisable(GL_ALPHA_TEST);
+                gc_blend(0);
+                gc_alpha_test(0);
             }
 
             if (have_shadow) {                            /* receivers mark stencil bit 7 where they are the visible surface; state is only touched on change */
@@ -561,20 +571,21 @@ void vita_gl_render_frame(const TaFrame *frame_in)
                         glStencilMask(0x80); glStencilFunc(GL_ALWAYS, want == 2 ? 0x80 : 0x00, 0x80); glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
                     }
                     st_cur = want;
-                }
+                    vita_gl_perf.state_calls++;
+                } else vita_gl_perf.state_skipped++;
             }
 
             GLuint tex_id = 0;
             if (st->textured) tex_id = vita_gl_get_or_create_texture(st->tcw, st->tsp);
             if (tex_id) {
-                glEnable(GL_TEXTURE_2D);
-                glBindTexture(GL_TEXTURE_2D, tex_id);
+                gc_tex2d(1);
+                bind_tex(tex_id);
                 /* PVR shading instruction: 0 decal (rgb,a = tex), 1 modulate (rgb = tex*col, a = tex; vertex alpha forced to 1 in ta_build_gl_ex),
                  * 2 decal-alpha (rgb = tex*ta + col*(1-ta), a = col.a), 3 modulate-alpha (rgb = tex*col, a = ta*col.a). */
                 static const GLint env[4] = { GL_REPLACE, GL_MODULATE, GL_DECAL, GL_MODULATE };
-                glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, env[st->shading & 3]);
+                gc_texenv(env[st->shading & 3]);
             } else {
-                glDisable(GL_TEXTURE_2D);
+                gc_tex2d(0);
             }
             /* Translucent table fog: pre-fog the vertex colour toward FOG_COL_RAM (alpha untouched) before the blend (approximation: HW fogs after texture modulation) */
             int pre_fogged = 0;
@@ -587,10 +598,11 @@ void vita_gl_render_frame(const TaFrame *frame_in)
                     s_fv[vi].r = s_cv[vi].r + (fog_r - s_cv[vi].r) * a; s_fv[vi].g = s_cv[vi].g + (fog_g - s_cv[vi].g) * a; s_fv[vi].b = s_cv[vi].b + (fog_b - s_cv[vi].b) * a;
                     if (a > amax) amax = a;
                 }
-                if (amax > 1.0f / 255.0f) { glColorPointer(4, GL_FLOAT, sizeof(TaClipVertex), &s_fv[0].r); pre_fogged = 1; }
+                if (amax > 1.0f / 255.0f) { gc_color_ptr(&s_fv[0].r); pre_fogged = 1; }
             }
             glDrawArrays(GL_TRIANGLES, batch->first, batch->count);
-            if (pre_fogged) glColorPointer(4, GL_FLOAT, sizeof(TaClipVertex), &s_cv[0].r);
+            vita_gl_perf.draws++; vita_gl_perf.verts += batch->count;
+            if (pre_fogged) gc_color_ptr(&s_cv[0].r);
             /* Table fog (TSP fog control 0) on opaque polygons: a second untextured pass in FOG_COL_RAM with the per-vertex fog alpha, blended over the
              * lit/textured result and depth-tested GEQUAL (same vertices -> same depth, so exactly the visible pixels).  Translucent/punch-through are not fogged [ASSUMED approximation]. */
             if (list_id == TA_L_OPAQUE && st->fog_ctrl == 0 && (st->depth_mode == 4 || st->depth_mode == 6) && fog_den) {
@@ -603,14 +615,15 @@ void vita_gl_render_frame(const TaFrame *frame_in)
                     if (a > amax) amax = a;
                 }
                 if (amax > 1.0f / 255.0f) {
-                    if (st_cur) { glDisable(GL_STENCIL_TEST); st_cur = 0; }
-                    glDisable(GL_TEXTURE_2D);
-                    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                    glDepthFunc(GL_GEQUAL); glDepthMask(GL_FALSE);
-                    glColorPointer(4, GL_FLOAT, sizeof(TaClipVertex), &s_fv[0].r);
+                    if (st_cur) { glDisable(GL_STENCIL_TEST); st_cur = 0; vita_gl_perf.state_calls++; }
+                    gc_tex2d(0);
+                    gc_blend(1); gc_blend_func(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    gc_depth_func(GL_GEQUAL); gc_depth_mask(0);
+                    gc_color_ptr(&s_fv[0].r);
                     glDrawArrays(GL_TRIANGLES, batch->first, batch->count);
-                    glColorPointer(4, GL_FLOAT, sizeof(TaClipVertex), &s_cv[0].r);
-                    glDisable(GL_BLEND);
+                    vita_gl_perf.fog_draws++; vita_gl_perf.verts += batch->count;
+                    gc_color_ptr(&s_cv[0].r);
+                    gc_blend(0);
                 }
             }
             if (s_dump_pending) gl_logf("[gl]  list %d batch %u first=%u count=%u tex=%u fmt=%u/%u/%u shade=%d depth=%d zwd=%d blend=%d/%d ua=%d glerr=0x%x", list_id, b, batch->first, batch->count, tex_id, st->pixel_format, st->mip_mapped, st->vq, st->shading, st->depth_mode, st->z_write_disable, st->src_blend, st->dst_blend, st->use_alpha, (unsigned)glGetError());
@@ -624,13 +637,13 @@ void vita_gl_render_frame(const TaFrame *frame_in)
     glDisable(GL_BLEND);
     glDisable(GL_ALPHA_TEST);
     glDisable(GL_SCISSOR_TEST);
+    gc_reset();
     if (have_shadow && !R2_NOENDDIS) { glDisable(GL_STENCIL_TEST); glStencilMask(0xFF); }
 
     if (s_dump_pending) {
-        gl_logf("[gl] dump: frame %d verts=%u batches=%u cut=%g texmiss=%u redecode=%u hashbytes=%u mods=%u glerr=0x%x", s_frame_no, gl.nverts, gl.nbatches, cut, s_tex_misses, s_tex_redecodes, s_tex_hash_bytes, (unsigned)frame->nmods, (unsigned)glGetError());
+        gl_logf("[gl] dump: frame %d verts=%u batches=%u cut=%g texmiss=%u redecode=%u hashbytes=%llu mods=%u glerr=0x%x", s_frame_no, gl.nverts, gl.nbatches, cut, s_tex_misses, s_tex_redecodes, (unsigned long long)hle_texstats.hash_bytes, (unsigned)frame->nmods, (unsigned)glGetError());
         s_shot_after_swap = 1; s_dump_pending = 0;      /* vitaGL's glReadPixels reads the presented (front) buffer: capture after the swap */
     }
-    ta_gl_free(&gl);
 }
 
 void vita_gl_swap(void)

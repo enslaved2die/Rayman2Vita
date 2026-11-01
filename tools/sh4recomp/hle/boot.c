@@ -8,6 +8,7 @@
 #include <time.h>
 #if defined(__vita__)
 #include <psp2/kernel/clib.h>
+#include <psp2/kernel/processmgr.h>
 #endif
 
 /* ---------------------------------------------------------------- globals / tracing */
@@ -32,8 +33,17 @@ static volatile uint64_t clock_skew_ns;
  * env R2_CLOCK_CAP_MS=<ms> overrides (0 = off). Only the guest thread may call now_ns()/hle_time_us(). */
 static uint64_t next_vb_ns; static unsigned long vb_delivered;
 static uint64_t clock_slack_ns, clock_lag_ns, clock_last; static int clock_cap_init;
+/* raw host monotonic nanoseconds. Vita: newlib's clock_gettime(CLOCK_MONOTONIC) is sceKernelGetProcessTimeWide() plus a 64-bit division per call (and now_ns() runs on every TMU/SPG
+ * read and on every AICA wave-RAM access); read the process-time counter (us) directly. */
+static inline uint64_t raw_ns(void) {
+#if defined(__vita__)
+    return (uint64_t)sceKernelGetProcessTimeWide() * 1000ull;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+#endif
+}
 static uint64_t now_ns(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t r = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec + clock_skew_ns;
+    uint64_t r = raw_ns() + clock_skew_ns;
     if (!clock_cap_init) {
         clock_cap_init = 1; const char *e = getenv("R2_CLOCK_CAP_MS");
 #if defined(__vita__)
@@ -171,8 +181,35 @@ static RegEnt *reg_slot(uint32_t key) {
     return &regs[0];
 }
 static uint32_t norm(uint32_t a) { return (a >= 0xE0000000u) ? a : (a & 0x1FFFFFFFu); }
-uint32_t hle_reg_get(uint32_t addr) { return reg_slot(norm(addr) & ~3u)->val; }
-void hle_reg_set(uint32_t addr, uint32_t v) { reg_slot(norm(addr) & ~3u)->val = v; }
+/* Flat mirror of the hot registers: the PVR core registers + fog table + palette RAM (0x005F8000..0x005F9FFF, 2048 words) and QACR0/1 (0xFF000038/3C) are read every frame
+ * (palette/fog snapshots, SQ flush) and used to cost one hash-table lookup each (1,168 per frame).  The RegEnt in regs[] stays the authoritative backing store for the
+ * generic read path and the access counters; every path that changes a RegEnt value of these addresses (def_write, hle_reg_set) also updates the mirror, so hle_reg_get() is
+ * a plain array load.  pal_epoch / fog_epoch change only when a palette-relevant resp. fog-relevant register word really changes value. */
+#define PVR_BASE 0x005F8000u
+#define PVR_WORDS 2048u
+static uint32_t pvr_regs[PVR_WORDS], qacr_v[2], pal_epoch = 1, fog_epoch = 1;
+static inline void flat_store(uint32_t k, uint32_t v) {            /* k = normalised word address; mirror a RegEnt value */
+    uint32_t i = (k - PVR_BASE) >> 2;
+    if (k - PVR_BASE < PVR_WORDS * 4u) {
+        if (pvr_regs[i] != v) {
+            pvr_regs[i] = v;
+            if (k >= 0x005F9000u || k == 0x005F8108u || k == 0x005F80E4u) pal_epoch++;     /* palette RAM, PAL_RAM_CTRL, TEXT_CONTROL */
+            else if ((k >= 0x005F8200u && k < 0x005F8400u) || (k >= 0x005F80B0u && k <= 0x005F80C0u)) fog_epoch++;   /* fog table, FOG_COL_RAM/VERT/DENSITY/CLAMP */
+        }
+    } else if (k == 0xFF000038u) qacr_v[0] = v;
+    else if (k == 0xFF00003Cu) qacr_v[1] = v;
+}
+const uint32_t *hle_pvr_regs(void) { return pvr_regs; }
+uint32_t hle_pvr_pal_epoch(void) { return pal_epoch; }
+uint32_t hle_pvr_fog_epoch(void) { return fog_epoch; }
+uint32_t hle_reg_get(uint32_t addr) {
+    uint32_t k = norm(addr) & ~3u;
+    if (k - PVR_BASE < PVR_WORDS * 4u) return pvr_regs[(k - PVR_BASE) >> 2];
+    if (k == 0xFF000038u) return qacr_v[0];
+    if (k == 0xFF00003Cu) return qacr_v[1];
+    return reg_slot(k)->val;
+}
+void hle_reg_set(uint32_t addr, uint32_t v) { uint32_t k = norm(addr) & ~3u; reg_slot(k)->val = v; flat_store(k, v); }
 
 typedef struct { uint32_t lo, hi; hle_mmio_rd rd; hle_mmio_wr wr; hle_mmio_wr watch; } MapEnt;
 static MapEnt maps[64]; static int nmaps;
@@ -217,6 +254,26 @@ static uint8_t vram[8 << 20], waveram[2 << 20];
  * 32-bit offset = (A&3) | ((A&0x7FFFF8)>>1) | (((A>>2)&1)<<22). Kamui's texture upload (CPU stores to 0xA5xxxxxx) lands here. */
 static uint32_t vram_off(uint32_t k) { uint32_t o = k & 0x7FFFFF; if ((k >> 24) == 5) o = (o & 3) | ((o & 0x7FFFF8) >> 1) | (((o >> 2) & 1) << 22); return o; }
 uint8_t *hle_vram_ptr(void) { return vram; }
+/* VRAM dirty-page epochs (texture-cache validity).  One stamp per 4 KiB page of the 8 MiB image.  Every write that changes bytes of vram[] stamps the pages it touches with the
+ * current epoch (vram_stamp); writes into the frame-buffer shadow (fbshadow, see below) do not touch vram[] and therefore never stamp.  hle_vram_max_epoch() returns the newest
+ * stamp over a byte range and then opens a new epoch, so any later write gets a strictly larger stamp: a cached texture whose recorded value still equals the current max over its
+ * pages has not been written since (O(1), no hashing). Only the guest thread writes VRAM and queries (the renderer runs synchronously at STARTRENDER). */
+#define VRAM_PAGES 2048u
+static uint32_t vram_pg_epoch[VRAM_PAGES], vram_cur_epoch = 1;
+static inline void vram_stamp(uint32_t off, uint32_t len) {
+    if (!len || off >= (8u << 20)) return;
+    uint32_t p0 = off >> 12, p1 = (off + len - 1) >> 12; if (p1 >= VRAM_PAGES) p1 = VRAM_PAGES - 1;
+    for (uint32_t p = p0; p <= p1; p++) vram_pg_epoch[p] = vram_cur_epoch;
+}
+uint32_t hle_vram_max_epoch(uint32_t off, uint32_t len) {
+    uint32_t m = 0;
+    if (len && off < (8u << 20)) {
+        uint32_t p0 = off >> 12, p1 = (off + len - 1) >> 12; if (p1 >= VRAM_PAGES) p1 = VRAM_PAGES - 1;
+        for (uint32_t p = p0; p <= p1; p++) if (vram_pg_epoch[p] > m) m = vram_pg_epoch[p];
+    }
+    vram_cur_epoch++;
+    return m;
+}
 /* Frame-buffer regions.  The PVR renders into / scans out of FB_W_SOFn / FB_R_SOFn (64-bit-area byte offsets), and we never render into VRAM (the TA stream is drawn by the host
  * renderer), so these regions are not part of the VRAM image the texture decoder sees.  Games still touch them with the CPU: Rayman 2 copies the displayed buffer (R_SOF1 = 0x0aa000) into the
  * render buffer (W_SOF1 = 0x4aa000) through 0xA5xxxxxx at every level start.  In the 32-bit view `vram` (= texture view) that 0x96000-byte stream lands on L = 0x255000..0x2a0000 and
@@ -355,7 +412,7 @@ static void sq_flush_default(SH4Ctx *c, uint32_t addr) {          /* `pref @Rn` 
     if (phys >= 0x0C000000u && phys < 0x0D000000u) { memcpy(&sh4_ram[phys & 0xFFFFFF], d, 32); sq_ram_n++; return; }   /* SQ -> system RAM */
     if (sq_sink) { sq_sink(phys, d); sq_other_n++; return; }
     if (phys >= 0x10000000u && phys < 0x10800000u) { ta_fallback_scan(d, 32); sq_other_n++; return; }
-    if (phys >= 0x04000000u && phys < 0x08000000u) { vram_area_n[(phys >> 24) & 3]++; memcpy(&vram[phys & 0x7FFFFF], d, 32); sq_other_n++; return; }        /* SQ -> VRAM */
+    if (phys >= 0x04000000u && phys < 0x08000000u) { vram_area_n[(phys >> 24) & 3]++; memcpy(&vram[phys & 0x7FFFFF], d, 32); vram_stamp(phys & 0x7FFFFF, 32); sq_other_n++; return; }        /* SQ -> VRAM */
     hle_unhandled("sq-flush", phys, 32, 0);
 }
 static uint32_t sq_rd(uint32_t a, int size) { uint32_t v = 0; memcpy(&v, sq_buf + (a & 0x3F), size); return v; }
@@ -372,7 +429,7 @@ static void dma_ch2(void) {
     if (hle_verbose >= 2) hle_log("[dma] ch2 src=%08x dst=%08x len=%u pr=%08x", src, dst, len, G ? G->pr : 0);
     if (sp >= 0x0C000000u && sp + len <= 0x0D000000u) {
         if (dst >= 0x10000000u && dst < 0x10800000u) { if (dma_ta_sink) dma_ta_sink(dst, &sh4_ram[sp & 0xFFFFFF], len); else ta_fallback_scan(&sh4_ram[sp & 0xFFFFFF], len); }
-        else if (dst >= 0x04000000u && dst < 0x05000000u) memcpy(&vram[dst & 0x7FFFFF], &sh4_ram[sp & 0xFFFFFF], len);
+        else if (dst >= 0x04000000u && dst < 0x05000000u) { memcpy(&vram[dst & 0x7FFFFF], &sh4_ram[sp & 0xFFFFFF], len); vram_stamp(dst & 0x7FFFFF, len); }
         else if (dst >= 0x0C000000u && dst < 0x0D000000u) memmove(&sh4_ram[dst & 0xFFFFFF], &sh4_ram[sp & 0xFFFFFF], len);
         else hle_unhandled("dma-ch2-dst", dst, len, 0);
     } else hle_unhandled("dma-ch2-src", src, len, 0);
@@ -386,7 +443,7 @@ static void dma_pvr(void) {
     uint32_t sp = sy & 0x1FFFFFFFu;
     if (sp >= 0x0C000000u && sp + len <= 0x0D000000u && (pv & 0x1FFFFFFFu) < 0x00800000u) {
         uint8_t *v = &vram[(pv & 0x1FFFFFFFu) & 0x7FFFFF];
-        if (dir == 0) memcpy(v, &sh4_ram[sp & 0xFFFFFF], len); else memcpy(&sh4_ram[sp & 0xFFFFFF], v, len);
+        if (dir == 0) { memcpy(v, &sh4_ram[sp & 0xFFFFFF], len); vram_stamp((pv & 0x1FFFFFFFu) & 0x7FFFFF, len); } else memcpy(&sh4_ram[sp & 0xFFFFFF], v, len);
     } else hle_unhandled("dma-pvr", pv, len, sy);
     hle_reg_set(0xA05F7C18u, 0);
     hle_asic_raise_later(1u << 20);
@@ -396,7 +453,7 @@ static void def_write(uint32_t a, int size, uint32_t v) {
     uint32_t k = norm(a);
     poll_check(a, v, 0);
     if (k >= 0x0C000000u && k < 0x0D000000u) { memcpy(&sh4_ram[k & 0xFFFFFF], &v, size); return; }
-    if (k >= 0x04000000u && k < 0x06000000u) { vram_cpu_n[(k >> 24) & 3]++; { unsigned a = (k >> 24) & 1; uint32_t o = k & 0x7FFFFF; if (o < vram_min[a]) vram_min[a] = o; if (o > vram_max[a]) vram_max[a] = o; } { uint8_t *fs = fb_shadow(k); memcpy(fs ? fs : &vram[vram_off(k)], &v, size); } return; }
+    if (k >= 0x04000000u && k < 0x06000000u) { vram_cpu_n[(k >> 24) & 3]++; { unsigned a = (k >> 24) & 1; uint32_t o = k & 0x7FFFFF; if (o < vram_min[a]) vram_min[a] = o; if (o > vram_max[a]) vram_max[a] = o; } { uint8_t *fs = fb_shadow(k); if (fs) memcpy(fs, &v, size); else { uint32_t vo = vram_off(k); if (memcmp(&vram[vo], &v, size)) { memcpy(&vram[vo], &v, size); vram_stamp(vo, (uint32_t)size); } } } return; }
     if (k >= 0x00800000u && k < 0x00A00000u) { memcpy(&waveram[k & 0x1FFFFF], &v, size); return; }
     if (!is_modelled_reg(k)) { hle_unhandled("wr", a, size, v); return; }
     RegEnt *r = reg_slot(k & ~3u);
@@ -404,6 +461,7 @@ static void def_write(uint32_t a, int size, uint32_t v) {
     count_reg(r, 1, v, size);
     if (size < 4) { int sh = (k & 3) * 8; uint32_t m = (size == 1 ? 0xFFu : 0xFFFFu) << sh; r->val = (r->val & ~m) | ((v << sh) & m); }
     else r->val = v;
+    flat_store(k & ~3u, r->val);
     switch (k & ~3u) {
     case 0xFFD8000Cu: tmu_base_cnt = v; tmu_base_ns = now_ns(); break;              /* TCNT0 write */
     case 0x005F8014u:                                                              /* STARTRENDER: render finishes instantly on the host */
@@ -606,7 +664,7 @@ void hle_boot_init(SH4Ctx *c, const uint8_t *image, uint32_t len, const char *dc
     sh4_register_hook(BIOS_GDROM, bios_gdrom); sh4_register_hook(BIOS_EXIT, bios_exit); sh4_register_hook(BIOS_RESET, bios_exit);
     /* SDK hooks */
     hle_hook(0x8C0DB7E0, h_pvr_write); hle_hook(0x8C0DB7EA, h_pvr_read);
-    hle_hook(0x8C06874C, h_sprintf_spy);
+    if (hle_verbose > 0) hle_hook(0x8C06874C, h_sprintf_spy);      /* only a logging spy: no hook (and no extra stub call per sprintf) when quiet */
     hle_hook(0x8C0CF830, h_nop); hle_hook(0x8C0CF89C, h_nop); hle_hook(0x8C0CFAFA, h_nop); hle_hook(0x8C0CFD4E, h_nop);
     hle_hook(0x8C0CFFE0, h_nop); hle_hook(0x8C0D1096, h_nop);
     hle_mmio_map(0xE0000000u, 0xE3FFFFFFu, sq_rd, sq_wr); hle_set_pref_handler(sq_flush_default);

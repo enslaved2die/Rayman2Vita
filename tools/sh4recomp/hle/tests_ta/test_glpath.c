@@ -69,7 +69,7 @@ int main(int argc, char **argv)
         for (uint32_t b = 0; b < gl.list_count[L]; b++) {
             const TaBatch *bt = &gl.batches[gl.list_first[L] + b]; const TaState *st = &bt->st;
             const Tex *tx = st->textured ? get_tex(vr, vn, &env, st->tcw, st->tsp) : NULL;
-            int clamp_u = (st->tsp >> 15) & 1, clamp_v = (st->tsp >> 16) & 1, flip_u = (st->tsp >> 17) & 1, flip_v = (st->tsp >> 18) & 1;
+            int clamp_u = st->clamp_u, clamp_v = st->clamp_v, flip_u = st->flip_u, flip_v = st->flip_v;   /* TSP: 15 ClampV, 16 ClampU, 17 FlipV, 18 FlipU (decoded by ta_decode_header) */
             for (uint32_t t = 0; t + 2 < bt->count; t += 3) {
                 float sx[3], sy[3], sz[3], cw[3];
                 for (int k = 0; k < 3; k++) {

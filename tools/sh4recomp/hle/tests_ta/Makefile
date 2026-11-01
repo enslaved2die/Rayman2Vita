@@ -18,5 +18,15 @@ test-frame: test_tex.c test_glpath.c ../ta.c ../ta.h
 	./test_glpath $(FRAMEDIR)/frame.bin $(FRAMEDIR)/vram.bin $(FRAMEDIR)/pvrregs.bin $(FRAMEDIR)/glpath.ppm
 	python3 ../../tools/ta_render.py $(FRAMEDIR)/frame.bin $(FRAMEDIR)/vram.bin $(FRAMEDIR)/ref_nearest.png --no-bilinear --no-mip
 	python3 ../../tools/cmp_ppm.py $(FRAMEDIR)/glpath.ppm $(FRAMEDIR)/ref_nearest.png
+# make test-stamp : texture-cache validity (VRAM page epochs + palette epoch) against the real boot.c/texmap.c, every VRAM write path; needs `make hle` (../../build_hle objects)
+HLEOBJ = $(filter-out %_vita.o %/run_game.o,$(wildcard ../../build_hle/*.o))
+test-stamp: test_stamp.c
+	cc $(CFLAGS) -I../ -I../../gen_fix test_stamp.c $(HLEOBJ) -lm -o test_stamp && ./test_stamp
+# make test-glcount : run the REAL vita_gl_render.c on the host against a counting vitaGL fake (fakegl/) on a frame dump; prints draw calls / GL state calls / texture traffic per frame
+GLC_FLAGS = -O1 -std=gnu11 -Wall -Wno-unused-function -I../.. -I../../gen_fix -I.. -Ifakegl -DCPA_PLATFORM_VITA -frounding-math
+test-glcount: test_glcount.c ../vita_gl_render.c ../ta.c ../texmap.c
+	cc $(GLC_FLAGS) -c ../texmap.c -Dhle_ta_background=tm_bg -Dhle_ta_pvr_snapshot=tm_snap -Dhle_ta_fog_table=tm_fog -o texmap_glc.o
+	cc $(GLC_FLAGS) test_glcount.c ../ta.c texmap_glc.o -lm -o test_glcount
+	./test_glcount $(FRAMEDIR)/frame.bin $(FRAMEDIR)/vram.bin $(FRAMEDIR)/pvrregs.bin $(FRAMEDIR)/pvrfog.bin 6
 clean:
-	rm -f test_ta test_ta_real test_tex test_glpath
+	rm -f test_ta test_ta_real test_tex test_glpath test_stamp test_glcount texmap_glc.o

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Generate build_hle/hook_stubs.c and build_hle/rename.sed for the HLE build.
-Hookable set = every literal 0x8Cxxxxxx in hle/*.c (and hle/*.h) that is a lifted function entry (gen/recomp_decls.h)."""
+Hookable set = every literal 0x8Cxxxxxx in the CODE of hle/*.c (and hle/*.h; C comments are stripped first, string literals kept) that is a lifted
+function entry (gen/recomp_decls.h). hle/hooks.extra (extra spy-able addresses for `run_game --spy`) is only added when R2_EXTRA_HOOKS=1 is set in the
+environment: every stub costs an extra call + hook test on the guest's hottest functions (calloc/malloc/free/strcmp/Kamui strip builders ...)."""
 import re, sys, glob, os
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 out = os.path.join(root, "build_hle")
@@ -8,13 +10,17 @@ os.makedirs(out, exist_ok=True)
 decl = open(os.path.join(root, (sys.argv[1] if len(sys.argv) > 1 else "gen"), "recomp_decls.h")).read()
 funcs = set(int(m, 16) for m in re.findall(r"void f_([0-9a-f]{8})\(SH4Ctx", decl))
 lits = set()
+# comments out, strings/chars kept (a quoted "0x8c..." still counts, as before)
+_tok = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.S)
+def strip_comments(t):
+    return _tok.sub(lambda m: " " if m.group(0)[0] == "/" else m.group(0), t)
 for f in glob.glob(os.path.join(root, "hle", "*.[ch]")):
     if f.endswith("hook_stubs.c"): continue
-    for m in re.findall(r"0x([89aA][cC][0-9a-fA-F]{6})\b", open(f).read()):
+    for m in re.findall(r"0x([89aA][cC][0-9a-fA-F]{6})\b", strip_comments(open(f).read())):
         v = int(m, 16) & 0x8CFFFFFF
         if v in funcs: lits.add(v)
 extra = os.path.join(root, "hle", "hooks.extra")      # extra hookable (spy-able) addresses, one hex per line, '#' comments
-if os.path.exists(extra):
+if os.path.exists(extra) and os.environ.get("R2_EXTRA_HOOKS") == "1":
     for ln in open(extra):
         ln = ln.split('#')[0].strip()
         if ln:

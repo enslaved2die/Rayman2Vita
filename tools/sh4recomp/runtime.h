@@ -10,6 +10,24 @@
 #include <fenv.h>
 #endif
 
+/* SH4_INLINE: on the Vita build every helper below must be inlined into the (huge) lifted functions: GCC refuses at -O2/-O3 for plain `static inline`
+ * and emitted ~82k outlined calls. Host builds keep plain `static inline` (identical behaviour either way). */
+#if defined(__vita__) || defined(R2_ALWAYS_INLINE)
+#define SH4_INLINE static inline __attribute__((always_inline))
+#else
+#define SH4_INLINE static inline
+#endif
+#define SH4_COLD __attribute__((noinline, cold))
+/* SH4_FASTFP (ARM VFP targets only): sh4_setfpscr mirrors guest FPSCR.DN into the hardware FPSCR.FZ (flush-to-zero of denormal inputs AND results, sign kept),
+ * which is bit-identical to the software fz() in/out flush, so fin()/fout()/fq() become plain bit casts. Hardware default-NaN (DN) is NOT used: it would
+ * replace propagated input-NaN payloads by 0x7FC00000 (software propagates them); the invalid-operation result 0x7FC00000 is still canonicalised to 0x7FBFFFFF
+ * by nanfix(). Defaults to on for __vita__ && __arm__; -DR2_NO_FASTFP turns it off. */
+#if defined(__vita__) && defined(__arm__) && !defined(R2_NO_FASTFP)
+#define SH4_FASTFP 1
+#endif
+#define SH4_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define SH4_LIKELY(x)   __builtin_expect(!!(x), 1)
+
 #define SH4_RAM_SIZE   0x01000000u
 #define SH4_IMAGE_BASE 0x8C010000u
 #define SH4_FPSCR_RM  0x00000003u
@@ -37,13 +55,14 @@ extern unsigned long sh4_stat_unmapped;     /* count of slow-path/unmapped acces
 /* ---- memory ---- */
 uint32_t sh4_io_read(uint32_t addr, int size);              /* slow path (hook table) */
 void     sh4_io_write(uint32_t addr, int size, uint32_t v);
-#define SH4_FAST(a) ((((a) >> 24) | 0x20u) == 0xACu)
-static inline uint32_t LD8(uint32_t a)  { return SH4_FAST(a) ? sh4_ram[a & 0xFFFFFFu] : sh4_io_read(a,1); }
-static inline uint32_t LD16(uint32_t a) { if (SH4_FAST(a)) { uint16_t v; memcpy(&v, &sh4_ram[a & 0xFFFFFFu], 2); return v; } return sh4_io_read(a,2); }
-static inline uint32_t LD32(uint32_t a) { if (SH4_FAST(a)) { uint32_t v; memcpy(&v, &sh4_ram[a & 0xFFFFFFu], 4); return v; } return sh4_io_read(a,4); }
-static inline void ST8(uint32_t a, uint32_t v)  { if (SH4_FAST(a)) sh4_ram[a & 0xFFFFFFu] = (uint8_t)v; else sh4_io_write(a,1,v); }
-static inline void ST16(uint32_t a, uint32_t v) { if (SH4_FAST(a)) { uint16_t x=(uint16_t)v; memcpy(&sh4_ram[a & 0xFFFFFFu], &x, 2); } else sh4_io_write(a,2,v); }
-static inline void ST32(uint32_t a, uint32_t v) { if (SH4_FAST(a)) memcpy(&sh4_ram[a & 0xFFFFFFu], &v, 4); else sh4_io_write(a,4,v); }
+/* RAM iff top byte is 0x8C (P1) or 0xAC (P2): clearing bit 29 maps both onto 0x8C */
+#define SH4_FAST(a) (((a) & 0xDF000000u) == 0x8C000000u)
+SH4_INLINE uint32_t LD8(uint32_t a)  { return SH4_LIKELY(SH4_FAST(a)) ? sh4_ram[a & 0xFFFFFFu] : sh4_io_read(a,1); }
+SH4_INLINE uint32_t LD16(uint32_t a) { if (SH4_LIKELY(SH4_FAST(a))) { uint16_t v; memcpy(&v, &sh4_ram[a & 0xFFFFFFu], 2); return v; } return sh4_io_read(a,2); }
+SH4_INLINE uint32_t LD32(uint32_t a) { if (SH4_LIKELY(SH4_FAST(a))) { uint32_t v; memcpy(&v, &sh4_ram[a & 0xFFFFFFu], 4); return v; } return sh4_io_read(a,4); }
+SH4_INLINE void ST8(uint32_t a, uint32_t v)  { if (SH4_LIKELY(SH4_FAST(a))) sh4_ram[a & 0xFFFFFFu] = (uint8_t)v; else sh4_io_write(a,1,v); }
+SH4_INLINE void ST16(uint32_t a, uint32_t v) { if (SH4_LIKELY(SH4_FAST(a))) { uint16_t x=(uint16_t)v; memcpy(&sh4_ram[a & 0xFFFFFFu], &x, 2); } else sh4_io_write(a,2,v); }
+SH4_INLINE void ST32(uint32_t a, uint32_t v) { if (SH4_LIKELY(SH4_FAST(a))) memcpy(&sh4_ram[a & 0xFFFFFFu], &v, 4); else sh4_io_write(a,4,v); }
 
 /* ---- calls / hooks ---- */
 typedef struct { uint32_t addr; sh4_fn fn; } Sh4FuncEnt;
@@ -61,8 +80,8 @@ void sh4_load_image(const uint8_t *data, uint32_t len, uint32_t guest_base);
 void sh4_ctx_reset(SH4Ctx *c);
 
 /* ---- SR / FPSCR ---- */
-static inline uint32_t sh4_getsr(SH4Ctx *c) { return c->sr_other | c->t | (c->s << 1) | (c->q << 8) | (c->m << 9); }
-static inline void sh4_setsr(SH4Ctx *c, uint32_t v) {
+SH4_INLINE uint32_t sh4_getsr(SH4Ctx *c) { return c->sr_other | c->t | (c->s << 1) | (c->q << 8) | (c->m << 9); }
+SH4_INLINE void sh4_setsr(SH4Ctx *c, uint32_t v) {
     uint32_t old = c->sr_other;
     c->t = v & 1; c->s = (v >> 1) & 1; c->q = (v >> 8) & 1; c->m = (v >> 9) & 1;
     c->sr_other = v & 0x700083F0u;                 /* MD(30) RB(29) BL(28) FD(15) IMASK(7:4) */
@@ -70,18 +89,24 @@ static inline void sh4_setsr(SH4Ctx *c, uint32_t v) {
         for (int i = 0; i < 8; i++) { uint32_t x = c->r[i]; c->r[i] = c->rb[i]; c->rb[i] = x; }
     }
 }
-static inline void sh4_frchg(SH4Ctx *c) {
+SH4_INLINE void sh4_frchg(SH4Ctx *c) {
     for (int i = 0; i < 16; i++) { uint32_t x = c->fr[i]; c->fr[i] = c->xf[i]; c->xf[i] = x; }
     c->fpscr ^= SH4_FPSCR_FR;
 }
-static inline void sh4_setfpscr(SH4Ctx *c, uint32_t v) {
+#define SH4_FPSCR_DN 0x00040000u
+#if defined(__arm__)
+extern uint32_t sh4_hwfp_cfg;                        /* last (RM==1)|DN<<1 programmed into the hardware FPSCR (0xFFFFFFFF = never) */
+SH4_COLD void sh4_hw_fpscr_update(uint32_t cfg);       /* runtime.c: vmrs/vmsr RMode+FZ */
+SH4_INLINE void sh4_hw_fpscr(uint32_t v) {
+    /* hardware FPSCR: RMode (bits 23:22) = RZ (3) iff guest RM==1; FZ (bit 24) = guest DN. vmsr serialises the VFP pipe, so only write when this changes. */
+    uint32_t cfg = ((v & SH4_FPSCR_RM) == 1 ? 1u : 0u) | ((v & SH4_FPSCR_DN) ? 2u : 0u);
+    if (cfg != sh4_hwfp_cfg) sh4_hw_fpscr_update(cfg);
+}
+#endif
+SH4_INLINE void sh4_setfpscr(SH4Ctx *c, uint32_t v) {
     v &= 0x003FFFFFu;
 #if defined(__arm__)
-    uint32_t arm_fpscr;
-    __asm__ volatile("vmrs %0, fpscr" : "=r"(arm_fpscr));
-    arm_fpscr &= ~(3u << 22);
-    if ((v & SH4_FPSCR_RM) == 1) arm_fpscr |= (3u << 22);
-    __asm__ volatile("vmsr fpscr, %0" : : "r"(arm_fpscr));
+    sh4_hw_fpscr(v);
 #elif !defined(__vita__)
     fesetround((v & SH4_FPSCR_RM) == 1 ? FE_TOWARDZERO : FE_TONEAREST);   /* RM=1: round to zero */
 #endif
@@ -90,22 +115,22 @@ static inline void sh4_setfpscr(SH4Ctx *c, uint32_t v) {
 }
 
 /* ---- integer helpers ---- */
-static inline uint32_t sh4_cmpstr(uint32_t a, uint32_t b) {
+SH4_INLINE uint32_t sh4_cmpstr(uint32_t a, uint32_t b) {
     uint32_t x = a ^ b;
     return ((x & 0xFF) == 0) | ((x & 0xFF00) == 0) | ((x & 0xFF0000) == 0) | ((x & 0xFF000000u) == 0);
 }
-static inline uint32_t sh4_shad(uint32_t v, uint32_t sh) {
+SH4_INLINE uint32_t sh4_shad(uint32_t v, uint32_t sh) {
     int32_t s = (int32_t)v;
     if ((int32_t)sh >= 0) return (uint32_t)s << (sh & 31);
     if ((sh & 31) == 0) return (uint32_t)(s >> 31);
     return (uint32_t)(s >> ((~sh & 31) + 1));      /* shift right by (32 - (sh&31)) */
 }
-static inline uint32_t sh4_shld(uint32_t v, uint32_t sh) {
+SH4_INLINE uint32_t sh4_shld(uint32_t v, uint32_t sh) {
     if ((int32_t)sh >= 0) return v << (sh & 31);
     if ((sh & 31) == 0) return 0;
     return v >> ((~sh & 31) + 1);
 }
-static inline uint32_t sh4_div1(SH4Ctx *c, uint32_t rn, uint32_t rm) {
+SH4_INLINE uint32_t sh4_div1(SH4Ctx *c, uint32_t rn, uint32_t rm) {
     uint32_t old_q = c->q, tmp0, tmp1;
     c->q = rn >> 31;
     rn = (rn << 1) | c->t;
@@ -120,14 +145,14 @@ static inline uint32_t sh4_div1(SH4Ctx *c, uint32_t rn, uint32_t rm) {
     c->t = (c->q == c->m);
     return rn;
 }
-static inline void sh4_mac_l(SH4Ctx *c, uint32_t an, uint32_t am) {
+SH4_INLINE void sh4_mac_l(SH4Ctx *c, uint32_t an, uint32_t am) {
     int32_t a = (int32_t)LD32(an), b = (int32_t)LD32(am);
     int64_t mac = (int64_t)(((uint64_t)c->mach << 32) | c->macl);
     mac += (int64_t)a * (int64_t)b;
     if (c->s) { if (mac > (int64_t)0x00007FFFFFFFFFFFll) mac = 0x00007FFFFFFFFFFFll; else if (mac < (int64_t)0xFFFF800000000000ll) mac = (int64_t)0xFFFF800000000000ll; }
     c->mach = (uint32_t)((uint64_t)mac >> 32); c->macl = (uint32_t)mac;
 }
-static inline void sh4_mac_w(SH4Ctx *c, uint32_t an, uint32_t am) {
+SH4_INLINE void sh4_mac_w(SH4Ctx *c, uint32_t an, uint32_t am) {
     int32_t a = (int16_t)LD16(an), b = (int16_t)LD16(am);
     int64_t prod = (int64_t)a * b;
     if (c->s) {
@@ -142,57 +167,61 @@ static inline void sh4_mac_w(SH4Ctx *c, uint32_t an, uint32_t am) {
 }
 
 /* ---- FPU ---- */
-static inline float  u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
-static inline uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
-static inline double u2d(uint32_t hi, uint32_t lo) { uint64_t x = ((uint64_t)hi << 32) | lo; double d; memcpy(&d, &x, 8); return d; }
+SH4_INLINE float  u2f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+SH4_INLINE uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+SH4_INLINE double u2d(uint32_t hi, uint32_t lo) { uint64_t x = ((uint64_t)hi << 32) | lo; double d; memcpy(&d, &x, 8); return d; }
 /* FPSCR.DN=1 (bit 18, the Dreamcast default 0x00040001): denormal inputs/outputs flush to signed zero */
-#define SH4_FPSCR_DN 0x00040000u
-static inline uint32_t fz(SH4Ctx *c, uint32_t b) { return ((c->fpscr & SH4_FPSCR_DN) && (b & 0x7F800000u) == 0) ? (b & 0x80000000u) : b; }
-static inline float  fin(SH4Ctx *c, uint32_t b) { return u2f(fz(c, b)); }
-static inline uint32_t fout(SH4Ctx *c, float f) { return fz(c, f2u(f)); }
+SH4_INLINE uint32_t fz(SH4Ctx *c, uint32_t b) { return ((c->fpscr & SH4_FPSCR_DN) && (b & 0x7F800000u) == 0) ? (b & 0x80000000u) : b; }
+#ifdef SH4_FASTFP
+SH4_INLINE float  fin(SH4Ctx *c, uint32_t b) { (void)c; return u2f(b); }      /* hardware FZ == guest DN: flush happens inside the VFP op */
+SH4_INLINE uint32_t fout(SH4Ctx *c, float f) { (void)c; return f2u(f); }
+#else
+SH4_INLINE float  fin(SH4Ctx *c, uint32_t b) { return u2f(fz(c, b)); }
+SH4_INLINE uint32_t fout(SH4Ctx *c, float f) { return fz(c, f2u(f)); }
+#endif
 /* SH-4 default NaN for invalid operations (0/0, inf-inf, 0*inf, sqrt(<0)): 0x7FBFFFFF (single), 0x7FF7FFFFFFFFFFFF (double) */
-static inline int isnan32(uint32_t b) { return (b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu); }
-static inline uint32_t nanfix(uint32_t r, uint32_t a, uint32_t b) { return (isnan32(r) && !isnan32(a) && !isnan32(b)) ? 0x7FBFFFFFu : r; }
-static inline uint32_t fp_sz(SH4Ctx *c) { return (c->fpscr & SH4_FPSCR_SZ) ? 8 : 4; }
-static inline double  fp_getd(SH4Ctx *c, int n) { return u2d(c->fr[n & 14], c->fr[(n & 14) + 1]); }
-static inline void    fp_setd(SH4Ctx *c, int n, double d) { uint64_t x; memcpy(&x, &d, 8); c->fr[n & 14] = (uint32_t)(x >> 32); c->fr[(n & 14) + 1] = (uint32_t)x; }
-/* fmov helpers: SZ=1 => 64-bit transfers, odd register number selects the XD (alternate) bank */
-static inline void fp_ld(SH4Ctx *c, int n, uint32_t a) {
-    if (c->fpscr & SH4_FPSCR_SZ) {
-        uint32_t *b = (n & 1) ? c->xf : c->fr; int k = n & 14;
-        b[k + 1] = LD32(a); b[k] = LD32(a + 4);      /* little-endian: low word at low address -> FR(n+1) */
-    } else c->fr[n] = LD32(a);
+SH4_INLINE int isnan32(uint32_t b) { return (b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu); }
+SH4_INLINE uint32_t nanfix(uint32_t r, uint32_t a, uint32_t b) { return (isnan32(r) && !isnan32(a) && !isnan32(b)) ? 0x7FBFFFFFu : r; }
+SH4_INLINE uint32_t fp_sz(SH4Ctx *c) { return (c->fpscr & SH4_FPSCR_SZ) ? 8 : 4; }
+SH4_INLINE double  fp_getd(SH4Ctx *c, int n) { return u2d(c->fr[n & 14], c->fr[(n & 14) + 1]); }
+SH4_INLINE void    fp_setd(SH4Ctx *c, int n, double d) { uint64_t x; memcpy(&x, &d, 8); c->fr[n & 14] = (uint32_t)(x >> 32); c->fr[(n & 14) + 1] = (uint32_t)x; }
+/* fmov helpers: SZ=1 => 64-bit transfers, odd register number selects the XD (alternate) bank.
+ * The SZ=1 / PR=1 bodies are cold and outlined (the game only toggles SZ inside two tiny fmov-copy functions): the inlined fast path is a flag test + one load/store. */
+SH4_COLD static void fp_ld_sz(SH4Ctx *c, int n, uint32_t a) {
+    uint32_t *b = (n & 1) ? c->xf : c->fr; int k = n & 14;
+    b[k + 1] = LD32(a); b[k] = LD32(a + 4);          /* little-endian: low word at low address -> FR(n+1) */
 }
-static inline void fp_st(SH4Ctx *c, int n, uint32_t a) {
-    if (c->fpscr & SH4_FPSCR_SZ) {
-        uint32_t *b = (n & 1) ? c->xf : c->fr; int k = n & 14;
-        ST32(a, b[k + 1]); ST32(a + 4, b[k]);
-    } else ST32(a, c->fr[n]);
+SH4_COLD static void fp_st_sz(SH4Ctx *c, int n, uint32_t a) {
+    uint32_t *b = (n & 1) ? c->xf : c->fr; int k = n & 14;
+    ST32(a, b[k + 1]); ST32(a + 4, b[k]);
 }
-static inline void fp_mov(SH4Ctx *c, int n, int m) {
-    if (c->fpscr & SH4_FPSCR_SZ) {
-        uint32_t *bs = (m & 1) ? c->xf : c->fr, *bd = (n & 1) ? c->xf : c->fr; int ks = m & 14, kd = n & 14;
-        uint32_t h = bs[ks], l = bs[ks + 1]; bd[kd] = h; bd[kd + 1] = l;
-    } else c->fr[n] = c->fr[m];
+SH4_COLD static void fp_mov_sz(SH4Ctx *c, int n, int m) {
+    uint32_t *bs = (m & 1) ? c->xf : c->fr, *bd = (n & 1) ? c->xf : c->fr; int ks = m & 14, kd = n & 14;
+    uint32_t h = bs[ks], l = bs[ks + 1]; bd[kd] = h; bd[kd + 1] = l;
 }
-static inline void fp_arith(SH4Ctx *c, int op, int n, int m) {
-    if (c->fpscr & SH4_FPSCR_PR) {
-        double a = fp_getd(c, n), b = fp_getd(c, m), r;
-        switch (op) { case 0: r = a + b; break; case 1: r = a - b; break; case 2: r = a * b; break; default: r = a / b; }
-        { uint64_t rb; memcpy(&rb, &r, 8);
-          if ((rb & 0x7FF0000000000000ull) == 0x7FF0000000000000ull && (rb & 0x000FFFFFFFFFFFFFull) && !isnan(a) && !isnan(b)) rb = 0x7FF7FFFFFFFFFFFFull;
-          c->fr[n & 14] = (uint32_t)(rb >> 32); c->fr[(n & 14) + 1] = (uint32_t)rb; }
-    } else {
-        float a = fin(c, c->fr[n]), b = fin(c, c->fr[m]), r;
-        switch (op) { case 0: r = a + b; break; case 1: r = a - b; break; case 2: r = a * b; break; default: r = a / b; }
-        c->fr[n] = nanfix(fout(c, r), c->fr[n], c->fr[m]);
-    }
+SH4_INLINE void fp_ld(SH4Ctx *c, int n, uint32_t a)  { if (SH4_UNLIKELY(c->fpscr & SH4_FPSCR_SZ)) fp_ld_sz(c, n, a); else c->fr[n] = LD32(a); }
+SH4_INLINE void fp_st(SH4Ctx *c, int n, uint32_t a)  { if (SH4_UNLIKELY(c->fpscr & SH4_FPSCR_SZ)) fp_st_sz(c, n, a); else ST32(a, c->fr[n]); }
+SH4_INLINE void fp_mov(SH4Ctx *c, int n, int m)      { if (SH4_UNLIKELY(c->fpscr & SH4_FPSCR_SZ)) fp_mov_sz(c, n, m); else c->fr[n] = c->fr[m]; }
+SH4_COLD static void fp_arith_pr(SH4Ctx *c, int op, int n, int m) {
+    double a = fp_getd(c, n), b = fp_getd(c, m), r;
+    switch (op) { case 0: r = a + b; break; case 1: r = a - b; break; case 2: r = a * b; break; default: r = a / b; }
+    { uint64_t rb; memcpy(&rb, &r, 8);
+      if ((rb & 0x7FF0000000000000ull) == 0x7FF0000000000000ull && (rb & 0x000FFFFFFFFFFFFFull) && !isnan(a) && !isnan(b)) rb = 0x7FF7FFFFFFFFFFFFull;
+      c->fr[n & 14] = (uint32_t)(rb >> 32); c->fr[(n & 14) + 1] = (uint32_t)rb; }
 }
-static inline void fp_cmp(SH4Ctx *c, int op, int n, int m) {
+/* NOTE: PR=1 (double precision) IS used by the guest (the %f/double helpers around f_8c09c7bc, f_8c0ac0xx..f_8c0b3axx set FPSCR.PR), so the PR test cannot be
+ * dropped; it is a single predicted-not-taken test on the already-loaded FPSCR word. `op` is a compile-time constant at every call site (always_inline folds the switch). */
+SH4_INLINE void fp_arith(SH4Ctx *c, int op, int n, int m) {
+    if (SH4_UNLIKELY(c->fpscr & SH4_FPSCR_PR)) { fp_arith_pr(c, op, n, m); return; }
+    float a = fin(c, c->fr[n]), b = fin(c, c->fr[m]), r;
+    switch (op) { case 0: r = a + b; break; case 1: r = a - b; break; case 2: r = a * b; break; default: r = a / b; }
+    c->fr[n] = nanfix(fout(c, r), c->fr[n], c->fr[m]);
+}
+SH4_INLINE void fp_cmp(SH4Ctx *c, int op, int n, int m) {
     if (c->fpscr & SH4_FPSCR_PR) { double a = fp_getd(c, n), b = fp_getd(c, m); c->t = op ? (a > b) : (a == b); }
     else { float a = fin(c, c->fr[n]), b = fin(c, c->fr[m]); c->t = op ? (a > b) : (a == b); }
 }
-static inline void fp_unary(SH4Ctx *c, int op, int n) {   /* 0 fneg 1 fabs 2 fsqrt */
+SH4_INLINE void fp_unary(SH4Ctx *c, int op, int n) {   /* 0 fneg 1 fabs 2 fsqrt */
     if (c->fpscr & SH4_FPSCR_PR) {
         if (op == 0) c->fr[n & 14] ^= 0x80000000u; else if (op == 1) c->fr[n & 14] &= 0x7FFFFFFFu;
         else fp_setd(c, n, sqrt(fp_getd(c, n)));
@@ -201,29 +230,39 @@ static inline void fp_unary(SH4Ctx *c, int op, int n) {   /* 0 fneg 1 fabs 2 fsq
         else c->fr[n] = nanfix(fout(c, sqrtf(fin(c, c->fr[n]))), c->fr[n], c->fr[n]);
     }
 }
-static inline void fp_fmac(SH4Ctx *c, int n, int m) { c->fr[n] = fout(c, fmaf(fin(c, c->fr[0]), fin(c, c->fr[m]), fin(c, c->fr[n]))); }
-static inline void fp_float(SH4Ctx *c, int n) {
+#ifdef SH4_FASTFP
+/* Cortex-A9 has no fused multiply-add (VFPv3): the library fmaf() was a software call (float->double, vmla.f64, ->float). Use plain a*b+d (vmla.f32: product and sum
+ * each rounded once, FZ applied by hardware): differs from the fused host result only in the last ulp of rare cases. */
+SH4_INLINE void fp_fmac(SH4Ctx *c, int n, int m) { c->fr[n] = fout(c, fin(c, c->fr[0]) * fin(c, c->fr[m]) + fin(c, c->fr[n])); }
+#else
+SH4_INLINE void fp_fmac(SH4Ctx *c, int n, int m) { c->fr[n] = fout(c, fmaf(fin(c, c->fr[0]), fin(c, c->fr[m]), fin(c, c->fr[n]))); }
+#endif
+SH4_INLINE void fp_float(SH4Ctx *c, int n) {
     if (c->fpscr & SH4_FPSCR_PR) fp_setd(c, n, (double)(int32_t)c->fpul); else c->fr[n] = fout(c, (float)(int32_t)c->fpul);
 }
-static inline uint32_t fp_sat(double d) {
+SH4_INLINE uint32_t fp_sat(double d) {
     if (d != d) return 0x7FFFFFFFu;   /* NaN -> +max (matches qemu; SH7750 manual: invalid -> 0x7FFFFFFF) */
     if (d >= 2147483648.0) return 0x7FFFFFFFu;
     if (d <= -2147483648.0) return 0x80000000u;
     return (uint32_t)(int32_t)d;
 }
-static inline void fp_ftrc(SH4Ctx *c, int n) {
+SH4_INLINE void fp_ftrc(SH4Ctx *c, int n) {
     c->fpul = (c->fpscr & SH4_FPSCR_PR) ? fp_sat(fp_getd(c, n)) : fp_sat((double)fin(c, c->fr[n]));
 }
-static inline void fp_cnvsd(SH4Ctx *c, int n) { fp_setd(c, n, (double)u2f(c->fpul)); }
-static inline void fp_cnvds(SH4Ctx *c, int n) { c->fpul = f2u((float)fp_getd(c, n)); }
-static inline void fp_fsrra(SH4Ctx *c, int n) { c->fr[n] = fout(c, 1.0f / sqrtf(fin(c, c->fr[n]))); }
+SH4_INLINE void fp_cnvsd(SH4Ctx *c, int n) { fp_setd(c, n, (double)u2f(c->fpul)); }
+SH4_INLINE void fp_cnvds(SH4Ctx *c, int n) { c->fpul = f2u((float)fp_getd(c, n)); }
+SH4_INLINE void fp_fsrra(SH4Ctx *c, int n) { c->fr[n] = fout(c, 1.0f / sqrtf(fin(c, c->fr[n]))); }
 /* fipr/ftrv: accumulation order chosen to match qemu's helper (tested bit-exact vs qemu-system-sh4 in tests/optest.py);
  * real SH7750 hardware computes these with a non-IEEE fused datapath, so last-ulp differences vs silicon are possible. */
-static inline float fq(SH4Ctx *c, float f) { return u2f(fz(c, f2u(f))); }
+#ifdef SH4_FASTFP
+SH4_INLINE float fq(SH4Ctx *c, float f) { (void)c; return f; }                 /* hardware FZ already flushed every VFP result */
+#else
+SH4_INLINE float fq(SH4Ctx *c, float f) { return u2f(fz(c, f2u(f))); }
+#endif
 #ifndef SH4_DOT_MODE
 #define SH4_DOT_MODE 0
 #endif
-static inline float fp_dot4(SH4Ctx *c, const float *a, const float *b) {
+SH4_INLINE float fp_dot4(SH4Ctx *c, const float *a, const float *b) {
 #if SH4_DOT_MODE == 0
     float p0 = fq(c, a[0] * b[0]), p1 = fq(c, a[1] * b[1]), p2 = fq(c, a[2] * b[2]), p3 = fq(c, a[3] * b[3]);
     return fq(c, fq(c, fq(c, p0 + p1) + p2) + p3);
@@ -235,12 +274,12 @@ static inline float fp_dot4(SH4Ctx *c, const float *a, const float *b) {
     return (float)s;
 #endif
 }
-static inline void fp_fipr(SH4Ctx *c, int vn, int vm) {  /* FVn . FVm -> FR[n+3] */
+SH4_INLINE void fp_fipr(SH4Ctx *c, int vn, int vm) {  /* FVn . FVm -> FR[n+3] */
     float a[4], b[4];
     for (int i = 0; i < 4; i++) { a[i] = fin(c, c->fr[vn * 4 + i]); b[i] = fin(c, c->fr[vm * 4 + i]); }
     c->fr[vn * 4 + 3] = fout(c, fp_dot4(c, a, b));
 }
-static inline void fp_ftrv(SH4Ctx *c, int vn) {
+SH4_INLINE void fp_ftrv(SH4Ctx *c, int vn) {
     int a = vn * 4; float v[4], o[4], row[4];
     for (int i = 0; i < 4; i++) v[i] = fin(c, c->fr[a + i]);
     for (int i = 0; i < 4; i++) {
@@ -249,7 +288,7 @@ static inline void fp_ftrv(SH4Ctx *c, int vn) {
     }
     for (int i = 0; i < 4; i++) c->fr[a + i] = fout(c, o[i]);
 }
-static inline void fp_fsca(SH4Ctx *c, int dn) {
+SH4_INLINE void fp_fsca(SH4Ctx *c, int dn) {
     double ang = (double)(c->fpul & 0xFFFFu) * (6.283185307179586476925286766559 / 65536.0);
     c->fr[dn] = f2u((float)sin(ang)); c->fr[dn + 1] = f2u((float)cos(ang));
 }

@@ -11,14 +11,18 @@
 #include <stdint.h>
 
 /* --- stubs for the parts of hle.h snd.c uses --- */
-#include "../runtime.h"
+#include "../hle/hle.h"
+/* --- stubs for the parts of hle.h / io.h that snd.c uses --- */
 uint8_t sh4_ram[SH4_RAM_SIZE];
 uint64_t hle_time_us(void) { return 0; }
-void hle_mmio_map(uint32_t a, uint32_t b, void *r, void *w) { (void)a; (void)b; (void)r; (void)w; }
-void hle_mmio_watch(uint32_t a, uint32_t b, void *c) { (void)a; (void)b; (void)c; }
+hle_mmio_rd g_stub_rd[8]; hle_mmio_wr g_stub_wr[8]; uint32_t g_stub_lo[8]; int g_stub_n;
+void hle_mmio_map(uint32_t lo, uint32_t hi, hle_mmio_rd rd, hle_mmio_wr wr) { (void)hi; if (g_stub_n < 8) { g_stub_lo[g_stub_n] = lo; g_stub_rd[g_stub_n] = rd; g_stub_wr[g_stub_n] = wr; g_stub_n++; } }
+void hle_mmio_watch(uint32_t lo, uint32_t hi, hle_mmio_wr cb) { (void)lo; (void)hi; (void)cb; }
 uint32_t hle_reg_get(uint32_t a) { (void)a; return 0; }
 void hle_reg_set(uint32_t a, uint32_t v) { (void)a; (void)v; }
 void hle_asic_raise_later(uint32_t m) { (void)m; }
+unsigned long hle_frame_count; uint32_t hle_ring[256][2]; uint32_t hle_ring_pos;
+
 
 static const char *ROOT = "../../assets/dc/DCDATA/Sound";
 static int fails;
@@ -46,7 +50,7 @@ static void ref_adpcm(const uint8_t *src, int n, int16_t *dst) {
     }
 }
 static void chreg(int ch, int off, uint32_t v) { snd_test_regs()[(ch * 0x80 + off) >> 2] = v; }
-static void keyon(int ch) { snd_test_regwrite(ch * 0x80, snd_test_regs()[(ch * 0x80) >> 2] | 0x4000 | 0x8000); }
+static void keyon(int ch) { uint32_t r = snd_test_regs()[(ch * 0x80) >> 2]; snd_test_regwrite(ch * 0x80, (r & ~0x4000u) | 0x8000); snd_test_regs()[(ch * 0x80) >> 2] = r; snd_test_regwrite(ch * 0x80, r | 0x4000 | 0x8000); }   /* key off first: a latched-on channel is not restarted */
 
 static void t1(void) {
     printf("T1 real MANATEE.DRV on the ARM7 interpreter\n");
@@ -124,9 +128,44 @@ static void t3(void) {
     free(o);
 }
 
+
+/* ---- T4: pull mode runs the machine in real (audio) time, independent of the guest clock; 48 kHz resampler ---- */
+static void t4(void) {
+    printf("T4 pull mode (snd_mix) at 48 kHz: tone frequency/continuity\n");
+    snd_init(48000);
+    memset(snd_test_regs(), 0, 0x2000 * 4); snd_test_regs()[0x2800 / 4] = 0xF;
+    int16_t *w = (int16_t *)(snd_test_aram() + 0x1000); for (int i = 0; i < 441; i++) w[i] = (int16_t)(16000 * sin(2 * M_PI * i / 441.0));
+    chreg(0, 0, (1 << 9)); chreg(0, 4, 0x1000); chreg(0, 8, 0); chreg(0, 0xC, 441); chreg(0, 0x10, 31); chreg(0, 0x14, 31); chreg(0, 0x18, 1 << 11); chreg(0, 0x24, 0xF << 8);
+    keyon(0);
+    int n = 48000 * 2; int16_t *o = calloc(n, 4); for (int i = 0; i < n; i += 1024) snd_mix(o + 2 * i, (n - i) < 1024 ? n - i : 1024);
+    int zc = 0; for (int i = 1; i < n; i++) if ((o[2 * i - 2] < 0) != (o[2 * i] < 0)) zc++;
+    double fr = zc / 2.0 / 2.0; int maxd = 0; for (int i = 1; i < n; i++) { int d = abs(o[2 * i] - o[2 * i - 2]); if (d > maxd) maxd = d; }
+    CHECK(fabs(fr - 200.0) < 1.5, "snd_mix 48 kHz: looped tone %.2f Hz (expect 200)", fr);
+    CHECK(maxd < 2400, "no discontinuities across mix blocks (max step %d, sine step max ~2100)", maxd);
+    SndStats s; snd_get_stats(&s); CHECK(s.samples >= (uint64_t)(2 * 44100 * 0.99), "machine advanced in audio time (%llu AICA samples for 2 s)", (unsigned long long)s.samples);
+    free(o);
+}
+
+
+/* ---- T6: KYONEX semantics: a finished voice whose KYONB is still latched ON must not restart when another voice is keyed on ---- */
+static void t6(void) {
+    printf("T6 KYONEX edge semantics\n");
+    memset(snd_test_regs(), 0, 0x2000 * 4); snd_test_regs()[0x2800 / 4] = 0xF;
+    int16_t *w = (int16_t *)(snd_test_aram() + 0x1000); for (int i = 0; i < 441; i++) w[i] = (int16_t)(12000 * sin(2 * M_PI * i / 441.0));
+    for (int c = 0; c < 2; c++) { chreg(c, 0, 0); chreg(c, 4, 0x1000); chreg(c, 8, 0); chreg(c, 0xC, c ? 441 : 100); chreg(c, 0x10, 31); chreg(c, 0x14, 31); chreg(c, 0x18, 0); chreg(c, 0x24, 0xF << 8); }
+    chreg(1, 0, 1 << 9);                                            /* ch1 loops, ch0 one-shot (100 samples) */
+    keyon(0); snd_test_advance(2000, NULL);
+    SndStats s; snd_get_stats(&s); CHECK(s.active_channels == 0, "one-shot finished (active %d)", s.active_channels);
+    snd_test_regwrite(1 * 0x80, snd_test_regs()[0x80 >> 2] | 0x4000 | 0x8000);        /* key on ch1 only; ch0 still has KYONB=1 latched */
+    snd_test_advance(2000, NULL); snd_get_stats(&s);
+    CHECK(s.active_channels == 1, "finished ch0 not restarted by KYONEX for ch1 (active %d, expect 1)", s.active_channels);
+    keyon(0); snd_test_advance(50, NULL); snd_get_stats(&s);
+    CHECK(s.active_channels == 2, "explicit key-off + key-on restarts ch0 (active %d, expect 2)", s.active_channels);
+}
+
 int main(void) {
     snd_init(44100);
-    t1(); t2(); t3();
+    t1(); t2(); t3(); t4(); t6();
     printf("%s (%d failure%s)\n", fails ? "FAILED" : "ALL PASSED", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
 }

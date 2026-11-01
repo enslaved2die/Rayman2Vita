@@ -16,6 +16,7 @@
 #endif
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static TaCtx tactx;
 static uint32_t prev_end[TA_NUM_LISTS];
@@ -79,6 +80,75 @@ static void dma_sink(uint32_t dst, const uint8_t *src, uint32_t len) {
 }
 
 #if !defined(__vita__)
+/* ---- host cross-check (env R2_TACHK=1): runs the real texture-validity code (texmap.c + boot.c epochs) next to an independent full re-hash, and compares the optimised batch /
+ * depth-cut paths with their references, over a whole play-through.  Summary on stderr every 1000 frames and at exit. ---- */
+static struct {
+    int on; uint64_t frames, strips, batches_exact, batches_new, batches_exact_l[TA_NUM_LISTS], batches_new_l[TA_NUM_LISTS];
+    uint64_t cut_frames, cut_diff, cut_exact; double cut_maxrel;
+    uint64_t tex_checks, tex_stale, tex_overinval, tex_new, tex_redecode, old_hash_bytes;
+    uint64_t verts_exact, verts_new;
+} tc;
+typedef struct { uint32_t tcw, tsp; HleTexStamp st; uint32_t ref; uint8_t used; uint64_t seen; } TcEnt;
+static TcEnt tc_tab[8192];
+static uint32_t tc_ref_hash(uint32_t tcw, uint32_t tsp)
+{
+    uint32_t off = (tcw & 0x1FFFFFu) << 3, n = ta_tex_byte_len(tcw, tsp);
+    if (off >= (8u << 20)) { n = 0; off = 0; } else if (off + n > (8u << 20)) n = (8u << 20) - off;
+    uint32_t h = ta_hash_bytes(hle_vram_ptr() + off, n);
+    int fmt = (int)((tcw >> 27) & 7); const uint32_t *pr = hle_pvr_regs(), *pal = pr + 0x400;
+    if (fmt == 5) h ^= ta_hash_bytes(pal + (((tcw >> 21) & 63) << 4), 64) * 31u ^ pr[0x42];
+    else if (fmt == 6) h ^= ta_hash_bytes(pal + (((tcw >> 25) & 3) << 8), 1024) * 31u ^ pr[0x42];
+    return h;
+}
+static void tc_report(const char *tag)
+{
+    fprintf(stderr, "[tachk] %s frames=%llu strips/frame=%.1f | batches/frame exact-merge=%.1f new=%.1f (opaque %.1f->%.1f punch %.1f->%.1f trans %.1f->%.1f) verts/frame %.0f->%.0f | depth-cut: frames=%llu differ=%llu maxrel=%.3g | "
+            "tex: checks=%llu new=%llu redecode=%llu STALE(epoch said valid, content changed)=%llu overinval=%llu old-scheme hash %.1f KB/frame, new %.1f KB/frame (epoch-hit %llu, hash-same %llu)\n",
+            tag, (unsigned long long)tc.frames, tc.frames ? (double)tc.strips / tc.frames : 0, tc.frames ? (double)tc.batches_exact / tc.frames : 0, tc.frames ? (double)tc.batches_new / tc.frames : 0,
+            tc.frames ? (double)tc.batches_exact_l[TA_L_OPAQUE] / tc.frames : 0, tc.frames ? (double)tc.batches_new_l[TA_L_OPAQUE] / tc.frames : 0,
+            tc.frames ? (double)tc.batches_exact_l[TA_L_PUNCH] / tc.frames : 0, tc.frames ? (double)tc.batches_new_l[TA_L_PUNCH] / tc.frames : 0,
+            tc.frames ? (double)tc.batches_exact_l[TA_L_TRANS] / tc.frames : 0, tc.frames ? (double)tc.batches_new_l[TA_L_TRANS] / tc.frames : 0,
+            tc.frames ? (double)tc.verts_exact / tc.frames : 0, tc.frames ? (double)tc.verts_new / tc.frames : 0,
+            (unsigned long long)tc.cut_frames, (unsigned long long)tc.cut_diff, tc.cut_maxrel,
+            (unsigned long long)tc.tex_checks, (unsigned long long)tc.tex_new, (unsigned long long)tc.tex_redecode, (unsigned long long)tc.tex_stale, (unsigned long long)tc.tex_overinval,
+            tc.frames ? tc.old_hash_bytes / 1024.0 / tc.frames : 0, tc.frames ? hle_texstats.hash_bytes / 1024.0 / tc.frames : 0, (unsigned long long)hle_texstats.epoch_hits, (unsigned long long)hle_texstats.hash_same);
+}
+static void tc_atexit(void) { if (tc.on) tc_report("final"); }
+static void tc_frame(const TaFrame *f)
+{
+    if (!tc.on) { const char *e = getenv("R2_TACHK"); tc.on = e && *e == '1' ? 1 : -1; if (tc.on > 0) atexit(tc_atexit); }
+    if (tc.on < 0) return;
+    tc.frames++; tc.strips += f->nstrips;
+    TaBuildOpts o_new = { 1, 1, -2.0f, -2.0f, 642.0f, 482.0f, 0 }, o_old = o_new; o_old.exact_merge = 1;
+    TaGl gn, go;
+    if (ta_build_gl_ex(f, &gn, &o_new) == 0 && ta_build_gl_ex(f, &go, &o_old) == 0) {
+        tc.batches_new += gn.nbatches; tc.batches_exact += go.nbatches; tc.verts_new += gn.nverts; tc.verts_exact += go.nverts;
+        for (int l = 0; l < TA_NUM_LISTS; l++) { tc.batches_new_l[l] += gn.list_count[l]; tc.batches_exact_l[l] += go.list_count[l]; }
+        if (gn.nverts == go.nverts && memcmp(gn.verts, go.verts, gn.nverts * sizeof(TaGlVertex))) fprintf(stderr, "[tachk] FAIL: merged build produced different vertices\n");
+        float a = ta_gl_depth_cut(&gn), b = ta_gl_depth_cut_ref(&gn);
+        tc.cut_frames++;
+        if (a != b) { tc.cut_diff++; double r = fabs((double)a - b) / (b ? fabs((double)b) : 1.0); if (r > tc.cut_maxrel) tc.cut_maxrel = r; }
+        ta_gl_free(&gn); ta_gl_free(&go);
+    }
+    /* texture validity: every distinct (tcw, key tsp) drawn this frame, once (the renderer's once-per-frame check) */
+    for (uint32_t i = 0; i < f->nstrips; i++) {
+        const TaStrip *s = &f->strips[i];
+        if (!s->st.textured || s->count < 3 || s->st.list == TA_L_OPAQUE_MOD || s->st.list == TA_L_TRANS_MOD) continue;
+        uint32_t tcw = s->st.tcw, tsp = s->st.tsp & HLE_TEX_KEY_TSP, h = (tcw * 2654435761u ^ tsp * 40503u) & 8191u; TcEnt *e = 0;
+        for (int k = 0; k < 8192; k++) { TcEnt *c = &tc_tab[(h + k) & 8191]; if (!c->used) { e = c; break; } if (c->tcw == tcw && c->tsp == tsp) { e = c; break; } }
+        if (!e) continue;
+        if (e->used && e->seen == tc.frames) continue;                  /* once per frame and texture, like the renderer's chk_frame */
+        e->seen = tc.frames;
+        uint32_t n = ta_tex_byte_len(tcw, tsp); tc.old_hash_bytes += n;
+        if (!e->used) { e->used = 1; e->tcw = tcw; e->tsp = tsp; hle_texstamp_set(&e->st, tcw, tsp); e->ref = tc_ref_hash(tcw, tsp); tc.tex_new++; continue; }
+        tc.tex_checks++;
+        int v = hle_texstamp_valid(&e->st, tcw, tsp); uint32_t r = tc_ref_hash(tcw, tsp), changed = r != e->ref;
+        if (v && changed) { tc.tex_stale++; if (tc.tex_stale < 10) fprintf(stderr, "[tachk] STALE tcw=%08x tsp=%08x frame %llu\n", tcw, tsp, (unsigned long long)tc.frames); }
+        if (!v && !changed) tc.tex_overinval++;
+        if (!v) { tc.tex_redecode++; hle_texstamp_set(&e->st, tcw, tsp); e->ref = r; }
+    }
+    if (tc.frames % 1000 == 0) tc_report("progress");
+}
 static void dump_binary(const TaFrame *f, unsigned long no) {
     FILE *o = fopen("build_hle/frame.bin", "wb"); if (!o) return;
     uint32_t hdr[4] = { 0x31465452u /* 'RTF1' */, f->nstrips, f->nverts, (uint32_t)no };
@@ -128,6 +198,7 @@ static void on_startrender(SH4Ctx *c) {
                 ta_frames, t->chunks, t->verts, t->strips, t->sprites, t->tris_total, t->modtris, t->list_end[0], t->list_end[1], t->list_end[2], t->list_end[3], t->list_end[4],
                 t->warn_vertex_no_header, t->warn_unsupported, t->warn_bad_list_end, t->sink_vram, t->sink_yuv, t->sink_tex, t->sink_unknown);
 #if !defined(__vita__)
+    tc_frame(f);
     const char *want = getenv("R2_FRAME");
     int pick = want ? (!strcmp(want, "mod") ? (t->modtris > 0) : (!strcmp(want, "spr") ? (t->sprites > 0) : (ta_frames == strtoul(want, 0, 10)))) : (!dumped && t->verts > 0);   /* R2_FRAME=mod / spr: first frame with modifier-volume triangles / sprites */
     if (pick && !dumped) {
