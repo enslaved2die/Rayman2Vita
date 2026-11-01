@@ -80,6 +80,16 @@ int main(void) {
     CHECK(LD32(REC(0) + 8) == 0xFFFFFFFFu);
     pad_set_state(PAD_B, 0); POLL(); CHECK(LD32(REC(0) + 8) == ~(uint32_t)PAD_B);
 
+    /* virtual VMU (hle/vmu.c): record 1 = "Visual Memory" with type word 0 while pad_set_vmu(1); the others stay "(no device)" */
+    ARG4 = 0; call(0x8C0CF158); pad_set_state(0, 0); POLL();
+    CHECK(LD32(REC(1) + 0x24) == 0x8C0F3034);                                 /* default: no VMU */
+    pad_set_vmu(1); POLL();
+    CHECK(LD32(REC(1) + 0x24) == HLE_PAD_VMUNAME); CHECK(LD32(0x8C2EB500 + 4) == 0); CHECK(LD32(REC(1) + 8) == 0 && LD32(REC(1) + 12) == 0xFFFFFFFFu);
+    CHECK(memcmp(hle_ptr(HLE_PAD_VMUNAME), "Visual Memory                 ", 31) == 0);
+    for (int i = 2; i < 24; i++) CHECK(LD32(REC(i) + 0x24) == 0x8C0F3034);
+    CHECK(LD32(REC(0) + 0x24) == HLE_PAD_NAMEBUF);
+    pad_set_vmu(0); POLL(); CHECK(LD32(REC(1) + 0x24) == 0x8C0F3034);
+
     /* poll is a no-op when the image flag is cleared */
     ST32(0x8C0F3030, 0); ST32(REC(0) + 8, 0x1234); POLL(); CHECK(LD32(REC(0) + 8) == 0x1234);
     printf("%d checks, %d failures\n", checks, fails);

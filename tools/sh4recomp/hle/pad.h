@@ -32,6 +32,8 @@ typedef struct { uint8_t rt, lt, joyx, joyy, joy2x, joy2y; } PadAnalog;
 #define HLE_PAD_TABLE   0x8C2EB020u       /* record array base */
 #define HLE_PAD_NAMEBUF 0x8C009800u       /* guest scratch (system area, see io.h) holding the 30-char device name + NUL */
 
+#define HLE_PAD_VMUNAME 0x8C009840u       /* guest scratch: "Visual Memory" + 16 spaces + NUL (record 1 name when a virtual VMU is present) */
+void pad_set_vmu(int present);            /* record 1 (A1) reports "Visual Memory" (default 0); owned by hle/vmu.c */
 void hle_pad_init(void);                  /* registers the two hooks; call AFTER boot.c's own hle_hook calls (later registration wins) */
 void pad_set_state(uint32_t buttons, const PadAnalog *analog);   /* analog may be NULL = idle; thread-safe (seqlock) */
 void pad_set_connected(int connected);    /* default 1: controller present in slot 0 */
