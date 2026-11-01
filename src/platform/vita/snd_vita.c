@@ -208,9 +208,12 @@ static int16_t              g_stream_ring[SND_STREAM_RING_FRAMES * 2];
 static uint32_t             g_stream_write_pos[2] = {0, 0};
 static uint32_t             g_stream_read_pos     = 0;
 static uint32_t             g_stream_read_frac    = 0;
+static volatile uint32_t    g_stream_consumed_frames = 0;
 static uint32_t             g_stream_sample_rate  = 22050;
 static int32_t              s_stream_pred[2]      = {0, 0};
 static int32_t              s_stream_step[2]      = {127, 127};
+static int32_t              s_stream_last_l       = 0;
+static int32_t              s_stream_last_r       = 0;
 
 /* ----------------------------------------------------------------------------
  * 4. Synchronization Primitives
@@ -532,33 +535,8 @@ static int SND_ParseOSBData(const uint8_t *data, size_t size, SND_Vita_Bank *pBa
     return 0;
 }
 
-static void SND_FreeBank(SND_Vita_Bank *pBank) {
-    if (!pBank || !pBank->loaded) return;
-
-    SND_Vita_Lock();
-
-    /* Immediately stop and deactivate any voices using this bank's samples */
-    for (int i = 0; i < SND_VITA_NUM_VOICES; i++) {
-        if (g_voices[i].active) {
-            int match = (pBank == &g_fix_bank && g_voices[i].bank_id == 0) ||
-                        (pBank == &g_level_bank && g_voices[i].bank_id >= 1) ||
-                        (g_voices[i].bank_id == pBank->bank_id);
-            if (!match && pBank->sounds) {
-                for (uint32_t s = 0; s < pBank->num_sounds; s++) {
-                    if (g_voices[i].pcm_data == pBank->sounds[s].pcm_data) {
-                        match = 1;
-                        break;
-                    }
-                }
-            }
-            if (match) {
-                g_voices[i].active = 0;
-                g_voices[i].pcm_data = NULL;
-                g_voices[i].num_samples = 0;
-            }
-        }
-    }
-
+static void SND_FreeBankMemory(SND_Vita_Bank *pBank) {
+    if (!pBank) return;
     if (pBank->sounds) {
         for (uint32_t i = 0; i < pBank->num_sounds; i++) {
             if (pBank->sounds[i].pcm_data) {
@@ -572,21 +550,83 @@ static void SND_FreeBank(SND_Vita_Bank *pBank) {
     pBank->num_sounds = 0;
     pBank->loaded = 0;
     pBank->name[0] = '\0';
+}
 
+static void SND_SwapBank_Locked(SND_Vita_Bank *pTargetBank, const SND_Vita_Bank *pNewBank, SND_Vita_Bank *pOldBankOut) {
+    *pOldBankOut = *pTargetBank;
+
+    /* Immediately stop and deactivate any voices using this bank's samples */
+    if (pTargetBank->loaded) {
+        for (int i = 0; i < SND_VITA_NUM_VOICES; i++) {
+            if (g_voices[i].active) {
+                int match = (pTargetBank == &g_fix_bank && g_voices[i].bank_id == 0) ||
+                            (pTargetBank == &g_level_bank && g_voices[i].bank_id >= 1) ||
+                            (g_voices[i].bank_id == pTargetBank->bank_id);
+                if (!match && pTargetBank->sounds) {
+                    for (uint32_t s = 0; s < pTargetBank->num_sounds; s++) {
+                        if (g_voices[i].pcm_data == pTargetBank->sounds[s].pcm_data) {
+                            match = 1;
+                            break;
+                        }
+                    }
+                }
+                if (match) {
+                    g_voices[i].active = 0;
+                    g_voices[i].pcm_data = NULL;
+                    g_voices[i].num_samples = 0;
+                }
+            }
+        }
+    }
+
+    if (pNewBank) {
+        *pTargetBank = *pNewBank;
+    } else {
+        memset(pTargetBank, 0, sizeof(*pTargetBank));
+    }
+}
+
+static void SND_FreeBank(SND_Vita_Bank *pBank) {
+    if (!pBank) return;
+
+    SND_Vita_Bank old_bank;
+    memset(&old_bank, 0, sizeof(old_bank));
+
+    SND_Vita_Lock();
+    if (!pBank->loaded) {
+        SND_Vita_Unlock();
+        return;
+    }
+    SND_SwapBank_Locked(pBank, NULL, &old_bank);
     SND_Vita_Unlock();
+
+    SND_FreeBankMemory(&old_bank);
 }
 
 int SND_Vita_LoadBankData(uint32_t bank_id, const uint8_t *data, size_t size, const char *name) {
     if (!data || size < 16) return -1;
 
     SND_Vita_Bank *pTargetBank = (bank_id == 0) ? &g_fix_bank : &g_level_bank;
-    SND_FreeBank(pTargetBank);
+
+    /* Parse and decode all ADPCM samples outside the audio mutex */
+    SND_Vita_Bank temp_bank;
+    memset(&temp_bank, 0, sizeof(temp_bank));
+    temp_bank.bank_id = bank_id;
+    int res = SND_ParseOSBData(data, size, &temp_bank, name ? name : (bank_id == 0 ? "FIX.OSB" : "LEVEL.OSB"));
+    if (res != 0) {
+        SND_FreeBank(pTargetBank);
+        return res;
+    }
+
+    SND_Vita_Bank old_bank;
+    memset(&old_bank, 0, sizeof(old_bank));
 
     SND_Vita_Lock();
-    pTargetBank->bank_id = bank_id;
-    int res = SND_ParseOSBData(data, size, pTargetBank, name ? name : (bank_id == 0 ? "FIX.OSB" : "LEVEL.OSB"));
+    SND_SwapBank_Locked(pTargetBank, &temp_bank, &old_bank);
     SND_Vita_Unlock();
-    return res;
+
+    SND_FreeBankMemory(&old_bank);
+    return 0;
 }
 
 int SND_Vita_LoadFixBank(void) {
@@ -595,6 +635,7 @@ int SND_Vita_LoadFixBank(void) {
         SND_Vita_Unlock();
         return 0;
     }
+    SND_Vita_Unlock();
 
     size_t sz = 0;
     uint8_t *data = SND_LoadFileBuffer("DCDATA/SOUND/BANKS/FIX.OSB", &sz);
@@ -609,14 +650,23 @@ int SND_Vita_LoadFixBank(void) {
 
     if (!data) {
         OS_Vita_LogWarn("[SND] FIX.OSB not found on storage");
-        SND_Vita_Unlock();
         return -1;
     }
 
-    g_fix_bank.bank_id = 0;
-    int res = SND_ParseOSBData(data, sz, &g_fix_bank, "FIX.OSB");
+    SND_Vita_Bank temp_bank;
+    memset(&temp_bank, 0, sizeof(temp_bank));
+    temp_bank.bank_id = 0;
+    int res = SND_ParseOSBData(data, sz, &temp_bank, "FIX.OSB");
     CPA_free(data);
-    SND_Vita_Unlock();
+
+    if (res == 0) {
+        SND_Vita_Bank old_bank;
+        memset(&old_bank, 0, sizeof(old_bank));
+        SND_Vita_Lock();
+        SND_SwapBank_Locked(&g_fix_bank, &temp_bank, &old_bank);
+        SND_Vita_Unlock();
+        SND_FreeBankMemory(&old_bank);
+    }
     return res;
 }
 
@@ -625,7 +675,6 @@ int SND_Vita_LoadBank(const char *szBankPath) {
 
     SND_Vita_UnloadBank();
 
-    SND_Vita_Lock();
     size_t sz = 0;
     uint8_t *data = SND_LoadFileBuffer(szBankPath, &sz);
     if (!data) {
@@ -643,14 +692,23 @@ int SND_Vita_LoadBank(const char *szBankPath) {
 
     if (!data) {
         OS_Vita_LogWarn("[SND] Bank '%s' not found on storage", szBankPath);
-        SND_Vita_Unlock();
         return -1;
     }
 
-    g_level_bank.bank_id = 1;
-    int res = SND_ParseOSBData(data, sz, &g_level_bank, szBankPath);
+    SND_Vita_Bank temp_bank;
+    memset(&temp_bank, 0, sizeof(temp_bank));
+    temp_bank.bank_id = 1;
+    int res = SND_ParseOSBData(data, sz, &temp_bank, szBankPath);
     CPA_free(data);
-    SND_Vita_Unlock();
+
+    if (res == 0) {
+        SND_Vita_Bank old_bank;
+        memset(&old_bank, 0, sizeof(old_bank));
+        SND_Vita_Lock();
+        SND_SwapBank_Locked(&g_level_bank, &temp_bank, &old_bank);
+        SND_Vita_Unlock();
+        SND_FreeBankMemory(&old_bank);
+    }
     return res;
 }
 
@@ -836,8 +894,7 @@ int SND_Vita_PlayMusicSubtrack(const char *szMusicContainer, uint32_t subtrack_i
         return 0;
     }
 
-    SND_Vita_Lock();
-    SND_StopMusic_Locked();
+    SND_Vita_StopMusic();
 
     size_t sz = 0;
     uint8_t *raw = SND_LoadFileBuffer(szMusicContainer, &sz);
@@ -856,15 +913,16 @@ int SND_Vita_PlayMusicSubtrack(const char *szMusicContainer, uint32_t subtrack_i
 
     if (!raw) {
         OS_Vita_LogWarn("[SND] BGM file '%s' not found", szMusicContainer);
-        SND_Vita_Unlock();
         return -1;
     }
 
+    SND_Vita_BGM temp_bgm;
+    memset(&temp_bgm, 0, sizeof(temp_bgm));
     int parse_res = -1;
 
     /* Check if raw is a direct RIFF/WAVE file */
     if (sz >= 12 && *(const uint32_t *)(raw + 0) == SND_MAGIC_RIFF) {
-        parse_res = SND_ParseWAVStream(raw, sz, &g_bgm, szMusicContainer);
+        parse_res = SND_ParseWAVStream(raw, sz, &temp_bgm, szMusicContainer);
     }
     /* Check if raw is a DCZ container */
     else if (sz >= 16) {
@@ -878,7 +936,7 @@ int SND_Vita_PlayMusicSubtrack(const char *szMusicContainer, uint32_t subtrack_i
                 size_t byte_start = (size_t)sector * 2048;
 
                 if (byte_start + file_sz <= sz && *(const uint32_t *)(raw + byte_start) == SND_MAGIC_RIFF) {
-                    parse_res = SND_ParseWAVStream(raw + byte_start, file_sz, &g_bgm, szMusicContainer);
+                    parse_res = SND_ParseWAVStream(raw + byte_start, file_sz, &temp_bgm, szMusicContainer);
                 }
             }
 
@@ -889,7 +947,7 @@ int SND_Vita_PlayMusicSubtrack(const char *szMusicContainer, uint32_t subtrack_i
                     entry_start = 0x1800;
                 }
                 if (entry_start < sz && *(const uint32_t *)(raw + entry_start) == SND_MAGIC_RIFF) {
-                    parse_res = SND_ParseWAVStream(raw + entry_start, sz - entry_start, &g_bgm, szMusicContainer);
+                    parse_res = SND_ParseWAVStream(raw + entry_start, sz - entry_start, &temp_bgm, szMusicContainer);
                 }
             }
         }
@@ -898,25 +956,29 @@ int SND_Vita_PlayMusicSubtrack(const char *szMusicContainer, uint32_t subtrack_i
     CPA_free(raw);
 
     if (parse_res == 0) {
-        g_bgm.active        = 1;
-        g_bgm.paused        = 0;
-        g_bgm.loop          = bLoop;
-        g_bgm.volume        = 1.0f;
-        g_bgm.fade_target   = 1.0f;
-        g_bgm.fade_speed    = 0.0f;
-        g_bgm.fading        = 0;
-        g_bgm.pan           = 0.0f;
-        g_bgm.current_frame = 0;
-        g_bgm.frame_frac    = 0;
-        strncpy(g_bgm.track_name, szMusicContainer, sizeof(g_bgm.track_name) - 1);
-        OS_Vita_LogInfo("[SND] Started BGM playback: '%s' (%u frames, loop=%d)",
-                        szMusicContainer, g_bgm.num_frames, bLoop);
+        temp_bgm.active        = 1;
+        temp_bgm.paused        = 0;
+        temp_bgm.loop          = bLoop;
+        temp_bgm.volume        = 1.0f;
+        temp_bgm.fade_target   = 1.0f;
+        temp_bgm.fade_speed    = 0.0f;
+        temp_bgm.fading        = 0;
+        temp_bgm.pan           = 0.0f;
+        temp_bgm.current_frame = 0;
+        temp_bgm.frame_frac    = 0;
+        strncpy(temp_bgm.track_name, szMusicContainer, sizeof(temp_bgm.track_name) - 1);
+
+        SND_Vita_Lock();
+        SND_StopMusic_Locked();
+        g_bgm = temp_bgm;
         SND_Vita_Unlock();
+
+        OS_Vita_LogInfo("[SND] Started BGM playback: '%s' (%u frames, loop=%d)",
+                        szMusicContainer, temp_bgm.num_frames, bLoop);
         return 0;
     }
 
     OS_Vita_LogError("[SND] Failed to parse BGM track '%s' (err: %d)", szMusicContainer, parse_res);
-    SND_Vita_Unlock();
     return -2;
 }
 
@@ -996,62 +1058,71 @@ void SND_Vita_FeedStreamChunk(int ch, const uint8_t *data, uint32_t bytes, int f
     if (!data || bytes == 0) return;
     int channel = (ch == 1) ? 1 : 0;
 
-    SND_Vita_Lock();
-    if (sample_rate > 0) {
-        g_stream_sample_rate = sample_rate;
-    }
-
     if (fmt == 1) {
         /* Format 1: 16-bit signed PCM */
         uint32_t num_samples = bytes / sizeof(int16_t);
         const int16_t *pcm = (const int16_t *)data;
+        SND_Vita_Lock();
+        if (sample_rate > 0) {
+            g_stream_sample_rate = sample_rate;
+        }
         uint32_t wp = g_stream_write_pos[channel];
         for (uint32_t i = 0; i < num_samples; i++) {
             uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
             g_stream_ring[idx * 2 + channel] = pcm[i];
-            if (channel == 0 && g_stream_write_pos[1] <= wp) {
-                g_stream_ring[idx * 2 + 1] = pcm[i];
-            }
         }
         g_stream_write_pos[channel] = wp + num_samples;
-    } else if (fmt == 2) {
-        /* Format 2: Yamaha AICA ADPCM */
-        uint32_t num_samples = bytes * 2;
+        SND_Vita_Unlock();
+    } else if (fmt == 2 || fmt == 0) {
+        /* Format 2 / 0: Yamaha AICA ADPCM — decode outside lock to avoid stalling real-time mixer */
+        uint32_t total_samples = bytes * 2;
         int32_t pred = s_stream_pred[channel];
         int32_t step = s_stream_step[channel];
         if (step < 127) step = 127;
 
-        uint32_t wp = g_stream_write_pos[channel];
-        for (uint32_t i = 0; i < num_samples; i++) {
-            uint8_t byte = data[i >> 1];
-            uint8_t nib = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+        int16_t decoded[4096];
+        uint32_t offset = 0;
+        while (offset < total_samples) {
+            uint32_t chunk = total_samples - offset;
+            if (chunk > 4096) chunk = 4096;
 
-            pred += (yam_diff[nib] * step) / 8;
-            if (pred > 32767) pred = 32767;
-            else if (pred < -32768) pred = -32768;
+            for (uint32_t i = 0; i < chunk; i++) {
+                uint32_t sample_idx = offset + i;
+                uint8_t byte = data[sample_idx >> 1];
+                uint8_t nib = (sample_idx & 1) ? (byte >> 4) : (byte & 0x0F);
 
-            uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
-            g_stream_ring[idx * 2 + channel] = (int16_t)pred;
-            if (channel == 0 && g_stream_write_pos[1] <= wp) {
-                g_stream_ring[idx * 2 + 1] = (int16_t)pred;
+                pred += (yam_diff[nib] * step) / 8;
+                if (pred > 32767) pred = 32767;
+                else if (pred < -32768) pred = -32768;
+
+                decoded[i] = (int16_t)pred;
+
+                int32_t st = (step * yam_scale[nib & 7]) >> 8;
+                step = (st < 127) ? 127 : ((st > 24576) ? 24576 : st);
             }
 
-            int32_t st = (step * yam_scale[nib & 7]) >> 8;
-            step = (st < 127) ? 127 : ((st > 24576) ? 24576 : st);
+            SND_Vita_Lock();
+            if (sample_rate > 0) {
+                g_stream_sample_rate = sample_rate;
+            }
+            uint32_t wp = g_stream_write_pos[channel];
+            for (uint32_t i = 0; i < chunk; i++) {
+                uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
+                g_stream_ring[idx * 2 + channel] = decoded[i];
+            }
+            g_stream_write_pos[channel] = wp + chunk;
+            s_stream_pred[channel] = pred;
+            s_stream_step[channel] = step;
+            SND_Vita_Unlock();
+
+            offset += chunk;
         }
-        s_stream_pred[channel] = pred;
-        s_stream_step[channel] = step;
-        g_stream_write_pos[channel] = wp + num_samples;
     }
-    SND_Vita_Unlock();
 }
 
 uint32_t SND_Vita_GetStreamQueuedFrames(void) {
     SND_Vita_Lock();
     uint32_t write_head = (g_stream_write_pos[0] < g_stream_write_pos[1]) ? g_stream_write_pos[0] : g_stream_write_pos[1];
-    if (g_stream_write_pos[1] == 0 && g_stream_write_pos[0] > 0) {
-        write_head = g_stream_write_pos[0];
-    }
     uint32_t queued = 0;
     if (write_head > g_stream_read_pos) {
         queued = write_head - g_stream_read_pos;
@@ -1065,16 +1136,26 @@ uint32_t SND_Vita_GetStreamFreeFrames(void) {
     return (queued < SND_STREAM_RING_FRAMES) ? (SND_STREAM_RING_FRAMES - queued) : 0;
 }
 
+uint32_t SND_Vita_GetStreamConsumedFrames(void) {
+    SND_Vita_Lock();
+    uint32_t consumed = g_stream_consumed_frames;
+    SND_Vita_Unlock();
+    return consumed;
+}
+
 void SND_Vita_ClearStream(void) {
     SND_Vita_Lock();
     g_stream_write_pos[0] = 0;
     g_stream_write_pos[1] = 0;
     g_stream_read_pos = 0;
     g_stream_read_frac = 0;
+    g_stream_consumed_frames = 0;
     s_stream_pred[0] = 0;
     s_stream_pred[1] = 0;
     s_stream_step[0] = 127;
     s_stream_step[1] = 127;
+    s_stream_last_l = 0;
+    s_stream_last_r = 0;
     memset(g_stream_ring, 0, sizeof(g_stream_ring));
     SND_Vita_Unlock();
 }
@@ -1372,9 +1453,9 @@ float SND_Vita_GetSFXVolume(void) {
 void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
     if (!out_samples || num_frames == 0) return;
 
-    /* 32-bit accumulation buffers */
-    int32_t mix_l[1024];
-    int32_t mix_r[1024];
+    /* 32-bit accumulation buffers (16-byte aligned for ARM NEON SIMD) */
+    int32_t mix_l[SND_VITA_FRAME_SAMPLES] __attribute__((aligned(16)));
+    int32_t mix_r[SND_VITA_FRAME_SAMPLES] __attribute__((aligned(16)));
 
     uint32_t frames_to_process = (num_frames > 1024) ? 1024 : num_frames;
 
@@ -1425,14 +1506,15 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
                 next_frame = g_bgm.loop ? 0 : curr_frame;
             }
 
-            /* Linear interpolation between frame samples */
+            /* Linear interpolation between frame samples (15-bit fractional precision) */
             int32_t sl0 = bgm_pcm[curr_frame * 2 + 0];
             int32_t sr0 = bgm_pcm[curr_frame * 2 + 1];
             int32_t sl1 = bgm_pcm[next_frame * 2 + 0];
             int32_t sr1 = bgm_pcm[next_frame * 2 + 1];
 
-            int32_t interp_l = sl0 + (((sl1 - sl0) * (int32_t)(frac >> 8)) >> 8);
-            int32_t interp_r = sr0 + (((sr1 - sr0) * (int32_t)(frac >> 8)) >> 8);
+            int32_t f_weight = (int32_t)(frac >> 1);
+            int32_t interp_l = sl0 + (((sl1 - sl0) * f_weight) >> 15);
+            int32_t interp_r = sr0 + (((sr1 - sr0) * f_weight) >> 15);
 
             mix_l[i] += (interp_l * igain_l) >> 15;
             mix_r[i] += (interp_r * igain_r) >> 15;
@@ -1448,10 +1530,7 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
 
     /* Mix Streaming Ring Buffer (BGM / Speech Chunks) */
     uint32_t stream_write_head = (g_stream_write_pos[0] < g_stream_write_pos[1]) ? g_stream_write_pos[0] : g_stream_write_pos[1];
-    if (g_stream_write_pos[1] == 0 && g_stream_write_pos[0] > 0) {
-        stream_write_head = g_stream_write_pos[0];
-    }
-    if (stream_write_head > g_stream_read_pos) {
+    if (stream_write_head >= 2 && (g_stream_read_pos < stream_write_head || s_stream_last_l != 0 || s_stream_last_r != 0)) {
         float effective_stream_vol = g_fBGMVolume * master_vol;
         int32_t igain = (int32_t)(effective_stream_vol * 32768.0f);
 
@@ -1463,31 +1542,40 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
         uint32_t frac = g_stream_read_frac;
 
         for (uint32_t i = 0; i < frames_to_process; i++) {
-            if (curr_pos >= stream_write_head) {
-                break;
+            if (curr_pos + 1 < stream_write_head) {
+                uint32_t f0 = curr_pos & SND_STREAM_RING_MASK;
+                uint32_t f1 = (curr_pos + 1) & SND_STREAM_RING_MASK;
+
+                int32_t sl0 = g_stream_ring[f0 * 2 + 0];
+                int32_t sr0 = g_stream_ring[f0 * 2 + 1];
+                int32_t sl1 = g_stream_ring[f1 * 2 + 0];
+                int32_t sr1 = g_stream_ring[f1 * 2 + 1];
+
+                int32_t f_weight = (int32_t)(frac >> 1);
+                int32_t interp_l = sl0 + (((sl1 - sl0) * f_weight) >> 15);
+                int32_t interp_r = sr0 + (((sr1 - sr0) * f_weight) >> 15);
+
+                s_stream_last_l = interp_l;
+                s_stream_last_r = interp_r;
+
+                mix_l[i] += (interp_l * igain) >> 15;
+                mix_r[i] += (interp_r * igain) >> 15;
+
+                frac += step;
+                curr_pos += (frac >> 16);
+                frac &= 0xFFFF;
+            } else {
+                /* Smoothly decay last output sample when waiting for next chunk lookahead */
+                s_stream_last_l = (s_stream_last_l * 252) >> 8;
+                s_stream_last_r = (s_stream_last_r * 252) >> 8;
+                mix_l[i] += (s_stream_last_l * igain) >> 15;
+                mix_r[i] += (s_stream_last_r * igain) >> 15;
             }
-
-            uint32_t f0 = curr_pos & SND_STREAM_RING_MASK;
-            uint32_t f1 = (curr_pos + 1 < stream_write_head) ? ((curr_pos + 1) & SND_STREAM_RING_MASK) : f0;
-
-            int32_t sl0 = g_stream_ring[f0 * 2 + 0];
-            int32_t sr0 = g_stream_ring[f0 * 2 + 1];
-            int32_t sl1 = g_stream_ring[f1 * 2 + 0];
-            int32_t sr1 = g_stream_ring[f1 * 2 + 1];
-
-            int32_t interp_l = sl0 + (((sl1 - sl0) * (int32_t)(frac >> 8)) >> 8);
-            int32_t interp_r = sr0 + (((sr1 - sr0) * (int32_t)(frac >> 8)) >> 8);
-
-            mix_l[i] += (interp_l * igain) >> 15;
-            mix_r[i] += (interp_r * igain) >> 15;
-
-            frac += step;
-            curr_pos += (frac >> 16);
-            frac &= 0xFFFF;
         }
 
         g_stream_read_pos  = curr_pos;
         g_stream_read_frac = frac;
+        g_stream_consumed_frames = curr_pos;
     }
 
     /* 2. Mix 16 Active SFX Voices */
@@ -1534,7 +1622,8 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
 
                 int32_t s0 = pcm[pos];
                 int32_t s1 = pcm[next_pos];
-                int32_t interp = s0 + (((s1 - s0) * (int32_t)(frac >> 8)) >> 8);
+                int32_t f_weight = (int32_t)(frac >> 1);
+                int32_t interp = s0 + (((s1 - s0) * f_weight) >> 15);
                 int32_t out = (interp * igain_l) >> 15;
 
                 mix_l[i] += out;
@@ -1563,7 +1652,8 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
 
                 int32_t s0 = pcm[pos];
                 int32_t s1 = pcm[next_pos];
-                int32_t interp = s0 + (((s1 - s0) * (int32_t)(frac >> 8)) >> 8);
+                int32_t f_weight = (int32_t)(frac >> 1);
+                int32_t interp = s0 + (((s1 - s0) * f_weight) >> 15);
 
                 mix_l[i] += (interp * igain_l) >> 15;
 
@@ -1590,7 +1680,8 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
 
                 int32_t s0 = pcm[pos];
                 int32_t s1 = pcm[next_pos];
-                int32_t interp = s0 + (((s1 - s0) * (int32_t)(frac >> 8)) >> 8);
+                int32_t f_weight = (int32_t)(frac >> 1);
+                int32_t interp = s0 + (((s1 - s0) * f_weight) >> 15);
 
                 mix_r[i] += (interp * igain_r) >> 15;
 
@@ -1617,7 +1708,8 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
 
                 int32_t s0 = pcm[pos];
                 int32_t s1 = pcm[next_pos];
-                int32_t interp = s0 + (((s1 - s0) * (int32_t)(frac >> 8)) >> 8);
+                int32_t f_weight = (int32_t)(frac >> 1);
+                int32_t interp = s0 + (((s1 - s0) * f_weight) >> 15);
 
                 mix_l[i] += (interp * igain_l) >> 15;
                 mix_r[i] += (interp * igain_r) >> 15;
@@ -1713,14 +1805,16 @@ int SND_Vita_AudioThreadFunc(unsigned int args, void *argp) {
         return 0;
     }
 
-    int16_t out_samples[SND_VITA_BUFFER_SAMPLES];
+    static int16_t out_samples[2][SND_VITA_BUFFER_SAMPLES] __attribute__((aligned(64)));
+    int buf_idx = 0;
 
     while (!g_bAudioShutdown) {
         /* Mix active voices and BGM into stereo frame buffer */
-        SND_Vita_MixStereoBuffer(out_samples, SND_VITA_FRAME_SAMPLES);
+        SND_Vita_MixStereoBuffer(out_samples[buf_idx], SND_VITA_FRAME_SAMPLES);
 
         /* sceAudioOutOutput blocks synchronously until buffer DMA starts */
-        int res = sceAudioOutOutput(nAudioPort, out_samples);
+        int res = sceAudioOutOutput(nAudioPort, out_samples[buf_idx]);
+        buf_idx ^= 1;
         if (res < 0) {
             /* If device is suspended or busy, yield briefly */
             sceKernelDelayThread(10000); /* 10 ms */
@@ -1767,6 +1861,7 @@ int SND_Vita_InitEx(int spawn_thread) {
     g_stream_read_pos = g_stream_read_frac = 0;
     s_stream_pred[0] = s_stream_pred[1] = 0;
     s_stream_step[0] = s_stream_step[1] = 127;
+    s_stream_last_l = s_stream_last_r = 0;
     g_stream_sample_rate = 22050;
 
     g_nOutputSampleRate = SND_VITA_OUTPUT_RATE;

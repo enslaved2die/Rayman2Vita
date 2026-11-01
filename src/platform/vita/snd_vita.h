@@ -449,6 +449,11 @@ uint32_t SND_Vita_GetStreamQueuedFrames(void);
 uint32_t SND_Vita_GetStreamFreeFrames(void);
 
 /**
+ * @brief Returns cumulative number of stream frames consumed since stream start/reset.
+ */
+uint32_t SND_Vita_GetStreamConsumedFrames(void);
+
+/**
  * @brief Resets stream ring buffer and per-channel decoder state.
  */
 void    SND_Vita_ClearStream(void);

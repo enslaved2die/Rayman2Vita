@@ -95,6 +95,7 @@ __attribute__((weak)) void SND_Vita_UnloadFixBank(void) {}
 __attribute__((weak)) int SND_Vita_PlaySound(uint32_t id, float v, float p) { (void)id; (void)v; (void)p; return 0; }
 __attribute__((weak)) int SND_Vita_PlaySoundEx(int slot, uint32_t bank, uint32_t id, float v, float p, float pitch) { (void)slot; (void)bank; (void)id; (void)v; (void)p; (void)pitch; return 0; }
 __attribute__((weak)) int SND_Vita_IsVoicePlaying(int voice_idx) { (void)voice_idx; return 0; }
+__attribute__((weak)) void SND_Vita_GetVoiceStatus(int voice_index, int *pActive, uint32_t *pPos, uint32_t *pTotal) { (void)voice_index; if (pActive) *pActive = 0; if (pPos) *pPos = 0; if (pTotal) *pTotal = 0; }
 __attribute__((weak)) void SND_Vita_StopVoice(int idx) { (void)idx; }
 __attribute__((weak)) void SND_Vita_StopAllVoices(void) {}
 __attribute__((weak)) void SND_Vita_SetVoicePan(int idx, float p) { (void)idx; (void)p; }
@@ -107,6 +108,7 @@ __attribute__((weak)) void SND_Vita_ResumeMusic(void) {}
 __attribute__((weak)) void SND_Vita_FeedStreamChunk(int ch, const uint8_t *data, uint32_t bytes, int fmt, uint32_t sample_rate) { (void)ch; (void)data; (void)bytes; (void)fmt; (void)sample_rate; }
 __attribute__((weak)) uint32_t SND_Vita_GetStreamQueuedFrames(void) { return 0; }
 __attribute__((weak)) uint32_t SND_Vita_GetStreamFreeFrames(void) { return 65536; }
+__attribute__((weak)) uint32_t SND_Vita_GetStreamConsumedFrames(void) { return 0; }
 __attribute__((weak)) void SND_Vita_ClearStream(void) {}
 __attribute__((weak)) void SND_Vita_SetMasterVolume(float v) { (void)v; }
 __attribute__((weak)) void SND_Vita_SetBGMVolume(float v) { (void)v; }
@@ -343,9 +345,11 @@ static void hle_sdGetStatus(SH4Ctx *c) {
     uint8_t  slot_id = get_slot_id(handle);
 
     s_stat_status_polls++;
-    if (!SND_Vita_IsVoicePlaying(slot_id)) {
-        s_slots[slot_id].active = 0;
-    }
+    int active = 0;
+    uint32_t sample_pos = 0;
+    SND_Vita_GetVoiceStatus(slot_id, &active, &sample_pos, NULL);
+    s_slots[slot_id].active = active;
+    s_slots[slot_id].sample_pos = sample_pos;
     if (out_ptr) {
         uint32_t status = s_slots[slot_id].active ? 1u : 0u; /* bit 0 = playing */
         ST32(out_ptr, status);
@@ -360,9 +364,11 @@ static void hle_sdGetFullStatus(SH4Ctx *c) {
     uint8_t  slot_id   = get_slot_id(handle);
 
     s_stat_status_polls++;
-    if (!SND_Vita_IsVoicePlaying(slot_id)) {
-        s_slots[slot_id].active = 0;
-    }
+    int active = 0;
+    uint32_t sample_pos = 0;
+    SND_Vita_GetVoiceStatus(slot_id, &active, &sample_pos, NULL);
+    s_slots[slot_id].active = active;
+    s_slots[slot_id].sample_pos = sample_pos;
     if (block_ptr) {
         /* Clear block words */
         for (uint32_t o = 0; o < 0x20; o += 4) {
@@ -382,6 +388,11 @@ static void hle_sdGetPos(SH4Ctx *c) {
     uint32_t out_ptr = c->r[5];
     uint8_t  slot_id = get_slot_id(handle);
 
+    int active = 0;
+    uint32_t sample_pos = 0;
+    SND_Vita_GetVoiceStatus(slot_id, &active, &sample_pos, NULL);
+    s_slots[slot_id].active = active;
+    s_slots[slot_id].sample_pos = sample_pos;
     if (out_ptr) {
         ST32(out_ptr, s_slots[slot_id].sample_pos);
     }
@@ -395,16 +406,18 @@ static void hle_sdGetPos(SH4Ctx *c) {
 
 /* Stream Open (0x8C06262C): initializes stream state and opens audio container */
 static void hle_stream_open(SH4Ctx *c) {
-    hle_orig(c, 0x8C06262C);
-    uint32_t state = LD32(STREAM_CTX_ADDR);
-    if (state != 0) {
-        /* Extract volume from stream context (+0x54 byte) */
-        uint8_t vol_byte = LD8(STREAM_CTX_ADDR + 0x54);
-        float vol = (float)vol_byte / 100.0f;
-        if (vol > 1.0f) vol = 1.0f;
-        SND_Vita_SetBGMVolume(vol);
-        LOG_INFO("stream_open (0x8C06262C): stream active (state=%u), initial BGM volume: %.2f", state, vol);
+    if (LD32(STREAM_CTX_ADDR) != 0) {
+        LOG_WARN("stream_open (0x8C06262C): stream busy (state=%u), resetting", LD32(STREAM_CTX_ADDR));
+        SND_Vita_ClearStream();
+        SND_Vita_StopMusic();
+        ST32(STREAM_CTX_ADDR, 0);
     }
+    hle_orig(c, 0x8C06262C);
+    SND_Vita_ClearStream();
+    uint8_t vol_byte = LD8(STREAM_CTX_ADDR + 0x54);
+    float vol = (vol_byte <= 100) ? ((float)vol_byte / 100.0f) : 1.0f;
+    SND_Vita_SetBGMVolume(vol);
+    LOG_INFO("stream_open (0x8C06262C): initial BGM volume: %.2f", vol);
 }
 
 /* Stream Stop (0x8C0628A8): stops streaming BGM and invokes end callback */
@@ -428,7 +441,7 @@ static void hle_stream_resume(SH4Ctx *c) {
 
 /* Stream Volume (0x8C062870): sets BGM streaming volume */
 static void hle_stream_volume(SH4Ctx *c) {
-    uint32_t arg = c->r[4];
+    uint32_t arg = c->r[5];
     if (arg) {
         uint8_t vol_byte = LD8(arg + 4);
         float vol = (float)vol_byte / 100.0f;
@@ -448,9 +461,10 @@ static void hle_stream_feed(SH4Ctx *c) {
 static void hle_sdStreamTransferChunk(SH4Ctx *c) {
     uint32_t handle   = c->r[4];
     uint32_t ch       = c->r[5];
-    uint32_t src_addr = c->r[6];
-    uint32_t byte_len = c->r[7];
-    (void)handle;
+    uint32_t desc_ptr = c->r[6];
+
+    uint32_t src_addr = desc_ptr ? LD32(desc_ptr + 8) : 0;
+    uint32_t byte_len = desc_ptr ? LD32(desc_ptr + 12) : 0;
 
     uint32_t fmt = LD32(STREAM_CTX_ADDR + 0x1C);
     uint32_t sample_rate = 22050;
@@ -462,21 +476,62 @@ static void hle_sdStreamTransferChunk(SH4Ctx *c) {
         }
     }
 
-    if (src_addr && byte_len > 0) {
+    if (src_addr && byte_len > 0 && byte_len <= 8192) {
         SND_Vita_FeedStreamChunk((int)ch, (const uint8_t *)hle_ptr(src_addr), byte_len, (int)fmt, sample_rate);
+        uint32_t channels = LD32(STREAM_CTX_ADDR + 0x18);
+        if (channels == 1 && ch == 0) {
+            SND_Vita_FeedStreamChunk(1, (const uint8_t *)hle_ptr(src_addr), byte_len, (int)fmt, sample_rate);
+        }
     }
 
-    hle_orig(c, 0x8C0E3404);
+    if (handle) {
+        uint32_t wp = LD32(handle + 0x14 + (ch & 1) * 4);
+        wp = (wp + 0x800) % 0x4000;
+        ST32(handle + 0x14 + (ch & 1) * 4, wp);
+    }
+
+    c->r[0] = 0;
+}
+
+/* sdStreamCreate (0x8C0E2E84): allocates and initializes a stream handle */
+static void hle_sdStreamCreate(SH4Ctx *c) {
+    uint32_t out_handle_ptr = c->r[4];
+    hle_orig(c, 0x8C0E2E84);
+    if (out_handle_ptr) {
+        uint32_t handle = LD32(out_handle_ptr);
+        if (!handle) {
+            handle = 0x8C2FA9A8u;
+            ST32(out_handle_ptr, handle);
+        }
+        ST32(handle + 0x14, 0);
+        ST32(handle + 0x18, 0);
+        ST32(handle + 0x24, 0);
+        ST32(handle + 0x28, 0);
+    }
+    c->r[0] = 0;
+}
+
+/* sdStreamClose (0x8C0E2C70): closes stream and frees handle */
+static void hle_sdStreamClose(SH4Ctx *c) {
+    uint32_t handle = c->r[4];
+    if (handle) {
+        ST32(handle + 4, 0);
+        ST32(handle + 0x14, 0);
+        ST32(handle + 0x18, 0);
+    }
+    SND_Vita_ClearStream();
+    c->r[0] = 0;
 }
 
 /* sdStreamCheckRoom (0x8C0E2D50): checks available space in stream ring buffer */
 static void hle_sdStreamCheckRoom(SH4Ctx *c) {
-    uint32_t req_bytes    = c->r[6];
     uint32_t out_room_ptr = c->r[7];
 
     if (out_room_ptr) {
-        if (SND_Vita_GetStreamFreeFrames() >= 2048) {
-            ST32(out_room_ptr, req_bytes);
+        uint32_t queued = SND_Vita_GetStreamQueuedFrames();
+        uint32_t free_frames = SND_Vita_GetStreamFreeFrames();
+        if (queued < 8192 && free_frames >= 4096) {
+            ST32(out_room_ptr, 1);
         } else {
             ST32(out_room_ptr, 0);
         }
@@ -489,12 +544,17 @@ static void hle_sdStreamGetPos(SH4Ctx *c) {
     uint32_t out_pos_ptr = c->r[6];
 
     if (out_pos_ptr) {
-        if (SND_Vita_GetStreamQueuedFrames() > 0) {
-            ST32(out_pos_ptr, 0);
-        } else {
-            uint32_t eof_thresh = LD32(STREAM_CTX_ADDR + 0x14);
-            ST32(out_pos_ptr, eof_thresh + 1);
+        uint32_t threshold = LD32(STREAM_CTX_ADDR + 0x14);
+        uint32_t consumed = SND_Vita_GetStreamConsumedFrames();
+        uint32_t queued = SND_Vita_GetStreamQueuedFrames();
+
+        uint32_t pos = consumed;
+        if (threshold > 0) {
+            if (consumed >= threshold || (queued == 0 && LD32(STREAM_CTX_ADDR) == 5)) {
+                pos = threshold + 1;
+            }
         }
+        ST32(out_pos_ptr, pos);
     }
     c->r[0] = 0;
 }
@@ -503,10 +563,17 @@ static void hle_sdStreamGetPos(SH4Ctx *c) {
 static void hle_stream_tick(SH4Ctx *c) {
     s_stat_stream_ticks++;
     uint32_t pr = c->pr;
-    int max_catchup = (LD32(STREAM_CTX_ADDR) == 3) ? 8 : 1;
     uint32_t saved_fade = 0;
 
-    for (int i = 0; i < max_catchup; i++) {
+    for (int i = 0; i < 8; i++) {
+        uint32_t st = LD32(STREAM_CTX_ADDR);
+        if (st == 0) {
+            break;
+        }
+        uint32_t prev_q = SND_Vita_GetStreamQueuedFrames();
+        if (st == 3 && prev_q >= 8192) {
+            break;
+        }
         uint64_t prev_feeds = s_stat_stream_feeds;
         c->pr = pr;
         if (i > 0) {
@@ -518,8 +585,10 @@ static void hle_stream_tick(SH4Ctx *c) {
         if (i > 0) {
             ST32(STREAM_CTX_ADDR + 0x58, saved_fade);
         }
-        /* Stop if no new chunk was fed or state changed */
-        if (s_stat_stream_feeds == prev_feeds || LD32(STREAM_CTX_ADDR) != 3) {
+        uint32_t next_st = LD32(STREAM_CTX_ADDR);
+        /* Stop if in steady-state (3 -> 3) and no new chunk/frames were fed */
+        if (st == 3 && next_st == 3 &&
+            (SND_Vita_GetStreamQueuedFrames() == prev_q || s_stat_stream_feeds == prev_feeds)) {
             break;
         }
     }
@@ -566,6 +635,8 @@ __attribute__((constructor)) static void snd_cleanroom_register_hooks(void) {
     hle_hook(0x8C0E3404, hle_sdStreamTransferChunk);
     hle_hook(0x8C0E2D50, hle_sdStreamCheckRoom);
     hle_hook(0x8C0E2CC0, hle_sdStreamGetPos);
+    hle_hook(0x8C0E2E84, hle_sdStreamCreate);
+    hle_hook(0x8C0E2C70, hle_sdStreamClose);
 }
 
 /* ----------------------------------------------------------------------------
