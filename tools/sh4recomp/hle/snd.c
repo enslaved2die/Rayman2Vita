@@ -10,6 +10,15 @@
  * 0x8C0F0044 0x8C0F0428 0x8C0F0478 0x8C0F04FC 0x8C0F05F4 0x8C0F066C 0x8C0F06BC 0x8C0F0750 0x8C0F07D0 0x8C0F0878 0x8C0F08E4, game sound init
  * 0x8C098776. None of them is hooked: they run as recompiled guest code against the emulated AICA below. */
 #include "snd.h"
+#ifndef SND_TEST
+#include "perf.h"      /* guest-thread cost counters (g_perf): stream tick, AICA lock waits */
+#endif
+/* R2_AUDIO_MODE (perf experiments, Makefile.vita VARIANT=v1_*): 0 = normal. 1 = frozen engine: snd_mix() returns silence and never advances the ARM7/AICA (the sd driver
+ * never answers; the guest keeps running if its polls are non-blocking, see notes_perf_variants.md). 2 = ARM7 + timers are stepped (status words stay sane) but the 64-voice
+ * generator, limiter and resampler are skipped (silence). */
+#ifndef R2_AUDIO_MODE
+#define R2_AUDIO_MODE 0
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -20,7 +29,10 @@
 /* vita-elf-create needs 3060 bytes of free space after the text segment before the 64 KiB-aligned data segment; a text segment ending a few hundred
  * bytes short of the boundary aborts the link ("Cannot allocate 3060 bytes for SCE data at end of segment 0; segment 1 overlaps"). Hit by an unlucky
  * code size in build_vita_v3; this 4 KiB of rodata moves the end of the segment. Remove only if the layout is otherwise guaranteed. */
-__attribute__((used)) static const char g_vita_layout_pad[4096] = "layout pad";
+#ifndef R2_LAYOUT_PAD
+#define R2_LAYOUT_PAD 4600      /* Makefile.vita raises it for variants whose text size ends too close to a 64 KiB boundary */
+#endif
+__attribute__((used)) static const char g_vita_layout_pad[R2_LAYOUT_PAD] = "layout pad";
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
 typedef SceUID snd_lock_t;
@@ -36,6 +48,14 @@ static inline void lk_lock(void) { pthread_mutex_lock(&g_lk); }
 static inline void lk_unlock(void) { pthread_mutex_unlock(&g_lk); }
 #endif
 
+/* guest-thread acquisition of the AICA lock, timed (the audio thread holds it for up to MIX_CHUNK samples while it generates them): counted in g_perf.t_snd_lock / snd_lock_n */
+static inline void glk_lock(void) {
+#ifndef SND_TEST
+    uint64_t t = r2_now_us(); lk_lock(); g_perf.t_snd_lock += r2_now_us() - t; g_perf.snd_lock_n++;
+#else
+    lk_lock();
+#endif
+}
 #define TRACE (g_trace)
 static int g_trace;
 static int g_evlog;                                     /* R2_SND_EV=1: per-voice key-on/off/end/loop event log */
@@ -82,6 +102,7 @@ static Arm A;
 static int      arm_run_flag;
 static int64_t  arm_budget;
 static int      idle_ok;
+static uint64_t st_arm_bulk;   /* ARM instructions accounted by delay_skip() in bulk (not dispatched one by one) */
 static uint64_t st_arm_instr, st_idle, st_samples, st_keyon, st_ringcmds; static uint32_t st_undef, st_peak;
 
 /* interrupts / timers */
@@ -705,7 +726,7 @@ static int delay_skip(int64_t *budget) {
     A.r[3] = r3 - (uint32_t)m;
     A.cpsr = (A.cpsr & ~(FN | FZ | FC | FV)) | FC;
     A.r[15] = 0x7284;
-    st_arm_instr += 3 * (uint64_t)m;
+    st_arm_instr += 3 * (uint64_t)m; st_arm_bulk += 3 * (uint64_t)m;
     *budget -= 8 * m;
     return 1;
 }
@@ -824,7 +845,11 @@ static void advance_locked(int n, int16_t *out) {
 #if !defined(__vita__) && !defined(SND_TEST)
         if (g_slow_ns) { uint64_t e = mix_now_us() * 1000 + g_slow_ns; while (mix_now_us() * 1000 < e) ; }      /* host emulation of the Vita's slow audio thread (R2_SND_SLOW_NS=9000 ~ 10 ms per 1024-frame block) */
 #endif
+#if R2_AUDIO_MODE == 2
+        float l = 0.0f, r = 0.0f;
+#else
         float l, r; render_sample(&l, &r);
+#endif
         if (probe) { uint64_t tp2 = mix_now_us(); st_tp_arm += tp1 - tp0; st_tp_vox += tp2 - tp1; st_tp_n++; }
         int32_t il = (int32_t)(l * g_master), ir = (int32_t)(r * g_master);
         if (aregs[0x2800 / 4] & 0x8000) { il = ir = (il + ir) / 2; }
@@ -931,7 +956,9 @@ static void stream_watchdog(uint32_t ctx) {
     }
     if (inhole) { uint32_t ms = (uint32_t)((now - bad0) / 44); if (ms > g_st_hole_ms_max) g_st_hole_ms_max = ms; }
 }
-static void sf_disp(SH4Ctx *c) {
+static void sf_disp_body(SH4Ctx *c);
+static void sf_disp(SH4Ctx *c) { uint64_t t0 = r2_now_us(); sf_disp_body(c); g_perf.t_snd_tick += r2_now_us() - t0; g_perf.snd_tick_n++; }
+static void sf_disp_body(SH4Ctx *c) {
     const uint32_t ctx = 0x8C2D4968u; uint32_t pr = c->pr; int maxn = (g_sf_on && LD32(ctx) == 3) ? 8 : 1; uint32_t fade = 0;
     for (int i = 0; i < maxn; i++) {
         int n0 = g_sf_chunks; c->pr = pr;
@@ -1013,6 +1040,9 @@ static inline void stage_next(float *l, float *r) {
 void snd_mix(int16_t *out, int frames) {
     if (!g_inited) snd_init(44100);
     g_pull_mode = 1;
+#if R2_AUDIO_MODE == 1
+    memset(out, 0, (size_t)frames * 4); st_mix_calls++; return;       /* frozen engine (perf experiment): no ARM7, no AICA, silence */
+#endif
     uint64_t t0 = mix_now_us();
     if (g_out_rate == 44100) {
         int done = 0;
@@ -1049,7 +1079,7 @@ void snd_mix(int16_t *out, int frames) {
 void snd_get_stats(SndStats *s) {
     lk_lock();
     memset(s, 0, sizeof *s);
-    s->arm_running = arm_run_flag; s->samples = st_samples; s->arm_instr = st_arm_instr; s->arm_idle_skips = st_idle; s->keyon = st_keyon; s->ringcmds = st_ringcmds;
+    s->arm_running = arm_run_flag; s->samples = st_samples; s->arm_instr = st_arm_instr; s->arm_bulk = st_arm_bulk; s->arm_idle_skips = st_idle; s->keyon = st_keyon; s->ringcmds = st_ringcmds;
     for (int i = 0; i < 64; i++) s->active_channels += chn[i].active;
     s->peak = st_peak; st_peak = 0; s->undef_instr = st_undef;
     {   /* per-block (1024 output frames = 941.2 AICA samples) split, extrapolated from the probed samples; the clock-read cost (calibrated in snd_init) is subtracted per half */
@@ -1113,7 +1143,7 @@ static void sh4_aram_wr(uint32_t a, int sz, uint32_t v) {
          * thread; on the Vita's weakly ordered cores stores can additionally become visible out of order). The guest holds the AICA lock across the block (first word 0x13200 ... last
          * word 0x1330C): the audio thread simply waits < 50 us, and the unlock publishes all stores (barrier). Safety: any store outside the block releases a lock left held. */
         if (g_blk_held && (o < 0x13200 || o > 0x1330F)) { g_blk_held = 0; lk_unlock(); }
-        if (o == 0x13200 && !g_blk_held) { lk_lock(); g_blk_held = 1; g_blk_s0 = st_samples; }
+        if (o == 0x13200 && !g_blk_held) { glk_lock(); g_blk_held = 1; g_blk_s0 = st_samples; }
         ram_wr(o, sz, v);
         if (g_blk_held && o >= 0x1330C) { g_blk_held = 0; lk_unlock(); }
         return;
@@ -1130,7 +1160,7 @@ static void sh4_reg_wr(uint32_t a, int sz, uint32_t v) {
     if (g_blk_held) { g_blk_held = 0; lk_unlock(); }       /* a command-block write was interrupted: never self-deadlock on the AICA lock */
     REC(1, sz, a & 0x7FFF, v, 0);
     CALLER_NOTE(3, a & 0x7FFF);
-    lk_lock(); if (!g_pull_mode) wall_sync_locked();
+    glk_lock(); if (!g_pull_mode) wall_sync_locked();
     reg_write(a & 0x7FFF, sz, v, 0);
     lk_unlock();
 }

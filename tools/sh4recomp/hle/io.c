@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* ---------------------------------------------------------------- layout constants (all PROVEN from the disassembly) */
 enum {
@@ -67,6 +68,17 @@ typedef struct { char *name; uint32_t size; int parent, child, next; unsigned ch
 static INode *g_idx; static int g_nidx, g_capidx;
 int hle_io_stat_calls;      /* syscall counters (tests/diagnostics) */
 unsigned long hle_io_lookups, hle_io_misses;
+/* guest-thread synchronous file IO (open / pread / close of the fake GD-ROM handles, stat), read by perf.c: microseconds, calls, bytes */
+uint64_t hle_io_t_us, hle_io_calls, hle_io_bytes;
+static inline uint64_t io_now_us(void) {
+#ifdef __vita__
+    extern unsigned long long sceKernelGetProcessTimeWide(void); return sceKernelGetProcessTimeWide();
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000;
+#endif
+}
+#define IO_T0() uint64_t io_t0_ = io_now_us()
+#define IO_T1(bytes) do { hle_io_t_us += io_now_us() - io_t0_; hle_io_calls++; hle_io_bytes += (bytes); } while (0)
 
 static int is_sep(char ch) { return ch == '\\' || ch == '/'; }
 
@@ -264,7 +276,7 @@ static int reg_find(const char *path, uint32_t size) {
 static uint32_t reg_size(const char *path) {          /* size from the index (path is a resolved host path); stat only as a fallback */
     size_t rl = strlen(g_root);
     if (g_idx_ready && !strncmp(path, g_root, rl) && path[rl] == '/') { int n = idx_find_path(path + rl + 1); if (n >= 0) return g_idx[n].size; }
-    struct stat st; hle_io_stat_calls++; return stat(path, &st) ? 0 : (uint32_t)st.st_size; }
+    struct stat st; hle_io_stat_calls++; IO_T0(); int sr_ = stat(path, &st); IO_T1(0); return sr_ ? 0 : (uint32_t)st.st_size; }
 
 /* ---------------------------------------------------------------- fake gdFs handles */
 static uint32_t gd_addr(unsigned i) { return g_gd_base + i * HLE_IO_GD_STRIDE; }
@@ -281,7 +293,7 @@ static uint32_t gd_open_range(uint32_t fad, int32_t nsect) {
     if (id < 0 || id >= g_nreg) { hle_log("[io] gd_open_range: fad %u does not map to a registered file", fad); return 0; }
     unsigned i; for (i = 0; i < g_ngd; i++) if (!g_gd[i].used) break;
     if (i == g_ngd) { hle_log("[io] out of fake gdFs handles (%u)", g_ngd); return 0; }
-    int fd = open(g_reg[id].path, O_RDONLY);
+    IO_T0(); int fd = open(g_reg[id].path, O_RDONLY); IO_T1(0);
     if (fd < 0) { hle_log("[io] open(%s): %s", g_reg[id].path, strerror(errno)); return 0; }
     g_gd[i].used = 1; g_gd[i].fd = fd; g_gd[i].reg = id; g_gd[i].base = lba & ((1u << LBA_SHIFT) - 1);
     uint32_t h = gd_addr(i);
@@ -293,13 +305,14 @@ static uint32_t gd_open_range(uint32_t fad, int32_t nsect) {
 }
 static void gd_close(uint32_t h) {
     GdEnt *g = gd_lookup(h); if (!g) return;
-    close(g->fd); g->fd = -1; g->used = 0; put16(h + G_VALID, 0);
+    { IO_T0(); close(g->fd); IO_T1(0); } g->fd = -1; g->used = 0; put16(h + G_VALID, 0);
 }
 /* read n sectors at the handle's current sector offset into guest buf; zero-fill past EOF like the padded last disc sector */
 /* read up to n bytes at file offset off into dst in large (1 MiB) chunks; returns bytes read */
 static size_t read_chunks(int fd, uint8_t *dst, size_t n, off_t off) {
-    size_t got = 0;
+    size_t got = 0; IO_T0();
     while (got < n) { size_t want = n - got; if (want > (1u << 20)) want = 1u << 20; ssize_t r = pread(fd, dst + got, want, off + (off_t)got); if (r <= 0) break; got += (size_t)r; }
+    IO_T1(got);
     return got;
 }
 /* read n sectors at the handle's current sector offset into guest buf; zero-fill past EOF like the padded last disc sector */

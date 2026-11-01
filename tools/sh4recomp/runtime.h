@@ -57,12 +57,21 @@ uint32_t sh4_io_read(uint32_t addr, int size);              /* slow path (hook t
 void     sh4_io_write(uint32_t addr, int size, uint32_t v);
 /* RAM iff top byte is 0x8C (P1) or 0xAC (P2): clearing bit 29 maps both onto 0x8C */
 #define SH4_FAST(a) (((a) & 0xDF000000u) == 0x8C000000u)
-SH4_INLINE uint32_t LD8(uint32_t a)  { return SH4_LIKELY(SH4_FAST(a)) ? sh4_ram[a & 0xFFFFFFu] : sh4_io_read(a,1); }
-SH4_INLINE uint32_t LD16(uint32_t a) { if (SH4_LIKELY(SH4_FAST(a))) { uint16_t v; memcpy(&v, &sh4_ram[a & 0xFFFFFFu], 2); return v; } return sh4_io_read(a,2); }
-SH4_INLINE uint32_t LD32(uint32_t a) { if (SH4_LIKELY(SH4_FAST(a))) { uint32_t v; memcpy(&v, &sh4_ram[a & 0xFFFFFFu], 4); return v; } return sh4_io_read(a,4); }
-SH4_INLINE void ST8(uint32_t a, uint32_t v)  { if (SH4_LIKELY(SH4_FAST(a))) sh4_ram[a & 0xFFFFFFu] = (uint8_t)v; else sh4_io_write(a,1,v); }
-SH4_INLINE void ST16(uint32_t a, uint32_t v) { if (SH4_LIKELY(SH4_FAST(a))) { uint16_t x=(uint16_t)v; memcpy(&sh4_ram[a & 0xFFFFFFu], &x, 2); } else sh4_io_write(a,2,v); }
-SH4_INLINE void ST32(uint32_t a, uint32_t v) { if (SH4_LIKELY(SH4_FAST(a))) memcpy(&sh4_ram[a & 0xFFFFFFu], &v, 4); else sh4_io_write(a,4,v); }
+/* -DR2_FASTCHK_SUB (perf variant v4b): the inline fast path accepts only 0x8C000000..0x8CFFFFFF (one subtract + one unsigned compare, and the subtract result is the RAM offset), the 0xAC mirror
+ * (uncached P2 view of the same RAM) takes the out-of-line slow path, which resolves it to RAM first (runtime.c). Default: bit 29 is ignored in the compare (two views inline, one more instruction). */
+#ifdef R2_FASTCHK_SUB
+#define SH4_FASTQ(a) (((a) - 0x8C000000u) < 0x01000000u)
+#define SH4_OFF(a)   ((a) - 0x8C000000u)
+#else
+#define SH4_FASTQ(a) SH4_FAST(a)
+#define SH4_OFF(a)   ((a) & 0xFFFFFFu)
+#endif
+SH4_INLINE uint32_t LD8(uint32_t a)  { return SH4_LIKELY(SH4_FASTQ(a)) ? sh4_ram[SH4_OFF(a)] : sh4_io_read(a,1); }
+SH4_INLINE uint32_t LD16(uint32_t a) { if (SH4_LIKELY(SH4_FASTQ(a))) { uint16_t v; memcpy(&v, &sh4_ram[SH4_OFF(a)], 2); return v; } return sh4_io_read(a,2); }
+SH4_INLINE uint32_t LD32(uint32_t a) { if (SH4_LIKELY(SH4_FASTQ(a))) { uint32_t v; memcpy(&v, &sh4_ram[SH4_OFF(a)], 4); return v; } return sh4_io_read(a,4); }
+SH4_INLINE void ST8(uint32_t a, uint32_t v)  { if (SH4_LIKELY(SH4_FASTQ(a))) sh4_ram[SH4_OFF(a)] = (uint8_t)v; else sh4_io_write(a,1,v); }
+SH4_INLINE void ST16(uint32_t a, uint32_t v) { if (SH4_LIKELY(SH4_FASTQ(a))) { uint16_t x=(uint16_t)v; memcpy(&sh4_ram[SH4_OFF(a)], &x, 2); } else sh4_io_write(a,2,v); }
+SH4_INLINE void ST32(uint32_t a, uint32_t v) { if (SH4_LIKELY(SH4_FASTQ(a))) memcpy(&sh4_ram[SH4_OFF(a)], &v, 4); else sh4_io_write(a,4,v); }
 
 /* ---- calls / hooks ---- */
 typedef struct { uint32_t addr; sh4_fn fn; } Sh4FuncEnt;

@@ -43,13 +43,81 @@ static SH4Ctx ctx;
 /* [vita] messages go to hle_log (stderr -> Vita3K console) AND to ux0:data/rayman2/rayman2.log (flushed per line: survives a crash,
  * works on real hardware where stderr goes nowhere). */
 static SceUID s_logfd = -1;
+/* Wait-free logging.  v13/rt2 showed the render thread (which printed the 12-line [perf] block) stuck for 0.1 - 0.8 s at every 300-frame boundary, first with synchronous SD writes, then still with a
+ * mutex-like spin lock shared with a low-priority writer thread (a priority-inversion candidate: a higher-priority thread spinning on a lock held by a preempted lower-priority thread on the same core).
+ * Now: one single-producer / single-consumer ring per producing thread (game, render/perf, audio): producing = memcpy + one barrier + one store, no lock, no kernel call, never waits (a full ring drops
+ * the line and counts it).  The perf block is not even formatted on the render thread: r2_perf_report hands a snapshot of the counters through a wait-free mailbox (r2_perf_post) and the writer thread formats
+ * it.  The writer polls every 30 ms (no semaphore signalling from producers), is unpinned and low priority, and holds no lock while it calls sceIoWrite.  sceClibPrintf (debug UART) is only used with
+ * -DR2_CLIB_PRINTF=1 (Vita3K stdout needs it; retail does not), because its per-line cost on hardware is unknown. */
+#ifndef R2_CLIB_PRINTF
+#define R2_CLIB_PRINTF 0
+#endif
+#define LOGRING (128 * 1024)
+typedef struct { char buf[LOGRING]; volatile unsigned head, tail, dropped; } LogRing;
+static LogRing s_ring[3];                      /* 0 game thread, 1 render thread (perf sink), 2 audio thread */
+static volatile int s_log_async;
+#define PERF_MAILBOX 8
+static R2Perf s_pm[PERF_MAILBOX]; static unsigned long s_pm_frame[PERF_MAILBOX]; static volatile unsigned s_pm_head, s_pm_tail, s_pm_dropped;
+static void ring_put(LogRing *r, const char *s, size_t n) {
+    unsigned h = r->head;
+    if (LOGRING - (h - r->tail) < n) { r->dropped++; return; }
+    size_t pos = h % LOGRING, first = LOGRING - pos < n ? LOGRING - pos : n;
+    memcpy(r->buf + pos, s, first); if (first < n) memcpy(r->buf, s + first, n - first);
+    __sync_synchronize(); r->head = h + (unsigned)n;
+}
+static void vita_log_ring(int ring, const char *fmt, va_list ap) {
+    char buf[512]; vsnprintf(buf, sizeof buf, fmt, ap);
+    size_t n = strlen(buf); buf[n++] = '\n';
+    if (!s_log_async) {                         /* before the writer thread exists: direct (unbuffered, survives a crash) */
+#if R2_CLIB_PRINTF
+        sceClibPrintf("%.*s", (int)n, buf);
+#endif
+        if (s_logfd < 0) s_logfd = sceIoOpen("ux0:data/rayman2/rayman2.log", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+        if (s_logfd >= 0) sceIoWrite(s_logfd, buf, n);
+        return;
+    }
+    ring_put(&s_ring[ring], buf, n);
+}
 static void vita_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void vita_log(const char *fmt, ...) {
-    char buf[512]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
-    hle_log("%s", buf);
-    sceClibPrintf("%s\n", buf);
-    if (s_logfd < 0) s_logfd = sceIoOpen("ux0:data/rayman2/rayman2.log", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-    if (s_logfd >= 0) { size_t n = strlen(buf); buf[n] = '\n'; sceIoWrite(s_logfd, buf, n + 1); }   /* direct sceIo: unbuffered, survives a crash */
+static void vita_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vita_log_ring(0, fmt, ap); va_end(ap); }
+static void vita_log_aud(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void vita_log_aud(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vita_log_ring(2, fmt, ap); va_end(ap); }
+static void vita_log_rt(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void vita_log_rt(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vita_log_ring(1, fmt, ap); va_end(ap); }
+static void perf_post(const R2Perf *snap, unsigned long frame) {     /* render thread: wait-free copy of ~500 bytes */
+    unsigned h = s_pm_head;
+    if (h - s_pm_tail >= PERF_MAILBOX) { s_pm_dropped++; return; }
+    s_pm[h % PERF_MAILBOX] = *snap; s_pm_frame[h % PERF_MAILBOX] = frame;
+    __sync_synchronize(); s_pm_head = h + 1;
+}
+static char s_wchunk[24 * 1024]; static unsigned s_wn;
+static void writer_flush(void) {
+    if (s_wn && s_logfd >= 0) sceIoWrite(s_logfd, s_wchunk, s_wn);
+#if R2_CLIB_PRINTF
+    if (s_wn) sceClibPrintf("%.*s", (int)s_wn, s_wchunk);
+#endif
+    s_wn = 0;
+}
+static void writer_put(const char *s, size_t n) { if (s_wn + n > sizeof s_wchunk) writer_flush(); if (n > sizeof s_wchunk) n = sizeof s_wchunk; memcpy(s_wchunk + s_wn, s, n); s_wn += (unsigned)n; }
+static void writer_perf_line(const char *line) { writer_put(line, strlen(line)); writer_put("\n", 1); }     /* formatted perf text: written by the writer thread itself */
+static int log_writer_thread(SceSize args, void *argp) {
+    (void)args; (void)argp;
+    for (;;) {
+        sceKernelDelayThread(30 * 1000);
+        for (int r = 0; r < 3; r++) {
+            LogRing *q = &s_ring[r]; unsigned t = q->tail, h = q->head;      /* the consumer owns tail; the data below head was published by the producer's barrier */
+            __sync_synchronize();
+            while (t != h) { unsigned pos = t % LOGRING, n = h - t; if (n > LOGRING - pos) n = LOGRING - pos; writer_put(q->buf + pos, n); t += n; }
+            q->tail = t;
+        }
+        while (s_pm_tail != s_pm_head) { __sync_synchronize(); unsigned i = s_pm_tail % PERF_MAILBOX; R2Perf snap = s_pm[i]; unsigned long fr = s_pm_frame[i]; __sync_synchronize(); s_pm_tail++; r2_perf_format(&snap, fr, writer_perf_line); }
+        writer_flush();
+    }
+    return 0;
+}
+static void vita_log_start_async(void) {
+    SceUID t = sceKernelCreateThread("rayman2_log", log_writer_thread, 0x10000100 + 60, 64 * 1024, 0, SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
+    if (t >= 0 && sceKernelStartThread(t, 0, NULL) >= 0) { r2_perf_post = perf_post; s_log_async = 1; }
 }
 
 /* Update controller state from PS Vita hardware to Dreamcast Maple pad */
@@ -98,7 +166,7 @@ static void vita_input_callback(SH4Ctx *c) {
     vita_update_input();
 }
 
-static void perf_sink(const char *line) { vita_log("%s", line); }
+static void perf_sink(const char *line) { vita_log_rt("%s", line); }
 static uint64_t acc_render, acc_swap, acc_ta, acc_ta_n;
 #ifdef R2_VITA_PROFILE
 /* make -f Makefile.vita PROFILE=1: hot-spot split via the linker (-Wl,--wrap): time spent in the GL submit and in the swap (vsync wait) per frame. */
@@ -175,10 +243,18 @@ static void vita_set_clocks(void) {
 #ifndef R2_AUDIO_CPU
 #define R2_AUDIO_CPU SCE_KERNEL_CPU_MASK_USER_2
 #endif
+#ifndef R2_RENDER_CPU
+#define R2_RENDER_CPU SCE_KERNEL_CPU_MASK_USER_0       /* render thread (vita_gl_render.c uses the same default); keep the three masks disjoint */
+#endif
+#ifndef R2_RENDER_THREAD
+#define R2_RENDER_THREAD 1
+#endif
 static int game_main(void) {
     hle_verbose = R2_VITA_VERBOSE;
     r2_perf_sink = perf_sink;
+    vita_log_start_async();
     vita_set_clocks();
+    { extern const char r2_variant_name[], r2_variant_flags[]; vita_log("[vita] variant: %s | %s | game cpu mask 0x%x audio cpu mask 0x%x", r2_variant_name, r2_variant_flags, (unsigned)R2_GAME_CPU, (unsigned)R2_AUDIO_CPU); }   /* Makefile.vita VARIANT: pasted logs identify themselves */
 
     /* 1. Set controller sampling mode */
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
@@ -186,6 +262,8 @@ static int game_main(void) {
     /* 2. Initialize vitaGL hardware rendering context */
     hle_ta_wide_set(R2_VITA_WIDE);
     vita_gl_render_init();
+    vita_log("[vita] render thread: %s (game cpu mask 0x%x, audio 0x%x, render 0x%x; R2_RENDER_THREAD default %d, disable at run time with an empty file ux0:data/rayman2/NO_RENDER_THREAD)",
+             vita_gl_rt_active() ? "ACTIVE (build + texture upload + GL submit + swap on the render thread)" : "off (inline on the game thread)", (unsigned)R2_GAME_CPU, (unsigned)R2_AUDIO_CPU, (unsigned)R2_RENDER_CPU, R2_RENDER_THREAD);
 
     /* 3. Determine binary image path */
     const char *candidate_bins[] = {
@@ -265,11 +343,11 @@ static int game_main(void) {
 static int audio_thread(SceSize args, void *argp) {
     (void)args; (void)argp;
     int port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, 1024, 48000, SCE_AUDIO_OUT_MODE_STEREO);
-    if (port < 0) { vita_log("[vita] audio: sceAudioOutOpenPort failed 0x%08x", port); return 0; }
+    if (port < 0) { vita_log_aud("[vita] audio: sceAudioOutOpenPort failed 0x%08x", port); return 0; }
     static int16_t buf[1024 * 2];
     unsigned long blocks = 0; int peak = 0, gpeak = 0; uint32_t aud_win_max = 0;
     uint64_t last = sceKernelGetProcessTimeWide();
-    vita_log("[vita] audio thread running (port %d)", port);
+    vita_log_aud("[vita] audio thread running (port %d)", port);
     for (;;) {
         { uint64_t tm0 = sceKernelGetProcessTimeWide(); snd_mix(buf, 1024); uint32_t d = (uint32_t)(sceKernelGetProcessTimeWide() - tm0);
           g_perf.aud_us_tot += d; g_perf.aud_blocks++; if (d > aud_win_max) aud_win_max = d; }
@@ -280,11 +358,11 @@ static int audio_thread(SceSize args, void *argp) {
         if (now - last >= 5000000) {
             SndStats st; snd_get_stats(&st);
             if (peak > gpeak) gpeak = peak;
-            g_perf.aud_arm_us = st.arm_us_blk; g_perf.aud_vox_us = st.vox_us_blk; g_perf.aud_avg_us = st.mix_us_avg; g_perf.aud_max_us = aud_win_max; aud_win_max = 0;
-            vita_log("[vita] audio: frame %lu, %lu blocks, peak %d (global %d), arm_running %d, ringcmds %llu, keyon %llu, active ch %d, undef %u, mix avg %u max %u us/block (budget 21333), est. split per block: arm7 %u us, voices %u us, rest(limit+resample+lock) %u us (probes %u), stream open/stop/pause/resume %u/%u/%u/%u, holes %u (longest %u ms), keyon_ignored %u",
+            g_perf.aud_arm_instr = st.arm_instr; g_perf.aud_arm_bulk = st.arm_bulk; g_perf.aud_samples = st.samples; g_perf.aud_arm_us = st.arm_us_blk; g_perf.aud_vox_us = st.vox_us_blk; g_perf.aud_avg_us = st.mix_us_avg; g_perf.aud_max_us = aud_win_max; aud_win_max = 0;
+            vita_log_aud("[vita] audio: frame %lu, %lu blocks, peak %d (global %d), arm_running %d, ringcmds %llu, keyon %llu, active ch %d, undef %u, mix avg %u max %u us/block (budget 21333), est. split per block: arm7 %u us, voices %u us, rest(limit+resample+lock) %u us (probes %u), stream open/stop/pause/resume %u/%u/%u/%u, holes %u (longest %u ms), keyon_ignored %u",
                      hle_frame_count, blocks, peak, gpeak, st.arm_running, (unsigned long long)st.ringcmds, (unsigned long long)st.keyon, st.active_channels, st.undef_instr, st.mix_us_avg, st.mix_us_max, st.arm_us_blk, st.vox_us_blk, st.mix_us_avg > st.arm_us_blk + st.vox_us_blk ? st.mix_us_avg - st.arm_us_blk - st.vox_us_blk : 0, st.tp_n,
                      st.stream_open, st.stream_stop, st.stream_pause, st.stream_resume, st.stream_holes, st.stream_hole_ms_max, st.keyon_ignored);
-            { static uint32_t last_note_seq; if (st.stream_note_seq != last_note_seq) { last_note_seq = st.stream_note_seq; vita_log("[vita] audio stream hole: %s", st.stream_note); } }
+            { static uint32_t last_note_seq; if (st.stream_note_seq != last_note_seq) { last_note_seq = st.stream_note_seq; vita_log_aud("[vita] audio stream hole: %s", st.stream_note); } }
             peak = 0; last = now;
         }
     }
