@@ -43,7 +43,7 @@ CFLAGS          := $(OPT) -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
                    $(EXTRA_CFLAGS) \
                    -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-label \
                    -DCPA_PLATFORM_VITA -DR2_DREAMCAST_BASELINE -D__vita__ \
-                   -I$(RECOMP_DIR) -I$(HGEN) -I$(HLE_DIR)
+                   -I$(RECOMP_DIR) -I$(HGEN) -I$(HLE_DIR) -Iinclude -Isrc/platform/vita
 
 LDFLAGS         := -Wl,-q -Wl,--gc-sections -L$(VITASDK)/arm-vita-eabi/lib
 
@@ -73,8 +73,14 @@ LIBS            := -lvitaGL \
                    -lstdc++ \
                    -lm
 
-# Audio module (owned elsewhere): linked when present; build with SND_SRC= to leave it out.
+# Audio module: cleanroom audio engine by default, or fallback to AICA emulator snd.c
+USE_CLEANROOM_AUDIO ?= 1
+ifeq ($(USE_CLEANROOM_AUDIO),1)
+SND_SRC         ?= $(HLE_DIR)/snd_cleanroom.c
+EXTRA_OBJS      += $(BUILD_DIR)/snd_vita.o
+else
 SND_SRC         ?= $(wildcard $(HLE_DIR)/snd.c)
+endif
 
 # Generated recompilation translation units
 RECOMP_SRCS     := $(wildcard $(HGEN)/recomp_[0-9]*.c)
@@ -98,7 +104,7 @@ COMMON_OBJS     := $(BUILD_DIR)/recomp_functab.o \
                    $(BUILD_DIR)/runtime.o \
                    $(BUILD_DIR)/hook_stubs.o
 
-ALL_OBJS        := $(RECOMP_OBJS) $(COMMON_OBJS) $(HLE_OBJS)
+ALL_OBJS        := $(RECOMP_OBJS) $(COMMON_OBJS) $(HLE_OBJS) $(EXTRA_OBJS)
 
 ELF             := $(BUILD_DIR)/$(TARGET).elf
 VELF            := $(BUILD_DIR)/$(TARGET).velf
@@ -143,6 +149,9 @@ $(BUILD_DIR)/hook_stubs.o: $(BUILD_DIR)/hook_stubs.c $(HLE_DIR)/hle.h $(HLE_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/hle_%.o: $(HLE_DIR)/%.c $(HLE_DIR)/hle.h $(HLE_DIR)/hle_priv.h $(RECOMP_DIR)/runtime.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/snd_vita.o: src/platform/vita/snd_vita.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(ELF): $(ALL_OBJS) | $(BUILD_DIR)

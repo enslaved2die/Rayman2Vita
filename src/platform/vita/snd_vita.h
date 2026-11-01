@@ -5,10 +5,12 @@
  * PlayStation Vita Audio Subsystem & Yamaha AICA ADPCM Decoder
  * - Yamaha AICA 4-bit ADPCM Decoder (standard step adaptation & difference tables)
  * - Multi-Channel Audio Mixer: 1 Streaming BGM Channel + 16 SFX Voices
- * - Dedicated Real-Time Audio Worker Thread (sceAudioOut @ 44.1 kHz 16-bit Stereo)
- * - Sound Bank (.OSB) Loader for FIX.OSB & Level Sound Banks
- * - Streaming Background Music Loader (.DCZ and .WAV RIFF containers)
- * - Per-channel & Master Volume and Stereo Panning Control
+ * - Dedicated Real-Time Audio Worker Thread (sceAudioOut @ 48.0 kHz or 44.1 kHz 16-bit Stereo)
+ * - Sound Bank (.OSB) Loader for FIX.OSB & Level Sound Banks with loop point extraction
+ * - Streaming Background Music Loader (.DCZ archive container and .WAV RIFF streams)
+ * - Dreamcast Yamaha AICA DIPAN stereo panning law (3 dB step attenuation curve)
+ * - ARM NEON SIMD vectorization for mixing, saturation clamping, and frame interleaving
+ * - Thread-safe synchronization between main game thread and audio worker thread
  *
  * Primary Port Baseline: Sega Dreamcast Yamaha AICA Sound Architecture
  * Secondary Guidance:    PC DirectSound retail implementation
@@ -29,7 +31,9 @@ extern "C" {
  * 1. Audio Subsystem Constants & Configuration
  * ---------------------------------------------------------------------------- */
 #define SND_VITA_NUM_VOICES         16      /* 16 simultaneous SFX voices */
-#define SND_VITA_OUTPUT_RATE        48000   /* 48.0 kHz hardware sample rate (SCE_AUDIO_OUT_PORT_TYPE_MAIN) */
+#define SND_VITA_RATE_48000         48000   /* 48.0 kHz hardware sample rate (SCE_AUDIO_OUT_PORT_TYPE_MAIN) */
+#define SND_VITA_RATE_44100         44100   /* 44.1 kHz hardware sample rate (SCE_AUDIO_OUT_PORT_TYPE_BGM) */
+#define SND_VITA_OUTPUT_RATE        SND_VITA_RATE_48000 /* Default hardware sample rate */
 #define SND_VITA_FRAME_SAMPLES      1024    /* 1024 stereo frames per output buffer */
 #define SND_VITA_BUFFER_SAMPLES     (SND_VITA_FRAME_SAMPLES * 2) /* 2048 int16 samples */
 
@@ -54,10 +58,13 @@ extern "C" {
 /* Single sound sample entry loaded from .OSB sound bank */
 typedef struct SND_Vita_Sample {
     uint32_t    sound_id;       /* Bank-relative sound ID */
-    uint32_t    sample_rate;    /* Native sample rate (typically 22050 or 44100 Hz) */
+    uint32_t    sample_rate;    /* Native sample rate (typically 11025, 22050, or 44100 Hz) */
     uint32_t    num_samples;    /* Number of decoded 16-bit mono PCM samples */
     int16_t    *pcm_data;       /* Decompressed 16-bit signed PCM buffer */
-    int         loop;           /* Loop flag */
+    int         loop;           /* Loop flag: 1 = looping, 0 = one-shot */
+    uint32_t    loop_start;     /* Loop start sample index */
+    uint32_t    loop_end;       /* Loop end sample index */
+    uint16_t    pitch_reg;      /* Raw Yamaha AICA OCT/FNS register */
 } SND_Vita_Sample;
 
 /* Sound Bank Container (e.g. FIX.OSB, BNK_xx.OSB) */
@@ -78,12 +85,16 @@ typedef struct SND_Vita_Voice {
     uint32_t            sound_id;
     const int16_t      *pcm_data;
     uint32_t            num_samples;
+    uint32_t            sample_rate;     /* Native sample rate (typically 22050 or 24000 Hz) */
     uint32_t            sample_pos;      /* Current integer sample index */
     uint32_t            sample_pos_frac; /* 16.16 fixed-point fractional accumulator */
-    uint32_t            rate_step;       /* Resampling step: (sample_rate << 16) / 44100 */
+    uint32_t            rate_step;       /* Resampling step: (sample_rate * pitch << 16) / output_rate */
     float               volume;          /* 0.0f (silent) to 1.0f (full) */
     float               pan;             /* -1.0f (full left) to +1.0f (full right) */
+    float               pitch;           /* Pitch scale (1.0f = normal) */
     int                 loop;
+    uint32_t            loop_start;
+    uint32_t            loop_end;
 } SND_Vita_Voice;
 
 /* Streaming Background Music (BGM) Channel */
@@ -96,12 +107,15 @@ typedef struct SND_Vita_BGM {
 
     int16_t            *pcm_data;        /* Decoded PCM16 stereo/mono buffer */
     uint32_t            num_frames;      /* Total frames in buffer */
-    uint32_t            sample_rate;     /* Input sample rate (e.g. 22050 or 44100) */
+    uint32_t            sample_rate;     /* Input sample rate (e.g. 22050, 44100, 48000) */
     uint32_t            current_frame;   /* Current integer playback frame */
     uint32_t            frame_frac;      /* 16.16 fractional accumulator */
-    uint32_t            rate_step;       /* Resampling step: (sample_rate << 16) / 44100 */
+    uint32_t            rate_step;       /* Resampling step: (sample_rate << 16) / output_rate */
     int                 channels;        /* 1 = mono, 2 = stereo */
     char                track_name[128]; /* Currently playing track name */
+    float               fade_target;     /* Fade target volume (0.0f..1.0f) */
+    float               fade_speed;      /* Volume change per second */
+    int                 fading;          /* 1 if active volume fade in progress */
 } SND_Vita_BGM;
 
 /* ----------------------------------------------------------------------------
@@ -148,7 +162,7 @@ void    SND_Vita_DecodeAICA_Stereo(const uint8_t *src, int16_t *dst, uint32_t nu
 
 /**
  * @brief Initializes the PS Vita audio subsystem, allocates voice pools,
- *        and spawns the dedicated high-priority audio worker thread.
+ *        creates thread mutex, and spawns the dedicated high-priority audio worker thread.
  * @return 0 on success, negative error code on failure.
  */
 int     SND_Vita_Init(void);
@@ -164,6 +178,27 @@ void    SND_Vita_Shutdown(void);
  * @return 1 if initialized, 0 otherwise.
  */
 int     SND_Vita_IsInitialized(void);
+
+/**
+ * @brief Locks the audio subsystem mutex for thread-safe parameter updates.
+ */
+void    SND_Vita_Lock(void);
+
+/**
+ * @brief Unlocks the audio subsystem mutex.
+ */
+void    SND_Vita_Unlock(void);
+
+/**
+ * @brief Gets current output hardware sample rate (typically 48000 or 44100).
+ */
+uint32_t SND_Vita_GetOutputSampleRate(void);
+
+/**
+ * @brief Configures the mixer output sample rate (48000 or 44100 Hz).
+ * @param rate Target output rate.
+ */
+void    SND_Vita_SetOutputSampleRate(uint32_t rate);
 
 /* Audio thread function */
 #if defined(__vita__)
@@ -200,9 +235,47 @@ void    SND_Vita_UnloadBank(void);
  */
 void    SND_Vita_UnloadFixBank(void);
 
+/**
+ * @brief Retrieves the sound entry count for a given bank.
+ */
+uint32_t SND_Vita_GetBankSoundCount(const SND_Vita_Bank *pBank);
+
+/**
+ * @brief Retrieves a pointer to a specific sample entry in a bank.
+ */
+const SND_Vita_Sample *SND_Vita_GetBankSound(const SND_Vita_Bank *pBank, uint32_t sound_id);
+
 /* ----------------------------------------------------------------------------
  * 7. Sound Effects & Music Playback Control
  * ---------------------------------------------------------------------------- */
+
+/**
+ * @brief Retrieves the sound descriptor for a given sound ID.
+ *        Searches level bank first, then FIX bank.
+ * @param ulSoundId Sound index.
+ * @return Pointer to SND_Vita_Sample descriptor or NULL if not found.
+ */
+const SND_Vita_Sample *SND_Vita_GetSoundDescriptor(uint32_t ulSoundId);
+
+/**
+ * @brief Retrieves the sound descriptor from a specific bank.
+ * @param bLevelBank 1 for level bank, 0 for FIX bank.
+ * @param ulSoundId  Sound index.
+ * @return Pointer to SND_Vita_Sample descriptor or NULL if not found.
+ */
+const SND_Vita_Sample *SND_Vita_GetBankSoundDescriptor(int bLevelBank, uint32_t ulSoundId);
+
+/**
+ * @brief Plays a sound effect with volume, pan, pitch scale, and loop control.
+ *
+ * @param ulSoundId Sound index in the bank.
+ * @param fVolume   Voice volume (0.0f silent to 1.0f full).
+ * @param fPan      Stereo panning (-1.0f left, 0.0f center, +1.0f right).
+ * @param fPitch    Pitch scale (1.0f = normal pitch).
+ * @param bLoop     1 to loop, 0 for one-shot.
+ * @return Allocated voice index (0..15), or -1 if no voice could be assigned.
+ */
+int     SND_Vita_PlaySoundEx(uint32_t ulSoundId, float fVolume, float fPan, float fPitch, int bLoop);
 
 /**
  * @brief Triggers a sound effect voice using a bank-relative Sound ID.
@@ -216,6 +289,37 @@ void    SND_Vita_UnloadFixBank(void);
 int     SND_Vita_PlaySound(uint32_t ulSoundId, float fVolume, float fPan);
 
 /**
+ * @brief Updates voice pan (Dreamcast driver cmd 0x15).
+ * @param voice_index Voice handle (0..15).
+ * @param fPan        Pan (-1.0f full left, 0.0f center, +1.0f full right).
+ */
+void    SND_Vita_SetVoicePan(int voice_index, float fPan);
+
+/**
+ * @brief Updates voice volume (Dreamcast driver cmd 0x16).
+ * @param voice_index Voice handle (0..15).
+ * @param fVolume     Volume (0.0f silent, 1.0f full).
+ */
+void    SND_Vita_SetVoiceVolume(int voice_index, float fVolume);
+
+/**
+ * @brief Updates voice pitch / frequency scale (Dreamcast driver cmd 0x18).
+ * @param voice_index Voice handle (0..15).
+ * @param fPitch      Pitch multiplier (e.g. 1.0f = normal, 1.5f = +50%, 0.5f = half speed).
+ */
+void    SND_Vita_SetVoicePitch(int voice_index, float fPitch);
+
+/**
+ * @brief Emulates Dreamcast MANATEE driver command dispatch (cmds 0x11, 0x12, 0x15, 0x16, 0x18).
+ * @param uCmd    Command opcode (0x11=KeyOn, 0x12=KeyOff/Stop, 0x15=Pan, 0x16=Volume, 0x18=Pitch).
+ * @param uHandle Voice handle slot (0..15).
+ * @param lParam1 First parameter (e.g. Sound ID for 0x11, Pan/Vol/Pitch for 0x15/0x16/0x18).
+ * @param lParam2 Second parameter (e.g. flags/extra for 0x11).
+ * @return 0 on success, negative error code on failure.
+ */
+int     SND_Vita_SendCommand(uint8_t uCmd, uint8_t uHandle, int32_t lParam1, int32_t lParam2);
+
+/**
  * @brief Stops a specific SFX voice immediately.
  * @param voice_index Voice index (0..15).
  */
@@ -227,13 +331,60 @@ void    SND_Vita_StopVoice(int voice_index);
 void    SND_Vita_StopAllVoices(void);
 
 /**
- * @brief Starts streaming playback of a background music track (.DCZ or .WAV).
+ * @brief Queries voice playback progress and active state.
+ */
+void    SND_Vita_GetVoiceStatus(int voice_index, int *pActive, uint32_t *pPos, uint32_t *pTotal);
+
+/**
+ * @brief Checks if a voice handle is actively playing.
+ * @param voice_index Voice handle (0..15).
+ * @return 1 if active and playing, 0 if idle/finished.
+ */
+int     SND_Vita_IsVoicePlaying(int voice_index);
+
+/**
+ * @brief Returns the number of currently active SFX voice channels.
+ * @return Count of active voices (0..16).
+ */
+int     SND_Vita_GetActiveVoiceCount(void);
+
+/**
+ * @brief Advances streaming BGM state, updates volume fades, and maintains stream buffers.
+ * @param fDeltaTime Time elapsed since last tick in seconds.
+ */
+void    SND_Vita_TickBGM(float fDeltaTime);
+
+/**
+ * @brief Initiates a smooth BGM volume fade.
+ * @param fTargetVolume Target volume level (0.0f .. 1.0f).
+ * @param fFadeDuration Duration of fade in seconds (> 0).
+ */
+void    SND_Vita_FadeBGM(float fTargetVolume, float fFadeDuration);
+
+/**
+ * @brief Gets current streaming BGM playback status.
+ * @return 1 if playing, 0 if stopped/idle, -1 if paused.
+ */
+int     SND_Vita_GetBGMStatus(void);
+
+/**
+ * @brief Starts streaming playback of a background music track (.DCZ archive or .WAV).
  *
- * @param szMusicTrack Track filename or relative path (e.g. "NA.DCZ", "SILENST.WAV").
+ * @param szMusicTrack Track filename or path (e.g. "NA.DCZ", "SILENST.WAV").
  * @param bLoop        1 to loop seamlessly upon reaching track end, 0 to play once.
  * @return 0 on success, negative on failure.
  */
 int     SND_Vita_PlayMusic(const char *szMusicTrack, int bLoop);
+
+/**
+ * @brief Starts streaming playback of a specific subtrack within a DCZ container.
+ *
+ * @param szMusicContainer Container filename (e.g. "NA.DCZ").
+ * @param subtrack_index   0-based subtrack index within the DCZ archive.
+ * @param bLoop            1 to loop seamlessly, 0 to play once.
+ * @return 0 on success, negative on failure.
+ */
+int     SND_Vita_PlayMusicSubtrack(const char *szMusicContainer, uint32_t subtrack_index, int bLoop);
 
 /**
  * @brief Stops BGM playback and unloads current music buffer.
@@ -260,15 +411,17 @@ void    SND_Vita_SetSFXVolume(float fVolume);
 float   SND_Vita_GetMasterVolume(void);
 float   SND_Vita_GetBGMVolume(void);
 float   SND_Vita_GetSFXVolume(void);
+float   SND_Vita_GetBGMChannelVolume(void);
 
 /* ----------------------------------------------------------------------------
  * 9. Multi-Channel Mixer Core
  * ---------------------------------------------------------------------------- */
 
 /**
- * @brief Mixes the BGM channel and 16 active SFX voices into a 1024-frame stereo buffer.
- *        Performs linear interpolation resampling to 44.1 kHz, volume scaling,
- *        stereo panning, and 16-bit signed clipping [-32768, 32767].
+ * @brief Mixes the BGM channel and 16 active SFX voices into a stereo frame buffer.
+ *        Performs integer linear interpolation resampling, volume scaling,
+ *        Dreamcast Yamaha AICA DIPAN stereo panning, and 16-bit signed clipping [-32768, 32767].
+ *        Uses ARM NEON vector instructions when available.
  *
  * @param out_samples Interleaved 16-bit stereo PCM buffer (size >= num_frames * 2).
  * @param num_frames  Number of stereo frames to mix (standard: 1024).

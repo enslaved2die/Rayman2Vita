@@ -268,6 +268,122 @@ static bool test_mixer_panning_and_voices(void) {
 }
 
 /* ============================================================================
+ * Test 5: Advanced SOSB (Looping, Large Offsets > 64KB) & DIPAN Law Verification
+ * ============================================================================ */
+static bool test_advanced_sosb_and_dipan(void) {
+    printf(COLOR_BOLD "=== Test 5: Advanced SOSB (Looping & >64KB Offsets) & DIPAN Law ===" COLOR_RESET "\n");
+
+    /* Ensure only FIX.OSB is active to test FIX sound IDs */
+    SND_Vita_UnloadBank();
+    SND_Vita_LoadFixBank();
+
+    /* Sound 0 in FIX.OSB is one-shot (loop=0) */
+    int v0 = SND_Vita_PlaySound(0, 1.0f, 0.0f);
+    assert(v0 >= 0);
+    int active = 0; uint32_t pos = 0, total = 0;
+    SND_Vita_GetVoiceStatus(v0, &active, &pos, &total);
+    assert(active == 1);
+    assert(total == 6059);
+    SND_Vita_StopVoice(v0);
+    printf(" - Sound #0 (One-Shot): total_samples=%u, active=%d [OK]\n", total, active);
+
+    /* Sound 1 in FIX.OSB is looping (b5=3 -> loop=1, 15499 samples) */
+    int v1 = SND_Vita_PlaySound(1, 1.0f, 0.0f);
+    assert(v1 >= 0);
+    SND_Vita_GetVoiceStatus(v1, &active, &pos, &total);
+    assert(active == 1);
+    assert(total == 15499);
+    SND_Vita_StopVoice(v1);
+    printf(" - Sound #1 (Looping): total_samples=%u, active=%d [OK]\n", total, active);
+
+    /* Sound 8 in FIX.OSB is at offset 0x011dd0 (>64KB, requires desc[4] high byte) */
+    int v8 = SND_Vita_PlaySound(8, 1.0f, 0.0f);
+    assert(v8 >= 0);
+    SND_Vita_GetVoiceStatus(v8, &active, &pos, &total);
+    assert(active == 1);
+    assert(total == 10881);
+    int16_t mix_buf[1024 * 2];
+    SND_Vita_MixStereoBuffer(mix_buf, 1024);
+    int64_t v8_energy = 0;
+    for (int i = 0; i < 2048; i++) v8_energy += abs(mix_buf[i]);
+    printf(" - Sound #8 (>64KB offset): total_samples=%u, energy=%lld [OK]\n", total, (long long)v8_energy);
+    assert(v8_energy > 0);
+    SND_Vita_StopVoice(v8);
+
+    /* Sound 200 in FIX.OSB is at offset 0x0bb190 (>700KB) */
+    int v200 = SND_Vita_PlaySound(200, 1.0f, 0.0f);
+    assert(v200 >= 0);
+    SND_Vita_GetVoiceStatus(v200, &active, &pos, &total);
+    assert(active == 1);
+    assert(total == 10111);
+    SND_Vita_MixStereoBuffer(mix_buf, 1024);
+    int64_t v200_energy = 0;
+    for (int i = 0; i < 2048; i++) v200_energy += abs(mix_buf[i]);
+    printf(" - Sound #200 (>700KB offset): total_samples=%u, energy=%lld [OK]\n", total, (long long)v200_energy);
+    assert(v200_energy > 0);
+    SND_Vita_StopVoice(v200);
+
+    /* 2. Verify Dreamcast DIPAN Panning Law (3 dB attenuation curve) */
+    /* Pan = -0.5f */
+    SND_Vita_StopAllVoices();
+    SND_Vita_PlaySound(0, 1.0f, -0.5f);
+    SND_Vita_MixStereoBuffer(mix_buf, 1024);
+    int64_t e_l_neg = 0, e_r_neg = 0;
+    for (int i = 0; i < 1024; i++) {
+        e_l_neg += abs(mix_buf[i * 2 + 0]);
+        e_r_neg += abs(mix_buf[i * 2 + 1]);
+    }
+    printf(" - DIPAN Pan=-0.5f: Left Energy=%lld, Right Energy=%lld (ratio=%.3f)\n",
+           (long long)e_l_neg, (long long)e_r_neg, (double)e_r_neg / (double)e_l_neg);
+    assert(e_l_neg > e_r_neg);
+    assert(e_r_neg > 0);
+
+    /* Pan = +0.5f */
+    SND_Vita_StopAllVoices();
+    SND_Vita_PlaySound(0, 1.0f, 0.5f);
+    SND_Vita_MixStereoBuffer(mix_buf, 1024);
+    int64_t e_l_pos = 0, e_r_pos = 0;
+    for (int i = 0; i < 1024; i++) {
+        e_l_pos += abs(mix_buf[i * 2 + 0]);
+        e_r_pos += abs(mix_buf[i * 2 + 1]);
+    }
+    printf(" - DIPAN Pan=+0.5f: Left Energy=%lld, Right Energy=%lld (ratio=%.3f)\n",
+           (long long)e_l_pos, (long long)e_r_pos, (double)e_l_pos / (double)e_r_pos);
+    assert(e_r_pos > e_l_pos);
+    assert(e_l_pos > 0);
+    assert(e_l_neg == e_r_pos); /* Perfect stereo symmetry */
+    assert(e_r_neg == e_l_pos);
+
+    /* 3. Dynamic Output Rate Configuration (48.0 kHz MAIN vs 44.1 kHz BGM) */
+    SND_Vita_SetOutputSampleRate(SND_VITA_RATE_44100);
+    assert(SND_Vita_GetOutputSampleRate() == SND_VITA_RATE_44100);
+    SND_Vita_MixStereoBuffer(mix_buf, 1024);
+
+    SND_Vita_SetOutputSampleRate(SND_VITA_RATE_48000);
+    assert(SND_Vita_GetOutputSampleRate() == SND_VITA_RATE_48000);
+    SND_Vita_MixStereoBuffer(mix_buf, 1024);
+    printf(" - Dynamic Output Sample Rate (44.1 kHz vs 48.0 kHz): PASS [OK]\n");
+
+    /* 4. DCZ Subtrack Playback */
+    int res_sub0 = SND_Vita_PlayMusicSubtrack("assets/dc/DCDATA/SOUND/MUSIC/NA.DCZ", 0, 1);
+    assert(res_sub0 == 0);
+    SND_Vita_MixStereoBuffer(mix_buf, 1024);
+
+    int res_sub1 = SND_Vita_PlayMusicSubtrack("assets/dc/DCDATA/SOUND/MUSIC/NA.DCZ", 1, 1);
+    assert(res_sub1 == 0);
+    SND_Vita_MixStereoBuffer(mix_buf, 1024);
+    int64_t sub1_energy = 0;
+    for (int i = 0; i < 2048; i++) sub1_energy += abs(mix_buf[i]);
+    printf(" - DCZ Subtrack selection (Track #1): energy=%lld [OK]\n", (long long)sub1_energy);
+    assert(sub1_energy > 0);
+    SND_Vita_StopMusic();
+
+    SND_Vita_StopAllVoices();
+    printf(COLOR_GREEN "Advanced SOSB & DIPAN law verification: PASS [OK]" COLOR_RESET "\n\n");
+    return true;
+}
+
+/* ============================================================================
  * Main Test Runner
  * ============================================================================ */
 int main(int argc, char **argv) {
@@ -291,6 +407,7 @@ int main(int argc, char **argv) {
     all_passed &= test_sound_bank_osb();
     all_passed &= test_bgm_streamer();
     all_passed &= test_mixer_panning_and_voices();
+    all_passed &= test_advanced_sosb_and_dipan();
 
     /* Clean shutdown */
     SND_Vita_Shutdown();
