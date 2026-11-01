@@ -40,6 +40,108 @@
 #endif
 
 /* ----------------------------------------------------------------------------
+ * Weak Compatibility Shims (Active when os_vita.c / vfs_vita.c are not linked)
+ * ---------------------------------------------------------------------------- */
+__attribute__((weak)) void *CPA_malloc(size_t size) {
+    return malloc(size);
+}
+
+__attribute__((weak)) void *CPA_calloc(size_t num, size_t size) {
+    return calloc(num, size);
+}
+
+__attribute__((weak)) void CPA_free(void *ptr) {
+    free(ptr);
+}
+
+static void snd_log_internal(const char *prefix, const char *fmt, va_list ap) {
+    char buf[512];
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+#if defined(__vita__)
+    sceClibPrintf("%s %s\n", prefix, buf);
+#else
+    fprintf(stderr, "%s %s\n", prefix, buf);
+#endif
+}
+
+__attribute__((weak)) void OS_Vita_LogInfo(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    snd_log_internal("[SND][INFO]", fmt, ap);
+    va_end(ap);
+}
+
+__attribute__((weak)) void OS_Vita_LogWarn(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    snd_log_internal("[SND][WARN]", fmt, ap);
+    va_end(ap);
+}
+
+__attribute__((weak)) void OS_Vita_LogError(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    snd_log_internal("[SND][ERROR]", fmt, ap);
+    va_end(ap);
+}
+
+/* Fallback weak symbol when recomp io.c is not linked */
+__attribute__((weak)) int hle_io_resolve(const char *dir, const char *name, char *out, size_t cap) {
+    (void)dir; (void)name; (void)out; (void)cap;
+    return -1;
+}
+
+__attribute__((weak)) void *CPA_LoadFile(const char *filename, size_t *out_size) {
+    if (!filename) return NULL;
+    char resolved[1024];
+    FILE *f = NULL;
+
+    if (hle_io_resolve(NULL, filename, resolved, sizeof(resolved)) == 0) {
+        f = fopen(resolved, "rb");
+    }
+
+    if (!f) {
+        f = fopen(filename, "rb");
+    }
+#if defined(CPA_PLATFORM_VITA) || defined(__vita__)
+    if (!f) {
+        snprintf(resolved, sizeof(resolved), "ux0:data/rayman2/%s", filename);
+        f = fopen(resolved, "rb");
+    }
+    if (!f) {
+        snprintf(resolved, sizeof(resolved), "app0:%s", filename);
+        f = fopen(resolved, "rb");
+    }
+#endif
+
+    if (!f) return NULL;
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(f);
+        return NULL;
+    }
+
+    void *buf = malloc((size_t)sz);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+
+    fclose(f);
+    if (out_size) *out_size = (size_t)sz;
+    return buf;
+}
+
+/* ----------------------------------------------------------------------------
  * 1. Yamaha AICA ADPCM Adaptation & Quantization Tables
  * ---------------------------------------------------------------------------- */
 static const int16_t s_aica_step_table[89] = {
@@ -317,8 +419,7 @@ static uint8_t *SND_LoadFileBuffer(const char *path, size_t *pOutSize) {
         return (uint8_t *)buf;
     }
 
-#if !defined(__vita__)
-    /* 2. Direct storage load for host unit tests */
+    /* 2. Direct storage load fallback */
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
 
@@ -346,9 +447,6 @@ static uint8_t *SND_LoadFileBuffer(const char *path, size_t *pOutSize) {
 
     if (pOutSize) *pOutSize = (size_t)fsz;
     return data;
-#else
-    return NULL;
-#endif
 }
 
 /* ----------------------------------------------------------------------------
