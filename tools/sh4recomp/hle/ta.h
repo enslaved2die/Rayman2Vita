@@ -166,6 +166,7 @@ typedef struct TaBatch {
 typedef struct TaGl {
     TaGlVertex *verts; uint32_t nverts;
     TaBatch *batches; uint32_t nbatches;
+    uint32_t capverts, capbatches;    /* allocated capacity (kept across ta_build_gl_reuse calls) */
     uint32_t list_first[TA_NUM_LISTS], list_count[TA_NUM_LISTS];  /* batch index ranges per list type (batches are grouped by list) */
 } TaGl;
 /* Convert strips -> triangle lists (even/odd winding corrected so a fixed cull mode works), sprites -> 2 tris,
@@ -178,11 +179,14 @@ void ta_gl_free(TaGl *g);
  * optional Sutherland-Hodgman clipping to the rectangle [clip_x0,clip_x1]x[clip_y0,clip_y1] done on the screen-linear quantities
  * (x, y, 1/W, u/W, v/W, colours), which is exact for the PVR's interpolation model.  Triangles with a non-finite coordinate or 1/W <= 0 are dropped.
  * Vertex alpha is adjusted to the TSP shading mode (modulate (1) = texture alpha only -> vertex alpha forced to 1) and use-alpha=0 forces 1. */
-typedef struct TaBuildOpts { int cull; int clip; float clip_x0, clip_y0, clip_x1, clip_y1; } TaBuildOpts;
+typedef struct TaBuildOpts { int cull; int clip; float clip_x0, clip_y0, clip_x1, clip_y1; int exact_merge; } TaBuildOpts;   /* exact_merge: 1 = merge only strips with identical header words (old behaviour) in every list */
 int  ta_build_gl_ex(const TaFrame *f, TaGl *out, const TaBuildOpts *o);
+/* Same, but `out` is zero-initialised once by the caller and re-used for every frame: its arrays keep their capacity (no per-frame malloc/free). Release with ta_gl_free. */
+int  ta_build_gl_reuse(const TaFrame *f, TaGl *out, const TaBuildOpts *o);
 /* Robust upper bound of "scene" 1/W: the largest vertex 1/W that is <= 64 * median 1/W (UI quads at z=512 and degenerate near-plane vertices are
  * above it).  Depth is mapped zwin = 0.98 * invW / cut for invW <= cut and outliers are clamped to 0.995. [ASSUMED heuristic] */
-float ta_gl_depth_cut(const TaGl *g);
+float ta_gl_depth_cut(const TaGl *g);        /* median from 64 samples (insertion sort), no allocation */
+float ta_gl_depth_cut_ref(const TaGl *g);    /* exact median via qsort (reference for tests) */
 
 /* ---- screen-space (x, y, 1/W) -> GL clip space with perspective-correct varyings ----
  * The TA hands over already projected vertices: x,y in pixels, z = 1/W.  PVR interpolates 1/W, u/W, v/W linearly in screen space and divides per pixel.
@@ -211,6 +215,11 @@ int  ta_tex_decode(const uint8_t *vram, uint32_t vram_size, uint32_t tcw, uint32
  * fog alpha = lerp(table[idx] >> 8, table[idx] & 255, frac(m)) / 255 (table entry: high byte = value at idx, low byte = value at idx+1 [PROVEN: entry n low byte == entry n+1 high byte in the game's table]).
  * Result colour = lerp(colour, FOG_COL_RAM, alpha) [DOC; the formula follows the public PVR docs / emulators as remembered]. */
 float ta_fog_alpha(float inv_w, uint32_t fog_density, const uint32_t table[128]);
+float ta_fog_alpha_ref(float inv_w, uint32_t fog_density, const uint32_t table[128]);   /* original log2f/floorf version (tests) */
+
+/* ---- texture cache helpers ---- */
+uint32_t ta_tex_byte_len(uint32_t tcw, uint32_t tsp);     /* conservative byte length of the texture data in VRAM at tcw*8 (pixels + mip chain + VQ codebook) */
+uint32_t ta_hash_bytes(const void *data, uint32_t n);      /* 4-lane multiplicative content hash */
 
 /* ---- 16:9 mode (ta_hle.c) ---- the game's own "MODE 16/9" renders the scene with a wider FOV and squeezes all x by 1/k about x=320 (k patched to 4/3);
  * renderers un-squeeze by mapping the 640x480 screen space onto the whole 16:9 display.  hle_ta_wide_active() = game currently in 16:9 mode (valid per frame). */

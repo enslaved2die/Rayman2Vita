@@ -317,12 +317,125 @@ static void test_fog(void)
     CHECK(a >= 0.0f && a <= 199.0f / 255.0f);
 }
 
+
+/* ---- fog: bit-extraction ta_fog_alpha vs the original log2f/floorf implementation ---- */
+static uint32_t xs = 12345u; static uint32_t rnd(void) { xs ^= xs << 13; xs ^= xs >> 17; xs ^= xs << 5; return xs; }
+static void test_fog_exact(void)
+{
+    static uint32_t tabs[4][128];
+    for (int i = 0; i < 128; i++) { tabs[0][i] = 0; tabs[3][i] = 0xFFFFu; }
+    for (int i = 0; i < 12; i++) tabs[0][i] = 0xc7c7u;
+    tabs[0][12] = 0xc7bfu; tabs[0][13] = 0xbfb5u; tabs[0][14] = 0xb5abu;
+    for (int i = 0; i < 128; i++) { uint32_t a = (uint32_t)(255 - 2 * i) & 255, b = (uint32_t)(255 - 2 * i - 2) & 255; tabs[1][i] = (a << 8) | b; }          /* linear ramp */
+    for (int i = 0; i < 128; i++) tabs[2][i] = rnd() & 0xFFFFu;                                                                                       /* random */
+    static const uint32_t dens[] = { 0xff0a, 0x8004, 0xff00, 0x8000, 0x8101, 0xc0fe, 0x8007, 0xff80, 0x0100, 0xff7f, 0xa0fd, 0x0000 };
+    uint64_t n = 0, mism = 0; double maxd = 0;
+    for (int t = 0; t < 4; t++) for (unsigned d = 0; d < sizeof dens / sizeof *dens + 40; d++) {
+        uint32_t den = d < sizeof dens / sizeof *dens ? dens[d] : (rnd() & 0xFFFFu);
+        float mult = (float)((den >> 8) & 255) / 128.0f * ldexpf(1.0f, (int8_t)(den & 255));
+        if (!(mult > 0.f) || !isfinite(mult)) mult = 1.f;
+        float inw[4096 + 1]; int ni = 0;
+        for (int i = 0; i < 4096; i++) {                                           /* z sweep 0..300 (inv_w = z / mult), random exponents, and +-64 ulps around every power of two */
+            float z = (float)i * (300.0f / 4096.0f) + 1e-3f * (float)(rnd() & 7);
+            inw[ni++] = z / mult;
+        }
+        for (int i = 0; i < ni; i++) { float a = ta_fog_alpha(inw[i], den, tabs[t]), b = ta_fog_alpha_ref(inw[i], den, tabs[t]); n++; if (a != b) { mism++; double dd = fabs((double)a - b); if (dd > maxd) maxd = dd; } }
+        for (int e = 0; e <= 8; e++) for (int u = -64; u <= 64; u++) {
+            float z = ldexpf(1.0f, e); uint32_t bits = F(z) + (uint32_t)u; float zz; memcpy(&zz, &bits, 4);
+            float x = zz / mult; float a = ta_fog_alpha(x, den, tabs[t]), b = ta_fog_alpha_ref(x, den, tabs[t]); n++; if (a != b) { mism++; double dd = fabs((double)a - b); if (dd > maxd) maxd = dd; }
+        }
+        for (int i = 0; i < 20000; i++) {                                          /* dense: every float bit pattern class: random positive floats incl. denormal/inf/nan */
+            uint32_t bits = rnd(); if (i % 5 == 0) bits &= 0x7FFFFFFFu; float x; memcpy(&x, &bits, 4);
+            float a = ta_fog_alpha(x, den, tabs[t]), b = ta_fog_alpha_ref(x, den, tabs[t]); n++;
+            if (a != b && !(a != a && b != b)) { mism++; double dd = fabs((double)a - b); if (dd > maxd) maxd = dd; }
+        }
+    }
+    printf("fog bit-extraction vs reference: %llu inputs, %llu differ, max abs diff %.3g\n", (unsigned long long)n, (unsigned long long)mism, maxd);
+    CHECK(maxd < 1e-5);                                                            /* documented: only log2f-rounds-up-at-power-of-two cases may differ, by < 1e-5 */
+}
+
+/* ---- depth cut: 64-sample median vs exact (qsort) ---- */
+static void test_depth_cut(void)
+{
+    uint64_t same = 0, tot = 0; double maxrel = 0;
+    for (int trial = 0; trial < 400; trial++) {
+        uint32_t nv = trial < 100 ? 3u * (1 + rnd() % 21) : 3u * (30 + rnd() % 4000);
+        TaGl g; memset(&g, 0, sizeof g); g.verts = calloc(nv, sizeof(TaGlVertex)); g.nverts = nv;
+        float scale = powf(10.f, (float)(int)(rnd() % 5) - 4.f);
+        for (uint32_t i = 0; i < nv; i++) {
+            float z = scale * (0.0005f + (rnd() & 0xFFFF) / 65536.0f * (trial % 3 == 0 ? 1.f : (float)(1 << (rnd() % 10))));
+            if (rnd() % 50 == 0) z = 512.f;                                  /* UI quads */
+            if (rnd() % 97 == 0) z = -1.f;                                   /* invalid */
+            g.verts[i].z = z;
+        }
+        float a = ta_gl_depth_cut(&g), b = ta_gl_depth_cut_ref(&g);
+        tot++; if (a == b) same++; else { double r = fabs((double)a - b) / fabs((double)b); if (r > maxrel) maxrel = r; }
+        CHECK(a == b);                                                        /* exact median selection: identical to the qsort reference */
+        free(g.verts);
+    }
+    printf("depth cut (histogram selection) vs qsort reference: %llu/%llu identical, max rel diff of the others %.3g\n", (unsigned long long)same, (unsigned long long)tot, maxrel);
+    CHECK(same == tot);
+    TaGl e; memset(&e, 0, sizeof e); CHECK(ta_gl_depth_cut(&e) == 1.f);
+}
+
+/* ---- strip merging: relaxed same_draw_state (opaque/punch) vs exact_merge ---- */
+static void mk_strip(TaFrame *f, int list, uint32_t ctl_extra, uint32_t isp, uint32_t tsp, uint32_t tcw, int tex, int clip, float x0)
+{
+    uint32_t h[8] = { 0 }; h[0] = ((uint32_t)list << 24) | (tex ? 8u : 0u) | ctl_extra | (clip ? (1u << 23) | ((uint32_t)clip << 16) : 0u); h[1] = isp; h[2] = tsp; h[3] = tcw;
+    if (f->nstrips >= f->capstrips) { f->capstrips = f->capstrips ? f->capstrips * 2 : 16; f->strips = realloc(f->strips, f->capstrips * sizeof(TaStrip)); }
+    if (f->nverts + 3 > f->capverts) { f->capverts = f->capverts ? f->capverts * 2 : 64; f->verts = realloc(f->verts, f->capverts * sizeof(TaVertex)); }
+    TaStrip *s = &f->strips[f->nstrips++]; memset(s, 0, sizeof *s); ta_decode_header(&s->st, h, NULL);
+    s->first = f->nverts; s->count = 3;
+    for (int k = 0; k < 3; k++) { TaVertex *v = &f->verts[f->nverts++]; memset(v, 0, sizeof *v); v->x = x0 + 10.f * (float)k; v->y = 50.f + (float)(k & 1) * 20.f; v->z = 0.01f + 0.001f * (float)f->nstrips; v->u = (float)k; v->v = 0.f; v->base[0] = v->base[1] = 1.f; }
+}
+static void test_merge(void)
+{
+    TaFrame f; memset(&f, 0, sizeof f);
+    const uint32_t ISP = (4u << 29) | 1u, TSP = 0x1Bu | (1u << 6) | (1u << 13), TCW = (1u << 27) | 0x2000u, TCW2 = (1u << 27) | 0x3000u;
+    /* opaque: A A(cull differs) A(ctl bits differ, src/dst/use_alpha differ) B A | untextured U U(cull differs) | clip change | wrap differs */
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP, TSP, TCW, 1, 0, 0);
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP | (2u << 27), TSP, TCW, 1, 0, 20);                                    /* cull mode differs: merges */
+    mk_strip(&f, TA_L_OPAQUE, 2u /*gouraud*/, ISP, TSP | (5u << 29) | (3u << 26) | (1u << 20) | (3u << 8) | (1u << 12), TCW, 1, 0, 40);   /* blend / alpha / mip-adjust / super-sample differ: merges */
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP, TSP, TCW2, 1, 0, 60);                                                /* other texture: new batch */
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP, TSP, TCW, 1, 0, 80);                                                 /* back to A: new batch (no reordering across B) */
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP, TSP, TCW, 1, 0, 100);                                                /* merges */
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP, TSP | (1u << 16), TCW, 1, 0, 120);                                   /* clamp-U differs: new batch (wrap is applied at bind time) */
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP, (TSP & ~0xC0u) | (3u << 6) | (1u << 16), TCW, 1, 0, 140);                       /* shading differs: new batch */
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP, 0, 0, 0, 0, 160);                                                    /* untextured: new batch (texture bits ignored) */
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP | (3u << 27), 0xFF3FFFC0u, 0x7FFFFFFF, 0, 0, 180);        /* untextured, other tsp/tcw/cull: merges */
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP, 0, 0, 0, 2, 200);                                                    /* user clip: new batch */
+    mk_strip(&f, TA_L_OPAQUE, 0, ISP | (1u << 26), 0, 0, 0, 2, 220);                                       /* z-write disable differs */
+    mk_strip(&f, TA_L_OPAQUE, 0, (7u << 29), 0, 0, 0, 2, 240);                                             /* depth mode differs */
+    mk_strip(&f, TA_L_OPAQUE, 0x80 /*shadow*/, (7u << 29), 0, 0, 0, 2, 260);                               /* shadow bit differs */
+    /* punch list: same state merges across differing blend bits */
+    mk_strip(&f, TA_L_PUNCH, 0, ISP, TSP, TCW, 1, 0, 0);
+    mk_strip(&f, TA_L_PUNCH, 0, ISP, TSP | (2u << 29), TCW, 1, 0, 20);
+    /* translucent: exact merge only (batches are depth-sorted as units) */
+    mk_strip(&f, TA_L_TRANS, 0, ISP, TSP, TCW, 1, 0, 0);
+    mk_strip(&f, TA_L_TRANS, 0, ISP, TSP, TCW, 1, 0, 20);                                                  /* identical: merges */
+    mk_strip(&f, TA_L_TRANS, 0, ISP | (2u << 27), TSP, TCW, 1, 0, 40);                                     /* cull differs: NOT merged in the translucent list */
+    TaBuildOpts on = { 1, 1, -2.f, -2.f, 642.f, 482.f, 0 }, oe = on; oe.exact_merge = 1;
+    TaGl gn, ge; CHECK(ta_build_gl_ex(&f, &gn, &on) == 0); CHECK(ta_build_gl_ex(&f, &ge, &oe) == 0);
+    CHECK(gn.nverts == ge.nverts && !memcmp(gn.verts, ge.verts, gn.nverts * sizeof(TaGlVertex)));          /* same triangles in the same order */
+    CHECK(gn.list_count[TA_L_OPAQUE] == 10);                                                               /* A(3 strips) B A(2) clampU shading U(2) clip zwd depth shadow */
+    printf("merge test: opaque batches exact=%u relaxed=%u, punch %u->%u, trans %u->%u\n", ge.list_count[TA_L_OPAQUE], gn.list_count[TA_L_OPAQUE], ge.list_count[TA_L_PUNCH], gn.list_count[TA_L_PUNCH], ge.list_count[TA_L_TRANS], gn.list_count[TA_L_TRANS]);
+    CHECK(gn.list_count[TA_L_PUNCH] == 1 && ge.list_count[TA_L_PUNCH] == 2);
+    CHECK(gn.list_count[TA_L_TRANS] == 2 && ge.list_count[TA_L_TRANS] == 2);
+    /* batch ranges must tile the vertex array of each list without gaps */
+    for (int l = 0; l < TA_NUM_LISTS; l++) { uint32_t exp = gn.nbatches ? gn.batches[gn.list_first[l]].first : 0; (void)exp; }
+    uint32_t pos = 0; for (uint32_t b = 0; b < gn.nbatches; b++) { CHECK(gn.batches[b].first == pos); pos += gn.batches[b].count; } CHECK(pos == gn.nverts);
+    /* reuse API: a second build into the same TaGl keeps capacity and gives the same result */
+    uint32_t cv = gn.capverts; CHECK(ta_build_gl_reuse(&f, &gn, &on) == 0); CHECK(gn.capverts == cv && gn.nverts == ge.nverts);
+    ta_gl_free(&gn); ta_gl_free(&ge); free(f.strips); free(f.verts);
+}
+
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
     test_game_strip_via_sq(); test_flat_and_untextured_float(); test_float_textured_64B_and_uv16();
     test_sprite_and_userclip(); test_intensity_and_edge();
     test_cull_clip_projection(); test_texture_decode(); test_fog();
+    test_fog_exact(); test_depth_cut(); test_merge();
 #ifdef TA_REAL
     test_real_compiler(argc > 1 ? argv[1] : "../../../../assets/dc/1ST_READ.BIN");
 #endif

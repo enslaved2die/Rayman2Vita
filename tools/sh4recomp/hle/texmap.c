@@ -6,6 +6,7 @@
  * layout by tools/ta_render.py when textures are decoded. */
 #include "hle_priv.h"
 #include "texmap.h"
+#include "ta.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -58,7 +59,7 @@ static void h_load(SH4Ctx *c) {
 void hle_ta_pvr_snapshot(uint32_t *out) {
     static const uint32_t regs[13] = { 0xA05F8108u, 0xA05F80E4u, 0xA05F811Cu, 0xA05F8098u, 0xA05F80B0u, 0xA05F80B4u, 0xA05F80B8u, 0xA05F80BCu,
                                        0xA05F80C0u, 0xA05F8078u, 0xA05F807Cu, 0xA05F8080u, 0xA05F8044u };
-    for (unsigned i = 0; i < 1024; i++) out[i] = hle_reg_get(0xA05F9000u + 4 * i);
+    memcpy(out, hle_pvr_regs() + 0x400, 1024 * sizeof(uint32_t));       /* palette RAM = words 0x400.. of the flat PVR register file */
     for (unsigned i = 0; i < 13; i++) out[1024 + i] = hle_reg_get(regs[i]);
 #if !defined(__vita__)
     { FILE *o = fopen("build_hle/pvrfog.bin", "wb"); if (o) { uint32_t ft[143]; hle_ta_fog_table(ft); float bc[3][4]; uint32_t bi = 0, bt = 0, bk = 0; hle_ta_background(bc, &bi, &bt, &bk);
@@ -67,7 +68,7 @@ void hle_ta_pvr_snapshot(uint32_t *out) {
     out[1037] = hle_reg_get(0xA05F808Cu); out[1038] = hle_reg_get(0xA05F8088u); out[1039] = hle_reg_get(0xA05F8040u);   /* ISP_BACKGND_T, ISP_BACKGND_D, BORDER_COL */
 }
 /* Fog table: 128 x 16-bit entries at 0xA05F8200 (low half of each register word). */
-void hle_ta_fog_table(uint32_t out[128]) { for (unsigned i = 0; i < 128; i++) out[i] = hle_reg_get(0xA05F8200u + 4 * i) & 0xFFFFu; }
+void hle_ta_fog_table(uint32_t out[128]) { const uint32_t *r = hle_pvr_regs() + 0x80; for (unsigned i = 0; i < 128; i++) out[i] = r[i] & 0xFFFFu; }   /* 0xA05F8200 = flat word 0x80 */
 /* Background plane (ISP_BACKGND_T/D): the game's Kamui setup writes a 3-vertex parameter into the 64-bit area at (tag_address<<2), laid out as
  * ISP, TSP, TCW, then 3 x (x, y, z, [skip words], colour) with skip = ISP_BACKGND_T[26:24] [PROVEN on the title/menu frames: 0x8080ff at 3 vertices].
  * Returns 1 and the three vertex colours as float {a,r,g,b} (valid only for untextured planes; textured ones use the colour words only if skip allows). */
@@ -107,4 +108,63 @@ void hle_texmap_init(void) {
 #endif
     hle_hook(0x8C0D6A00, h_create);
     hle_hook(0x8C0D6AC0, h_load);
+}
+
+/* ---- texture-cache validity stamps ------------------------------------------------------------------------------------------------------------------------
+ * A decoded texture stays valid as long as (a) the VRAM bytes it was decoded from and (b) for paletted formats the palette entries it uses are unchanged.  The old check hashed the
+ * texture bytes once per frame and texture (1-4 MB/frame).  Now: VRAM page epochs (boot.c) answer "was any page of this texture written since the decode" in O(pages); only if
+ * a page was written is the content hash computed, and if it still equals the stored hash the stamp is refreshed (a neighbouring texture sharing the 4 KiB page, or an identical
+ * rewrite, does not force a re-decode).  Paletted textures compare the palette epoch first and fall back to the hash of the 16/256 entries in use. */
+HleTexStats hle_texstats;
+static uint32_t tex_hash_range(uint32_t tcw, uint32_t tsp, uint32_t *off_out, uint32_t *len_out)
+{
+    uint32_t off = (tcw & 0x1FFFFFu) << 3, n = ta_tex_byte_len(tcw, tsp);
+    if (off >= (8u << 20)) { n = 0; off = 0; }
+    else if (off + n > (8u << 20)) n = (8u << 20) - off;
+    *off_out = off; *len_out = n; return n;
+}
+static uint32_t tex_content_hash(uint32_t tcw, uint32_t tsp)
+{
+    uint32_t off, n; tex_hash_range(tcw, tsp, &off, &n);
+    if (!n) return 0;
+    hle_texstats.hash_bytes += n; hle_texstats.hash_calls++;
+    return ta_hash_bytes(hle_vram_ptr() + off, n);
+}
+/* hash of the palette entries a 4bpp/8bpp texture reads + PAL_RAM_CTRL; 0 for other formats */
+static uint32_t tex_pal_hash(uint32_t tcw)
+{
+    int fmt = (int)((tcw >> 27) & 7);
+    const uint32_t *pr = hle_pvr_regs(), *pal = pr + 0x400;
+    uint32_t h = 2166136261u;
+    if (fmt == 5) { uint32_t b = ((tcw >> 21) & 63) << 4; for (uint32_t i = 0; i < 16; i++) { h ^= pal[(b + i) & 1023]; h *= 16777619u; } }
+    else if (fmt == 6) { uint32_t b = ((tcw >> 25) & 3) << 8; for (uint32_t i = 0; i < 256; i++) { h ^= pal[(b + i) & 1023]; h *= 16777619u; } }
+    else return 0;
+    hle_texstats.pal_hashes++;
+    return h ^ pr[(0x005F8108u - 0x005F8000u) >> 2];
+}
+void hle_texstamp_set(HleTexStamp *s, uint32_t tcw, uint32_t tsp)
+{
+    uint32_t off, n; tex_hash_range(tcw, tsp, &off, &n);
+    s->vram_epoch = hle_vram_max_epoch(off, n);
+    s->content_hash = tex_content_hash(tcw, tsp);
+    s->pal_epoch = hle_pvr_pal_epoch();
+    s->pal_hash = tex_pal_hash(tcw);
+}
+int hle_texstamp_valid(HleTexStamp *s, uint32_t tcw, uint32_t tsp)
+{
+    int fmt = (int)((tcw >> 27) & 7);
+    hle_texstats.checks++;
+    if (fmt == 5 || fmt == 6) {
+        uint32_t pe = hle_pvr_pal_epoch();
+        if (pe != s->pal_epoch) {
+            if (tex_pal_hash(tcw) != s->pal_hash) { hle_texstats.invalid++; return 0; }
+            s->pal_epoch = pe;
+        }
+    }
+    uint32_t off, n; tex_hash_range(tcw, tsp, &off, &n);
+    uint32_t me = hle_vram_max_epoch(off, n);
+    if (me == s->vram_epoch) { hle_texstats.epoch_hits++; return 1; }
+    if (tex_content_hash(tcw, tsp) != s->content_hash) { hle_texstats.invalid++; return 0; }
+    s->vram_epoch = me; hle_texstats.hash_same++;
+    return 1;
 }

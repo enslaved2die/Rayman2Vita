@@ -20,6 +20,7 @@
 #include "pad.h"
 #include "ta.h"
 #include "vita_gl_render.h"
+#include "texmap.h"
 #include "snd.h"
 #include <psp2/audioout.h>
 #include <psp2/io/fcntl.h>
@@ -120,6 +121,15 @@ static void vita_frame_end(SH4Ctx *c) {
                 hle_frame_count, acc_period / 299000.0, 299000000.0 / (acc_period ? acc_period : 1), acc_build / 300000.0,
                 acc_render / 300000.0, acc_swap / 300000.0, acc_ta / 300000.0, (unsigned long long)(acc_ta_n / 300), mi.uordblks >> 10, mi.arena >> 10, hle_io_lookups, hle_io_misses);
         acc_n = 0; acc_build = acc_period = acc_render = acc_swap = acc_ta = acc_ta_n = 0;
+        {   /* GL submission counters per rendered frame over this window (vita_gl_render.c): draw calls, GL state calls issued / avoided by the state cache, texture work, VRAM hashing */
+            static VitaGlPerf p0; static HleTexStats t0; VitaGlPerf p = vita_gl_perf; HleTexStats t = hle_texstats;
+            unsigned fr = p.frames - p0.frames; if (!fr) fr = 1;
+            vita_log("[vita] gl/frame: batches %u, draws %u (+%u fog), verts %u, state calls %u (%u skipped), tex binds %u params %u uploads %u | tex checks %u: epoch-hit %u hash-same %u invalid %u, hashed %u KB/frame",
+                     (p.batches - p0.batches) / fr, (p.draws - p0.draws) / fr, (p.fog_draws - p0.fog_draws) / fr, (unsigned)((p.verts - p0.verts) / fr), (p.state_calls - p0.state_calls) / fr, (p.state_skipped - p0.state_skipped) / fr,
+                     (p.tex_binds - p0.tex_binds) / fr, (p.tex_params - p0.tex_params) / fr, (p.tex_uploads - p0.tex_uploads) / fr,
+                     (unsigned)((t.checks - t0.checks) / fr), (unsigned)((t.epoch_hits - t0.epoch_hits) / fr), (unsigned)((t.hash_same - t0.hash_same) / fr), (unsigned)((t.invalid - t0.invalid) / fr), (unsigned)((t.hash_bytes - t0.hash_bytes) / fr / 1024));
+            p0 = p; t0 = t;
+        }
     }
 }
 
@@ -239,8 +249,8 @@ static int audio_thread(SceSize args, void *argp) {
         if (now - last >= 5000000) {
             SndStats st; snd_get_stats(&st);
             if (peak > gpeak) gpeak = peak;
-            vita_log("[vita] audio: frame %lu, %lu blocks, peak %d (global %d), arm_running %d, ringcmds %llu, keyon %llu, active ch %d, undef %u",
-                     hle_frame_count, blocks, peak, gpeak, st.arm_running, (unsigned long long)st.ringcmds, (unsigned long long)st.keyon, st.active_channels, st.undef_instr);
+            vita_log("[vita] audio: frame %lu, %lu blocks, peak %d (global %d), arm_running %d, ringcmds %llu, keyon %llu, active ch %d, undef %u, mix avg %u max %u us/block (budget 21333)",
+                     hle_frame_count, blocks, peak, gpeak, st.arm_running, (unsigned long long)st.ringcmds, (unsigned long long)st.keyon, st.active_channels, st.undef_instr, st.mix_us_avg, st.mix_us_max);
             peak = 0; last = now;
         }
     }

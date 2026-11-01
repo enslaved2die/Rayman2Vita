@@ -1,6 +1,6 @@
 /* snd.c - Dreamcast AICA sound system: ARM7 interpreter + AICA register file/sample generator. See snd.h and re_analysis/dc/notes_sound.md.
  *
- * Nothing in the guest is hooked: the recompiled sd library talks to wave RAM / AICA registers through MMIO, exactly as on hardware.
+ * The recompiled sd library talks to wave RAM / AICA registers through MMIO, exactly as on hardware. Guest hooks: only the stream catch-up tick (see "guest stream catch-up ticks") and two log-only taps.
  * ARM-side behaviour that is NOT modelled: DSP (reverb/effects), LFO, filter, key-rate-scaling, MIDI in/out, SCSP "stereo ADPCM", RTC,
  * AICA->SH4 interrupts (MCIPD), exact bus-wait timing of the ARM7 (it runs at a fixed ARM_CYCLES_PER_INSN cycles/instruction).
  */
@@ -22,6 +22,7 @@
  * code size in build_vita_v3; this 4 KiB of rodata moves the end of the segment. Remove only if the layout is otherwise guaranteed. */
 __attribute__((used)) static const char g_vita_layout_pad[4096] = "layout pad";
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
 typedef SceUID snd_lock_t;
 static snd_lock_t g_lk = -1;
 static void lk_init(void) { if (g_lk < 0) g_lk = sceKernelCreateMutex("snd", 0, 0, NULL); }
@@ -40,6 +41,7 @@ static int g_trace;
 static int g_evlog;                                     /* R2_SND_EV=1: per-voice key-on/off/end/loop event log */
 static uint64_t st_samples_fwd(void);
 #define EV(...) do { if (g_evlog) { fprintf(stderr, "[ev] t=%.4f ", (double)st_samples_fwd() / 44100.0); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+static int g_vdump_s;                                   /* R2_SND_VDUMP=<s>: dump every active voice every <s> seconds of AICA time (stuck/orphan voice diagnosis) */
 static int g_ringlog;                                   /* R2_SND_RING=1: log music stream ring refills vs. voice wraps */
 static uint64_t g_rw_bytes[2], g_rw_n[2], g_rw_wraps[2]; static uint32_t g_rw_lo[2], g_rw_hi[2];
 static uint64_t st_samples_fwd(void);
@@ -64,8 +66,10 @@ typedef struct {
     uint32_t ad_pos;
     int32_t  lsa_pred, lsa_step; int lsa_saved;
     int      lp_flag;
+    uint64_t t0;                 /* st_samples at key-on (voice dump) */
 } Chan;
 static Chan chn[64];
+static uint8_t g_keyed[64];       /* latched KYONB per channel (see keyonex) */
 static uint8_t g_dirty[64];       /* channel registers written since the last key-on (diagnostic) */
 static uint64_t st_restart_stale;
 
@@ -229,7 +233,7 @@ static inline uint32_t chn_reg(int ch, int r) { return aregs[(ch * 0x80 + r) >> 
 static void chan_start(int ch) {
     Chan *c = &chn[ch];
     memset(c, 0, sizeof *c);
-    c->active = 1; c->eg = 0; c->att = 1023.0f;
+    c->active = 1; c->eg = 0; c->att = 1023.0f; c->t0 = st_samples;
     uint32_t r10 = chn_reg(ch, 0x10);
     if ((r10 & 31) == 31) { c->att = 0.0f; c->eg = 1; }
     c->ad_pred = 0; c->ad_step = 127;
@@ -238,7 +242,7 @@ static void chan_start(int ch) {
     if (pcms >= 2) { c->ad_pos = 0; c->s0 = adpcm_next(c, base, lsa); c->s1 = adpcm_next(c, base, lsa); }
     else { c->s0 = chan_sample(c, 0, base, pcms); c->s1 = chan_sample(c, 1, base, pcms); }
     st_keyon++;
-    EV("KEYON ch%d pcms=%d sa=%06x lsa=%u lea=%u loop=%d rr=%u d2r=%u tl=%u dl=%u", ch, pcms, base, lsa, chn_reg(ch, 0xC) & 0xFFFF, (r0 >> 9) & 1, chn_reg(ch, 0x14) & 31, (r10 >> 11) & 31, (chn_reg(ch, 0x28) >> 8) & 255, (chn_reg(ch, 0x24) >> 8) & 15);
+    EV("KEYON ch%d pcms=%d sa=%06x lsa=%u lea=%u loop=%d rr=%u d2r=%u tl=%u dl=%u fns=%u oct=%d pan=%u", ch, pcms, base, lsa, chn_reg(ch, 0xC) & 0xFFFF, (r0 >> 9) & 1, chn_reg(ch, 0x14) & 31, (r10 >> 11) & 31, (chn_reg(ch, 0x28) >> 8) & 255, (chn_reg(ch, 0x24) >> 8) & 15, chn_reg(ch, 0x18) & 0x3FF, ((int)((chn_reg(ch, 0x18) >> 11) & 15) ^ 8) - 8, chn_reg(ch, 0x24) & 31);
     if (TRACE && pcms >= 2) {      /* decode-quality probe: statistics of the first samples (a correct ADPCM decode is ~zero-mean, not saturated) */
         Chan t; memset(&t, 0, sizeof t); t.ad_step = 127; uint32_t n = chn_reg(ch, 0xC) & 0xFFFF; if (n > 8192) n = 8192;
         double sum = 0, sq = 0; int sat = 0;
@@ -251,13 +255,22 @@ static void chan_start(int ch) {
                 ((int)((chn_reg(ch, 0x18) >> 11) & 15) ^ 8) - 8, (chn_reg(ch, 0x28) >> 8) & 255, (chn_reg(ch, 0x24) >> 8) & 15, chn_reg(ch, 0x24) & 31);
     }
 }
+/* KYONEX: latch each channel's KYONB. Key-on happens on a KYONB 0 -> 1 transition of the latched state, key-off on 1 -> 0 (Sega driver: a voice is keyed off explicitly
+ * before its channel is reused). A channel that is still latched ON but finished (sample end / EG at max) is NOT restarted by a later KYONEX for another voice: the previous
+ * code restarted every inactive channel with KYONB=1 on every KYONEX ("a finished SFX plays again whenever another sound starts"). Ignored restarts are counted/logged. */
+static uint64_t st_keyon_ignored; static int g_keyon_old;                 /* R2_SND_KEYON_OLD=1: old rule (restart every finished latched channel), A/B only */
 static void keyonex(void) {
     for (int ch = 0; ch < 64; ch++) {
         uint32_t r0 = chn_reg(ch, 0);
         int on = (r0 >> 14) & 1;
         Chan *c = &chn[ch];
-        if (on) { if (!c->active || c->eg == 3) { if (!g_dirty[ch]) { st_restart_stale++; EV("STALE_RESTART ch%d active=%d eg=%d", ch, c->active, c->eg); } g_dirty[ch] = 0; chan_start(ch); } }
-        else if (c->active && c->eg != 3) { c->eg = 3; EV("KEYOFF ch%d pos=%u att=%.0f rr=%u", ch, c->pos, c->att, chn_reg(ch, 0x14) & 31); }
+        if (on) {
+            if (!g_keyed[ch] || (g_keyon_old && (!c->active || c->eg == 3))) { g_keyed[ch] = 1; g_dirty[ch] = 0; chan_start(ch); }
+            else if (!c->active || c->eg == 3) { st_keyon_ignored++; EV("KEYON_IGNORED ch%d (latched on, active=%d eg=%d)", ch, c->active, c->eg); }
+        } else {
+            g_keyed[ch] = 0;
+            if (c->active && c->eg != 3) { c->eg = 3; EV("KEYOFF ch%d pos=%u att=%.0f rr=%u", ch, c->pos, c->att, chn_reg(ch, 0x14) & 31); }
+        }
     }
     for (int ch = 0; ch < 64; ch++) aregs[(ch * 0x80) >> 2] &= ~0x8000u;
 }
@@ -565,6 +578,7 @@ undef:
 }
 
 static void arm_reset(void) {
+    memset(g_keyed, 0, sizeof g_keyed);
     memset(&A, 0, sizeof A);
     A.cpsr = 0xD3;                                  /* SVC, I,F masked */
     A.r[15] = 0;
@@ -646,6 +660,13 @@ static void advance_locked(int n, int16_t *out) {
         if (out) { out[2 * k] = (int16_t)il; out[2 * k + 1] = (int16_t)ir; }
         if (g_wav) { int16_t p[2] = {(int16_t)il, (int16_t)ir}; fwrite(p, 2, 2, g_wav); g_wav_bytes += 4; }
         st_samples++;
+        if (g_vdump_s && (st_samples % ((uint64_t)g_vdump_s * 44100)) == 0) {
+            fprintf(stderr, "[vdump] t=%.1fs keyon=%llu ignored_keyon=%llu\n", (double)st_samples / 44100.0, (unsigned long long)st_keyon, (unsigned long long)st_keyon_ignored);
+            for (int ch = 0; ch < 64; ch++) { const Chan *c = &chn[ch]; if (!c->active) continue; uint32_t r0 = chn_reg(ch, 0), r18 = chn_reg(ch, 0x18), r24 = chn_reg(ch, 0x24);
+                fprintf(stderr, "[vdump]  ch%02d age=%.2fs latched=%d eg=%d att=%.0f pcms=%u loop=%u sa=%06x pos=%u/%u tl=%u dl=%u pan=%u fns=%u oct=%d rr=%u%s\n", ch, (double)(st_samples - c->t0) / 44100.0, g_keyed[ch], c->eg, c->att, (r0 >> 7) & 3, (r0 >> 9) & 1,
+                    (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)), c->pos, chn_reg(ch, 0xC) & 0xFFFF, (chn_reg(ch, 0x28) >> 8) & 255, (r24 >> 8) & 15, r24 & 31, r18 & 0x3FF, ((int)((r18 >> 11) & 15) ^ 8) - 8, chn_reg(ch, 0x14) & 31,
+                    (!g_keyed[ch] && c->eg == 3 && (double)(st_samples - c->t0) / 44100.0 > 8.0) ? " **KEYED OFF BUT NOT FINISHED**" : ((r0 >> 9) & 1) && c->eg != 3 && (double)(st_samples - c->t0) / 44100.0 > 8.0 && !((r0 & 0x7F) == 1 && ((chn_reg(ch, 4) & 0xFFFF) == 0x8000 || (chn_reg(ch, 4) & 0xFFFF) == 0xE000)) ? " **LONG-LOOPING**" : ""); }
+        }
         if (g_evlog && (st_samples % 2205) == 0) {
             fprintf(stderr, "[vol] t=%.2f mvol=%x mono=%d dsp[", (double)st_samples / 44100.0, aregs[0x2800 / 4] & 15, (aregs[0x2800 / 4] >> 15) & 1);
             for (int e = 0; e < 18; e++) { uint32_t w = aregs[(0x2000 + e * 4) / 4]; if (w & 0xF000) fprintf(stderr, "%d:%x/%x ", e, (w >> 12) & 15, (w >> 8) & 31); }
@@ -663,29 +684,32 @@ static void advance_locked(int n, int16_t *out) {
     }
 }
 
-/* GUEST-CLOCK driven advance. The emulated AICA/ARM7 is advanced from the guest thread to the guest-visible clock (hle_time_us), never from the
- * audio thread's own wall clock. Reason (PROVEN, see notes_sound.md section 7): the music stream rings (8192 samples = 0.37 s) are refilled by
- * the guest once per game frame; if the sample clock runs on real time while the guest runs slower than real time (Vita / Vita3K: the first
- * 5 s of a run only reached guest frame 2), the voice laps the ring several times between refills and replays stale data ("first fraction of a
- * second repeating"). With the sample clock slaved to the guest clock (and boot.c capping how much guest time one slow frame may span) the ring
- * is consumed at exactly the rate the guest produces it. In pull mode (an audio thread calls snd_mix) the generated samples go through a FIFO;
- * an empty FIFO plays silence (the guest is slower than real time) and playback re-primes before resuming.
- * Host without an audio consumer: the same advance, output goes to the WAV only. */
-#define FIFO_FRAMES 65536u                 /* ~1.5 s */
-#define FIFO_PRIME  2048u                  /* frames to accumulate before (re)starting playback after an underrun */
-static int16_t  g_fifo[FIFO_FRAMES * 2];
-static uint32_t g_fifo_rd, g_fifo_wr;      /* monotonically increasing frame counters */
-static int      g_primed;
-static uint64_t st_underruns, st_overruns, st_fifo_min = ~0ull;
-static uint64_t g_last_adv_us;
-static int g_pull_mode;
-static inline uint32_t fifo_fill(void) { return g_fifo_wr - g_fifo_rd; }
-static void fifo_push(const int16_t *in, int frames) {
-    for (int i = 0; i < frames; i++) {
-        if (fifo_fill() >= FIFO_FRAMES) { g_fifo_rd++; st_overruns++; }          /* consumer too slow: drop oldest */
-        uint32_t w = g_fifo_wr++ % FIFO_FRAMES; g_fifo[2 * w] = in[2 * i]; g_fifo[2 * w + 1] = in[2 * i + 1];
-    }
+#if !defined(__vita__)
+/* R2_SND_CALLER=1: histogram of (last entered guest function, access kind, ARAM/reg region) for every guest access to the AICA (host debugging) */
+extern uint32_t hle_ring[256][2]; extern uint32_t hle_ring_pos;
+static int g_callerlog; static struct { uint32_t fn, pr, kind, reg; uint64_t n; } g_cl[512]; static int g_cln;
+static void caller_note(uint32_t kind, uint32_t off) {
+    uint32_t fn = hle_ring[(hle_ring_pos - 1) & 255][0], pr = hle_ring[(hle_ring_pos - 1) & 255][1], reg = kind >= 2 ? off & 0xF000 : off >= 0x30000 ? 0x30000 : (off >> 12) << 12;
+    for (int i = 0; i < g_cln; i++) if (g_cl[i].fn == fn && g_cl[i].kind == kind && g_cl[i].reg == reg) { g_cl[i].n++; return; }
+    if (g_cln < 512) { g_cl[g_cln].fn = fn; g_cl[g_cln].pr = pr; g_cl[g_cln].kind = kind; g_cl[g_cln].reg = reg; g_cl[g_cln].n = 1; g_cln++; }
 }
+#define CALLER_NOTE(k, o) do { if (g_callerlog) caller_note((k), (o)); } while (0)
+#else
+#define CALLER_NOTE(k, o) do {} while (0)
+#endif
+
+/* TWO MODES.
+ * PULL MODE (an audio thread calls snd_mix: the Vita, or the host harness R2_SND_PULL): the emulated AICA/ARM7 is a REAL-TIME machine. snd_mix() advances it
+ * by exactly the number of 44.1 kHz samples the output block needs, so tempo/pitch of everything the machine plays (sequenced music, one-shot SFX, stream
+ * rings) is independent of how fast the guest runs. The guest thread never advances it and never takes a lock for the (hot) ARAM word accesses: sd talks to
+ * the ARM driver ONLY through ARAM (command ring at 0xB000, pointers at 0x13000/0x13004, status blocks, stream rings; PROVEN with R2_SND_CALLER=1: in 25 s the
+ * guest made 3 AICA register reads and 3 writes in total and ~1.1 M ARAM word stores), so plain 32-bit stores/loads + one memory barrier on the ring write
+ * pointer are enough; only the rare register writes (key-on etc.) and G2 DMA take the lock.
+ * (The older design slaved the sample clock to the guest clock: with the guest in slow motion that played the whole game in slow motion, see notes_sound.md 7/8.)
+ * LEGACY MODE (no consumer: plain host run): the machine is advanced from guest accesses to the guest-visible clock (hle_time_us) so the guest sees a live ARM;
+ * output goes to the WAV only. */
+static uint64_t g_last_adv_us;
+static volatile int g_pull_mode;
 static void wall_sync_locked(void) {
     uint64_t now = hle_time_us();                 /* guest thread only: hle_time_us is not thread safe */
     if (!g_last_adv_us) { g_last_adv_us = now; return; }
@@ -693,15 +717,39 @@ static void wall_sync_locked(void) {
     uint64_t dt = now - g_last_adv_us;
     uint64_t n = dt * 44100ull / 1000000ull;
     if (n < 32) return;
-    if (n > 8820) n = 8820;
+    if (n > 44100) n = 44100;                      /* up to 1 s of catch-up per call (was 200 ms: a long guest frame lost AICA time) */
     g_last_adv_us = now;
     if (!arm_run_flag && !st_keyon) return;       /* nothing to run before the driver exists */
-    while (n) {
-        int c = n > 512 ? 512 : (int)n; n -= (uint64_t)c;
-        if (g_pull_mode) { int16_t tmp[512 * 2]; advance_locked(c, tmp); fifo_push(tmp, c); }
-        else advance_locked(c, NULL);
-    }
+    while (n) { int c = n > 512 ? 512 : (int)n; n -= (uint64_t)c; advance_locked(c, NULL); }
 }
+
+#ifndef SND_TEST
+/* ============================================================================================================================ guest stream catch-up ticks
+ * The game's single stream engine (music AND voice-over; ctx 0x8C2D4968, see re_analysis/dc/notes_stream_hle.md) refills the two AICA rings with at most ONE 4096-byte chunk
+ * (1024 stereo frames, 46 ms of 22.05 kHz audio) per sound tick (dispatcher 0x8C0625B8 -> steady-state tick 0x8C062452 -> chunk feed 0x8C062F60), ~2 ticks per guest frame.
+ * Real time needs >= 21.5 chunks/s, so a guest below ~10 fps can not keep the rings fed however the AICA is clocked (stale 0.37 s laps replay: "music repeating/timing off").
+ * Fix (host-measured, notes_stream_hle.md section 7.1): call the original dispatcher up to 8 times per tick while the previous call actually fed a chunk and the stream is in
+ * steady state (ctx[0] == 3). The guest's own room test (0x8C0E2D50) bounds each call, so unplayed ring data is never overwritten; io.c reads complete synchronously. The fade is
+ * stepped once per steady-state call (ctx[0x16] active flag), so extra calls run with the fade disabled. R2_STREAM_CATCHUP=0 disables (A/B). */
+static int g_sf_chunks, g_sf_on = 1; static unsigned long g_sf_ticks, g_sf_extra;
+static void sf_feed(SH4Ctx *c) { g_sf_chunks++; hle_orig(c, 0x8C062F60); }
+static void sf_disp(SH4Ctx *c) {
+    const uint32_t ctx = 0x8C2D4968u; uint32_t pr = c->pr; int maxn = (g_sf_on && LD32(ctx) == 3) ? 8 : 1; uint32_t fade = 0;
+    for (int i = 0; i < maxn; i++) {
+        int n0 = g_sf_chunks; c->pr = pr;
+        if (i) { fade = LD32(ctx + 0x58); ST32(ctx + 0x58, 0); }
+        hle_orig(c, 0x8C0625B8);
+        if (i) { ST32(ctx + 0x58, fade); g_sf_extra++; }
+        if (g_sf_chunks == n0 || LD32(ctx) != 3) break;
+    }
+    g_sf_ticks++; c->pr = pr;
+}
+/* guest sd command taps (R2_SND_EV=1 log, counters): sd cmd 0x11 key-on request 0x8C0F06BC (r4 = sd handle, byte at +1 = driver handle id) and cmd 0x12 stop 0x8C0F08E4.
+ * Used to compare what the GAME asks for with what the AICA model plays (KEYON events): they must match 1:1. */
+static unsigned long st_gstart, st_gstop;
+static void sf_cmd_start(SH4Ctx *c) { st_gstart++; if (g_evlog) EV("GUEST start-cmd #%lu handle=%u args r5=%u r6=%u r7=%d", st_gstart, (unsigned)(LD8(c->r[4] + 1)), c->r[5] & 0xFF, c->r[6] & 0xFF, (int)c->r[7]); hle_orig(c, 0x8C0F06BC); }
+static void sf_cmd_stop(SH4Ctx *c) { st_gstop++; if (g_evlog) EV("GUEST stop-cmd #%lu handle=%u", st_gstop, (unsigned)(LD8(c->r[4] + 1))); hle_orig(c, 0x8C0F08E4); }
+#endif
 
 /* ============================================================================================================================ public API */
 int snd_init(int out_rate) {
@@ -716,52 +764,69 @@ int snd_init(int out_rate) {
 void snd_shutdown(void) { snd_wav_close(); }
 void snd_set_master_volume(float v) { g_master = v; }
 
-static double g_rs_pos; static float g_rs_h[2][4]; static int g_rs_have;   /* h[c][0..3] = samples at -1,0,+1,+2 around the read position */
-static float g_rs_step = 1.0f;                                  /* current playback speed (1.0 = AICA real time; < 1.0 while the guest is slower than real time) */
 static inline float cubic(const float *h, float t) {           /* Catmull-Rom between h[1] and h[2] */
     return h[1] + 0.5f * t * (h[2] - h[0] + t * (2.0f * h[0] - 5.0f * h[1] + 4.0f * h[2] - h[3] + t * (3.0f * (h[1] - h[2]) + h[3] - h[0])));
 }
-/* Consumer (audio thread). The guest-clock-driven producer (wall_sync_locked) delivers samples at guest speed, which on a slow host (Vita) is below real
- * time. Playing the FIFO at a fixed rate then alternates bursts of ~150 ms with ~120 ms of silence (PROVEN on the host with --frame-sleep-us 60000
- * R2_SND_PULL: 927 silence/sound transitions in 129 s, 41 % silent), which chops every one-shot SFX/voice into repeated fragments. Instead the read speed
- * follows the FIFO fill (full speed above FIFO_TARGET frames, proportionally slower below, floor SND_MIN_STEP), so a slow guest plays slow motion audio
- * (pitch lowered, exactly like the slow-motion game that boot.c's clock cap produces) without gaps. Above target the speed is exactly 1.0. */
-#define FIFO_TARGET 3072.0f
-#define SND_MIN_STEP 0.2f
+#define MIX_CHUNK 256                                           /* AICA samples generated per lock hold (~5.8 ms) */
+static uint64_t mix_now_us(void) {
+#if defined(__vita__)
+    return sceKernelGetProcessTimeWide();
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
+#endif
+}
+static uint64_t st_mix_calls, st_mix_us_tot, st_mix_us_max;
+static int16_t g_stage[MIX_CHUNK * 2]; static int g_stage_i, g_stage_n;      /* AICA samples generated but not yet consumed by the resampler */
+static double g_rs_pos; static float g_rs_h[2][4]; static int g_rs_have;   /* h[c][0..3] = samples at -1,0,+1,+2 around the read position */
+static void stage_refill(void) {
+    lk_lock();
+    __sync_synchronize();                                       /* see the guest's ARAM stores (ring entries before the write pointer) */
+    advance_locked(MIX_CHUNK, g_stage);
+    lk_unlock();
+    g_stage_i = 0; g_stage_n = MIX_CHUNK;
+}
+static inline void stage_next(float *l, float *r) {
+    if (g_stage_i >= g_stage_n) stage_refill();
+    *l = g_stage[2 * g_stage_i]; *r = g_stage[2 * g_stage_i + 1]; g_stage_i++;
+}
+/* Audio thread: returns the next `frames` frames at the rate given to snd_init(), advancing the machine in real (audio) time. */
 void snd_mix(int16_t *out, int frames) {
     if (!g_inited) snd_init(44100);
-    lk_lock();
-    g_pull_mode = 1;                       /* from now on the guest thread feeds the FIFO (wall_sync_locked); this thread only consumes it */
-    const double rate_ratio = 44100.0 / (double)g_out_rate;
-    for (int k = 0; k < frames; k++) {
-        uint32_t fill = fifo_fill();
-        if (!g_primed) {
-            if (fill < FIFO_PRIME) { out[2 * k] = out[2 * k + 1] = 0; continue; }
-            g_primed = 1; g_rs_have = 0; g_rs_step = 1.0f;
+    g_pull_mode = 1;
+    uint64_t t0 = mix_now_us();
+    if (g_out_rate == 44100) {
+        int done = 0;
+        while (done < frames) {
+            if (g_stage_i >= g_stage_n) stage_refill();
+            int n = g_stage_n - g_stage_i; if (n > frames - done) n = frames - done;
+            memcpy(out + 2 * done, g_stage + 2 * g_stage_i, (size_t)n * 4); g_stage_i += n; done += n;
         }
-        float tgt = (float)fill >= FIFO_TARGET ? 1.0f : (float)fill / FIFO_TARGET;
-        if (tgt < SND_MIN_STEP) tgt = SND_MIN_STEP;
-        g_rs_step += (tgt - g_rs_step) * (1.0f / 2048.0f);
-        int starved = 0;
-        while (g_rs_pos >= 1.0 || !g_rs_have) {
-            if (fifo_fill() == 0) { starved = 1; break; }
-            uint32_t r = g_fifo_rd++ % FIFO_FRAMES; int16_t nx[2] = {g_fifo[2 * r], g_fifo[2 * r + 1]};
-            for (int c = 0; c < 2; c++) { for (int j = 0; j < 3; j++) g_rs_h[c][j] = g_rs_h[c][j + 1]; g_rs_h[c][3] = nx[c]; }
-            if (g_rs_have) g_rs_pos -= 1.0; else { g_rs_have = 1; for (int c = 0; c < 2; c++) for (int j = 0; j < 3; j++) g_rs_h[c][j] = nx[c]; g_rs_pos = 0; }
+    } else {
+        const double ratio = 44100.0 / (double)g_out_rate;
+        if (!g_rs_have) {                                       /* prime the 4-tap history; read position starts between h[1] and h[2] */
+            for (int j = 0; j < 4; j++) { float l, r; stage_next(&l, &r); g_rs_h[0][j] = l; g_rs_h[1][j] = r; }
+            g_rs_pos = 0; g_rs_have = 1;
         }
-        if (starved) { g_primed = 0; st_underruns++; out[2 * k] = out[2 * k + 1] = 0; continue; }
-        for (int c = 0; c < 2; c++) { float v = cubic(g_rs_h[c], (float)g_rs_pos); out[2 * k + c] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : v); }
-        g_rs_pos += (double)g_rs_step * rate_ratio;
+        for (int k = 0; k < frames; k++) {
+            while (g_rs_pos >= 1.0) {
+                float l, r; stage_next(&l, &r);
+                for (int j = 0; j < 3; j++) { g_rs_h[0][j] = g_rs_h[0][j + 1]; g_rs_h[1][j] = g_rs_h[1][j + 1]; }
+                g_rs_h[0][3] = l; g_rs_h[1][3] = r; g_rs_pos -= 1.0;
+            }
+            for (int c = 0; c < 2; c++) { float v = cubic(g_rs_h[c], (float)g_rs_pos); out[2 * k + c] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : v); }
+            g_rs_pos += ratio;
+        }
     }
-    if (fifo_fill() < st_fifo_min) st_fifo_min = fifo_fill();
-    lk_unlock();
+    uint64_t dt = mix_now_us() - t0; st_mix_calls++; st_mix_us_tot += dt; if (dt > st_mix_us_max) st_mix_us_max = dt;
 }
 void snd_get_stats(SndStats *s) {
     lk_lock();
     memset(s, 0, sizeof *s);
     s->arm_running = arm_run_flag; s->samples = st_samples; s->arm_instr = st_arm_instr; s->arm_idle_skips = st_idle; s->keyon = st_keyon; s->ringcmds = st_ringcmds;
     for (int i = 0; i < 64; i++) s->active_channels += chn[i].active;
-    s->peak = st_peak; st_peak = 0; s->undef_instr = st_undef; s->underruns = st_underruns; s->overruns = st_overruns; s->fifo_fill = fifo_fill();
+    s->peak = st_peak; st_peak = 0; s->undef_instr = st_undef;
+    s->mix_calls = st_mix_calls; s->mix_us_avg = st_mix_calls ? (uint32_t)(st_mix_us_tot / st_mix_calls) : 0; s->mix_us_max = (uint32_t)st_mix_us_max;
+    st_mix_calls = st_mix_us_tot = st_mix_us_max = 0;
     lk_unlock();
 }
 uint8_t *snd_test_aram(void) { return aram; }
@@ -771,28 +836,32 @@ void snd_test_regwrite(uint32_t off, uint32_t v) { reg_write(off, 4, v, 0); }
 void snd_test_arm_reset(int run) { if (run) arm_reset(); else arm_run_flag = 0; }
 
 /* ============================================================================================================================ SH-4 guest MMIO */
+
+/* ARAM word accesses are lock-free (see PULL MODE above). Legacy mode takes the lock and syncs to the guest clock. */
 static uint32_t sh4_aram_rd(uint32_t a, int sz) {
-    lk_lock(); wall_sync_locked();
-    uint32_t v = ram_rd(a & 0x1FFFFF, sz);
-    lk_unlock(); return v;
+    CALLER_NOTE(0, a & 0x1FFFFF);
+    if (!g_pull_mode) { lk_lock(); wall_sync_locked(); lk_unlock(); }
+    return ram_rd(a & 0x1FFFFF, sz);
 }
 static uint64_t g_sh4wr[32], g_sh4wr_n;
 static void sh4_aram_wr(uint32_t a, int sz, uint32_t v) {
-    lk_lock(); wall_sync_locked();
+    CALLER_NOTE(1, a & 0x1FFFFF);
+    if (!g_pull_mode) { lk_lock(); wall_sync_locked(); lk_unlock(); }
     g_sh4wr[(a >> 16) & 31] += sz; g_sh4wr_n++;
     if (g_ringlog) { uint32_t o = a & 0x1FFFFF; int ri = (o >= 0x18000 && o < 0x1C000) ? 0 : (o >= 0x1E000 && o < 0x22000) ? 1 : -1;
+        if (ri == 0) { static unsigned long lf; static uint32_t fs, fe, fn_; static uint64_t lt; if (hle_frame_count != lf) { if (fn_) fprintf(stderr, "[frm0] f=%lu t=%.3f stores=%u first=%05x last=%05x voice_pos_bytes=%u\n", lf, (double)lt / 44100.0, fn_, fs, fe, chn[53].pos * 2); lf = hle_frame_count; fn_ = 0; } if (!fn_) fs = o; fe = o; fn_++; lt = st_samples; }
         if (ri >= 0) { g_rw_n[ri]++; g_rw_bytes[ri] += sz; if (!g_rw_hi[ri] || o < g_rw_lo[ri]) g_rw_lo[ri] = o; if (o + sz > g_rw_hi[ri]) g_rw_hi[ri] = o + sz; } }
-    if ((a & 0x1FFFFF) == 0x13000 && sz == 4) st_ringcmds += ((v - ram_rd(0x13000, 4)) & 0xFFF) >> 2;
+    if ((a & 0x1FFFFF) == 0x13000 && sz == 4) { st_ringcmds += ((v - ram_rd(0x13000, 4)) & 0xFFF) >> 2; __sync_synchronize(); }   /* ring entries before the write pointer */
     ram_wr(a & 0x1FFFFF, sz, v);
-    lk_unlock();
 }
 static uint32_t sh4_reg_rd(uint32_t a, int sz) {
-    lk_lock(); wall_sync_locked();
-    uint32_t v = reg_read(a & 0x7FFF, sz, 0);
-    lk_unlock(); return v;
+    CALLER_NOTE(2, a & 0x7FFF);
+    if (!g_pull_mode) { lk_lock(); wall_sync_locked(); lk_unlock(); }
+    return reg_read(a & 0x7FFF, sz, 0);
 }
 static void sh4_reg_wr(uint32_t a, int sz, uint32_t v) {
-    lk_lock(); wall_sync_locked();
+    CALLER_NOTE(3, a & 0x7FFF);
+    lk_lock(); if (!g_pull_mode) wall_sync_locked();
     reg_write(a & 0x7FFF, sz, v, 0);
     lk_unlock();
 }
@@ -812,7 +881,15 @@ static void g2_watch(uint32_t a, int sz, uint32_t v) {
     hle_asic_raise_later(1u << 15);
 }
 
-static void snd_atexit(void) { if (g_evlog) for (int ch = 0; ch < 64; ch++) if (chn[ch].active) { fprintf(stderr, "[ev] ACTIVE_AT_EXIT ch%d eg=%d att=%.0f pos=%u", ch, chn[ch].eg, chn[ch].att, chn[ch].pos); for (int r = 0; r < 0x50; r += 4) fprintf(stderr, " %02x:%08x", r, aregs[(ch * 0x80 + r) >> 2]); fputc(10, stderr); } snd_wav_close(); { const char *d = getenv("R2_SND_DUMP"); if (d && *d) { FILE *f = fopen(d, "wb"); if (f) { fwrite(aram, 1, ARAM_SIZE, f); fclose(f); } } } if (TRACE) { for (int i = 0; i < 32; i++) if (g_sh4wr[i]) fprintf(stderr, "[snd] sh4 wrote %llu bytes to aram %06x..\n", (unsigned long long)g_sh4wr[i], i << 16); SndStats s; snd_get_stats(&s); fprintf(stderr, "[snd] ringcmds=%llu samples=%llu arm_instr=%llu idle_skips=%llu keyon=%llu undef=%u active=%d\n", (unsigned long long)s.ringcmds, (unsigned long long)s.samples, (unsigned long long)s.arm_instr, (unsigned long long)s.arm_idle_skips, (unsigned long long)s.keyon, s.undef_instr, s.active_channels); } }
+static void snd_atexit(void) {
+#if !defined(__vita__)
+    if (g_callerlog) for (int i = 0; i < g_cln; i++) fprintf(stderr, "[caller] fn=%08x pr=%08x %s %05x n=%llu\n", g_cl[i].fn, g_cl[i].pr, (const char *[]){"aram_rd", "aram_wr", "reg_rd", "reg_wr"}[g_cl[i].kind], g_cl[i].reg, (unsigned long long)g_cl[i].n);
+#endif
+#ifndef SND_TEST
+    if (g_evlog) fprintf(stderr, "[ev] CATCHUP ticks=%lu extra_calls=%lu; guest start-cmds=%lu stop-cmds=%lu\n", g_sf_ticks, g_sf_extra, st_gstart, st_gstop);
+#endif
+    if (g_evlog) { SndStats ms; snd_get_stats(&ms); fprintf(stderr, "[ev] MIXCOST calls=%llu avg=%u us max=%u us per block of 1024 frames (budget 21333 us at 48 kHz); arm_instr=%llu keyon=%llu keyon_ignored=%llu\n", (unsigned long long)ms.mix_calls, ms.mix_us_avg, ms.mix_us_max, (unsigned long long)ms.arm_instr, (unsigned long long)ms.keyon, (unsigned long long)st_keyon_ignored); }
+    if (g_evlog) for (int ch = 0; ch < 64; ch++) if (chn[ch].active) { fprintf(stderr, "[ev] ACTIVE_AT_EXIT ch%d eg=%d att=%.0f pos=%u", ch, chn[ch].eg, chn[ch].att, chn[ch].pos); for (int r = 0; r < 0x50; r += 4) fprintf(stderr, " %02x:%08x", r, aregs[(ch * 0x80 + r) >> 2]); fputc(10, stderr); } snd_wav_close(); { const char *d = getenv("R2_SND_DUMP"); if (d && *d) { FILE *f = fopen(d, "wb"); if (f) { fwrite(aram, 1, ARAM_SIZE, f); fclose(f); } } } if (TRACE) { for (int i = 0; i < 32; i++) if (g_sh4wr[i]) fprintf(stderr, "[snd] sh4 wrote %llu bytes to aram %06x..\n", (unsigned long long)g_sh4wr[i], i << 16); SndStats s; snd_get_stats(&s); fprintf(stderr, "[snd] ringcmds=%llu samples=%llu arm_instr=%llu idle_skips=%llu keyon=%llu undef=%u active=%d\n", (unsigned long long)s.ringcmds, (unsigned long long)s.samples, (unsigned long long)s.arm_instr, (unsigned long long)s.arm_idle_skips, (unsigned long long)s.keyon, s.undef_instr, s.active_channels); } }
 
 #if !defined(__vita__)
 /* R2_SND_PULL=<wav>: host test of the Vita consumption path. A real-time thread pulls snd_mix(1024) at 44.1 kHz (as the sceAudioOut thread would) and writes
@@ -839,6 +916,11 @@ static void start_pull_test(void) {
 __attribute__((constructor)) static void snd_ctor(void) {
     lk_init(); build_tables(); aregs[0x2C00 / 4] = 1;
     { const char *rl = getenv("R2_SND_RING"); g_ringlog = rl && *rl && *rl != '0'; g_rw_lo[0] = g_rw_lo[1] = 0xFFFFFF; }
+#if !defined(__vita__)
+    { const char *cl = getenv("R2_SND_CALLER"); g_callerlog = cl && *cl && *cl != '0'; }
+#endif
+    { const char *ko = getenv("R2_SND_KEYON_OLD"); g_keyon_old = ko && *ko == '1'; }
+    { const char *vd = getenv("R2_SND_VDUMP"); g_vdump_s = vd ? atoi(vd) : 0; }
     { const char *e = getenv("R2_SND_EV"); g_evlog = e && *e && *e != '0'; }
     const char *tr = getenv("R2_SND_TRACE"); g_trace = tr && *tr && *tr != '0';
     static const uint32_t pfx[3] = {0x00000000u, 0x80000000u, 0xA0000000u};
@@ -852,6 +934,9 @@ __attribute__((constructor)) static void snd_ctor(void) {
     if (!w) w = "build_hle/audio.wav";
     if (strcmp(w, "0")) snd_wav_open(w);
     start_pull_test();
+#endif
+#ifndef SND_TEST
+    { const char *e = getenv("R2_STREAM_CATCHUP"); g_sf_on = !(e && *e == '0'); hle_hook(0x8C0625B8, sf_disp); hle_hook(0x8C062F60, sf_feed); hle_hook(0x8C0F06BC, sf_cmd_start); hle_hook(0x8C0F08E4, sf_cmd_stop); }
 #endif
     atexit(snd_atexit);
 }

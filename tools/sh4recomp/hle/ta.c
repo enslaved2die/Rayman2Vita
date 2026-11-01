@@ -52,8 +52,26 @@ void ta_decode_header(TaState *s, const uint32_t w[8], const uint32_t *w2)
 }
 
 /* ------------------------------------------------------------------ frame storage */
-static TaFrame *frame_new(void) { return (TaFrame *)calloc(1, sizeof(TaFrame)); }
-void ta_frame_free(TaFrame *f) { if (!f) return; free(f->verts); free(f->strips); free(f->mods); free(f); }
+/* Frames are recycled through a small pool: the vertex/strip/mod arrays keep their capacity from frame to frame (no per-frame malloc/realloc growth from 256 elements, no free). */
+#define FRAME_POOL 4
+static TaFrame *frame_pool[FRAME_POOL]; static int frame_pool_n;
+static TaFrame *frame_new(void)
+{
+    if (frame_pool_n) {
+        TaFrame *f = frame_pool[--frame_pool_n];
+        TaVertex *v = f->verts; uint32_t cv = f->capverts; TaStrip *st = f->strips; uint32_t cs = f->capstrips; TaModTri *m = f->mods; uint32_t cm = f->capmods;
+        memset(f, 0, sizeof *f);
+        f->verts = v; f->capverts = cv; f->strips = st; f->capstrips = cs; f->mods = m; f->capmods = cm;
+        return f;
+    }
+    return (TaFrame *)calloc(1, sizeof(TaFrame));
+}
+void ta_frame_free(TaFrame *f)
+{
+    if (!f) return;
+    if (frame_pool_n < FRAME_POOL && f->capverts <= (1u << 20)) { frame_pool[frame_pool_n++] = f; return; }
+    free(f->verts); free(f->strips); free(f->mods); free(f);
+}
 
 #define GROW(arr, n, cap) do { if ((n) >= (cap)) { (cap) = (cap) ? (cap) * 2 : 256; (arr) = realloc((arr), (cap) * sizeof(*(arr))); } } while (0)
 static TaVertex *push_vtx(TaFrame *f) { GROW(f->verts, f->nverts, f->capverts); TaVertex *v = &f->verts[f->nverts++]; memset(v, 0, sizeof *v); f->stats.verts++; return v; }
@@ -309,6 +327,22 @@ static int same_state(const TaState *a, const TaState *b)
     return a->list == b->list && (a->ctl & 0xFF) == (b->ctl & 0xFF) && a->isp == b->isp && a->tsp == b->tsp && a->tcw == b->tcw &&
            a->clip_mode == b->clip_mode && (!a->clip_mode || !memcmp(a->clip, b->clip, sizeof a->clip));
 }
+/* Draw-state equivalence for the lists the renderer draws in submission order (opaque, punch-through): two strips whose draw state is equal produce the same GL state for every
+ * triangle, so consecutive ones can share one batch / one glDrawArrays with the exact same pixel result (the triangle order is unchanged).  Compared are exactly the fields the
+ * renderer reads: list, textured, shadow (stencil receiver), user clip, depth func / depth write, fog control (opaque fog pass) and, for textured strips, the texture word
+ * (tcw), the TSP bits that select the decode / sampling (size [5:0], shading [7:6], filter [14:13], clamp/flip [18:15], ignore-texture-alpha [19]).  Bits that are baked into the
+ * vertices at build time (gouraud, colour type, offset, UV format, cull mode, use-alpha, shading-dependent vertex alpha, UV rebase flip/clamp) or unused by the Vita path (blend
+ * instructions in these lists, mip adjust, super-sample, accumulation-buffer selects, clamp colour) do not matter.  The translucent list keeps the exact same_state() merge: its
+ * batches are depth-sorted as units, so merging more would change the sort result. */
+#define TSP_DRAW_MASK (0x3Fu | 0xC0u | (3u << 13) | (0xFu << 15) | (1u << 19))
+static int same_draw_state(const TaState *a, const TaState *b)
+{
+    if (a->list != b->list || a->textured != b->textured || a->shadow != b->shadow || a->clip_mode != b->clip_mode) return 0;
+    if (a->clip_mode && memcmp(a->clip, b->clip, sizeof a->clip)) return 0;
+    if (a->depth_mode != b->depth_mode || a->z_write_disable != b->z_write_disable || a->fog_ctrl != b->fog_ctrl) return 0;
+    if (a->textured && (a->tcw != b->tcw || ((a->tsp ^ b->tsp) & TSP_DRAW_MASK))) return 0;
+    return 1;
+}
 static void to_gl(TaGlVertex *o, const TaVertex *v, const float base[4], const float off[4])
 {
     o->x = v->x; o->y = v->y; o->z = v->z; o->u = v->u; o->v = v->v;
@@ -322,7 +356,7 @@ static int gl_reserve(TaGl *g, uint32_t *cap, uint32_t extra)
     if (g->nverts + extra <= *cap) return 0;
     uint32_t nc = *cap ? *cap * 2 : 1024; while (nc < g->nverts + extra) nc *= 2;
     TaGlVertex *nv = (TaGlVertex *)realloc(g->verts, nc * sizeof *nv); if (!nv) return -1;
-    g->verts = nv; *cap = nc; return 0;
+    g->verts = nv; *cap = nc; g->capverts = nc; return 0;
 }
 /* clip a convex polygon (<= 8 verts) of screen-linear attribute vectors against one axis-aligned half plane; a[axis] sign*(coord - lim) >= 0 keeps */
 typedef struct { float a[13]; } ClipV;   /* x y invW u*invW v*invW r g b a or og ob oa */
@@ -347,9 +381,21 @@ static void shade_alpha(float *a, const TaState *st)
 int ta_build_gl_ex(const TaFrame *f, TaGl *g, const TaBuildOpts *o)
 {
     memset(g, 0, sizeof *g);
-    uint32_t cap = 0;
-    g->batches = (TaBatch *)malloc((f->nstrips ? f->nstrips : 1) * sizeof(TaBatch));
-    if (!g->batches) return -1;
+    return ta_build_gl_reuse(f, g, o);
+}
+/* Same as ta_build_gl_ex, but g must be zero-initialised once and may then be passed to every later call: its vertex / batch arrays keep their capacity (g->capverts / capbatches). */
+int ta_build_gl_reuse(const TaFrame *f, TaGl *g, const TaBuildOpts *o)
+{
+    TaGlVertex *keep_v = g->verts; uint32_t keep_cv = g->capverts; TaBatch *keep_b = g->batches; uint32_t keep_cb = g->capbatches;
+    memset(g, 0, sizeof *g);
+    g->verts = keep_v; g->capverts = keep_cv; g->batches = keep_b; g->capbatches = keep_cb;
+    uint32_t cap = g->capverts;
+    uint32_t need_b = f->nstrips ? f->nstrips : 1;
+    if (g->capbatches < need_b) {
+        TaBatch *nb = (TaBatch *)realloc(g->batches, need_b * sizeof(TaBatch));
+        if (!nb) { ta_gl_free(g); return -1; }
+        g->batches = nb; g->capbatches = need_b;
+    }
     if (gl_reserve(g, &cap, 3) != 0) { ta_gl_free(g); return -1; }
     for (int l = 0; l < TA_NUM_LISTS; l++) {
         g->list_first[l] = g->nbatches;
@@ -358,7 +404,8 @@ int ta_build_gl_ex(const TaFrame *f, TaGl *g, const TaBuildOpts *o)
             const TaStrip *s = &f->strips[i];
             if (s->st.list != l || s->count < 3) continue;
             TaBatch *b = g->nbatches ? &g->batches[g->nbatches - 1] : NULL;
-            if (!b || g->nbatches <= g->list_first[l] || !same_state(&b->st, &s->st)) {
+            int merge = b && g->nbatches > g->list_first[l] && ((l == TA_L_TRANS || (o && o->exact_merge)) ? same_state(&b->st, &s->st) : same_draw_state(&b->st, &s->st));
+            if (!merge) {
                 b = &g->batches[g->nbatches++]; b->st = s->st; b->first = g->nverts; b->count = 0;
             }
             const TaVertex *V = &f->verts[s->first];
@@ -424,7 +471,8 @@ int ta_build_gl_ex(const TaFrame *f, TaGl *g, const TaBuildOpts *o)
 int ta_build_gl(const TaFrame *f, TaGl *g) { return ta_build_gl_ex(f, g, NULL); }
 
 static int cmp_f(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
-float ta_gl_depth_cut(const TaGl *g)
+/* Reference implementation (exact median via qsort over every vertex): kept for tests / R2_TACHK; the renderer uses ta_gl_depth_cut. */
+float ta_gl_depth_cut_ref(const TaGl *g)
 {
     if (!g->nverts) return 1.f;
     float *t = (float *)malloc(g->nverts * sizeof(float)); if (!t) return 1.f;
@@ -436,6 +484,41 @@ float ta_gl_depth_cut(const TaGl *g)
     for (uint32_t i = 0; i < n; i++) if (t[i] <= lim) cut = t[i];
     free(t);
     return cut;
+}
+/* Same definition, exact, without qsort and without per-frame allocation.  (The first version estimated the median from 64 evenly spaced vertices; on a dumped intro frame that moved the
+ * cut from 0.0442 to 0.0414 and re-rendered 21% of the picture, because vertices above the cut are clamped in ta_gl_make_clip and the depth mapping scales with it - so the median must
+ * be exact.)  The valid 1/W values are copied once into a persistent contiguous buffer (capacity kept across frames) while counting a 1024-bucket histogram of the float bit patterns
+ * (positive floats sort like their bits); the k-th smallest (k = n/2, i.e. what t[n/2] was after the sort) is then found by two more histogram passes over only the bucket that
+ * contains rank k (11 + 11 + 10 bits), then one scan for the largest value <= 64 * median.  Everything after the first pass runs on the compact buffer (4 bytes/vertex). */
+float ta_gl_depth_cut(const TaGl *g)
+{
+    static uint32_t *zb; static uint32_t zcap;
+    if (!g->nverts) return 1.f;
+    if (zcap < g->nverts) { uint32_t nc = g->nverts + 4096; uint32_t *nb = (uint32_t *)realloc(zb, nc * sizeof *nb); if (!nb) return ta_gl_depth_cut_ref(g); zb = nb; zcap = nc; }
+    static uint32_t h1[2048];
+    memset(h1, 0, 1024 * sizeof h1[0]);
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g->nverts; i++) {
+        float z = g->verts[i].z;
+        if (z > 0.f && isfinite(z)) { uint32_t u; memcpy(&u, &z, 4); zb[n++] = u; h1[u >> 22]++; }     /* u < 0x7F800000: 9 exponent+mantissa-top bits -> 0..508 */
+    }
+    if (!n) return 1.f;
+    uint32_t k = n / 2, acc = 0, b1 = 0;
+    for (; b1 < 1024; b1++) { if (acc + h1[b1] > k) break; acc += h1[b1]; }
+    k -= acc;
+    memset(h1, 0, 2048 * sizeof h1[0]);
+    for (uint32_t i = 0; i < n; i++) if ((zb[i] >> 22) == b1) h1[(zb[i] >> 11) & 0x7FF]++;
+    acc = 0; uint32_t b2 = 0;
+    for (; b2 < 2048; b2++) { if (acc + h1[b2] > k) break; acc += h1[b2]; }
+    k -= acc;
+    memset(h1, 0, 2048 * sizeof h1[0]);
+    for (uint32_t i = 0; i < n; i++) if ((zb[i] >> 11) == ((b1 << 11) | b2)) h1[zb[i] & 0x7FF]++;
+    acc = 0; uint32_t b3 = 0;
+    for (; b3 < 2048; b3++) { if (acc + h1[b3] > k) break; acc += h1[b3]; }
+    uint32_t mb = (b1 << 22) | (b2 << 11) | b3; float med; memcpy(&med, &mb, 4);
+    float lim = med * 64.f, cut = 0.f, mn = 3.4e38f;
+    for (uint32_t i = 0; i < n; i++) { float z; memcpy(&z, &zb[i], 4); if (z < mn) mn = z; if (z <= lim && z > cut) cut = z; }
+    return cut > 0.f ? cut : mn;
 }
 void ta_gl_make_clip(const TaGlVertex *in, uint32_t n, float cut, TaClipVertex *out)
 {
@@ -557,7 +640,8 @@ int ta_tex_decode(const uint8_t *vram, uint32_t vn, uint32_t tcw, uint32_t tsp, 
 void ta_gl_free(TaGl *g) { free(g->verts); free(g->batches); memset(g, 0, sizeof *g); }
 
 
-float ta_fog_alpha(float inv_w, uint32_t fog_density, const uint32_t table[128])
+/* Reference (original) implementation, kept for the exactness test. */
+float ta_fog_alpha_ref(float inv_w, uint32_t fog_density, const uint32_t table[128])
 {
     int e8 = (int8_t)(fog_density & 255);
     float den = (float)((fog_density >> 8) & 255) / 128.0f * ldexpf(1.0f, e8);
@@ -572,4 +656,50 @@ float ta_fog_alpha(float inv_w, uint32_t fog_density, const uint32_t table[128])
     float fr = m - floorf(m);
     uint32_t t = table[idx];
     return ((float)((t >> 8) & 255) * (1.0f - fr) + (float)(t & 255) * fr) / 255.0f;
+}
+/* z in [1, 255.99] is a normal positive float, so e = floor(log2 z) is its exponent field - 127, and m = z*16/2^e - 16 = 16*(significand - 1) is its 23 mantissa bits / 2^19
+ * (all steps of the reference are exact in float): floor(m) = top 4 mantissa bits, frac(m) = low 19 bits / 2^19.  Only when log2f() of a value one ulp below a power of two rounds
+ * up to the integer does the reference pick e+1 (m slightly negative, idx = 16(e+1) - 1, frac = 1 - tiny): same table index, the weights differ in the last float bits. */
+float ta_fog_alpha(float inv_w, uint32_t fog_density, const uint32_t table[128])
+{
+    static uint32_t s_dens_key = 0x80000000u; static float s_den;       /* density multiplier cache (the density register is constant within a frame) */
+    if (fog_density != s_dens_key) { s_dens_key = fog_density; s_den = (float)((fog_density >> 8) & 255) / 128.0f * ldexpf(1.0f, (int8_t)(fog_density & 255)); }
+    float z = inv_w * s_den;
+    if (!(z > 1.0f)) z = 1.0f;
+    if (z > 255.99f) z = 255.99f;
+    uint32_t u; memcpy(&u, &z, 4);
+    int e = (int)((u >> 23) & 0xFF) - 127;
+    int idx = ((int)((u >> 19) & 0xF)) + e * 16;
+    if (idx > 127) idx = 127;
+    float fr = (float)(u & 0x7FFFFu) * (1.0f / 524288.0f);
+    uint32_t t = table[idx];
+    return ((float)((t >> 8) & 255) * (1.0f - fr) + (float)(t & 255) * fr) / 255.0f;
+}
+
+/* ------------------------------------------------------------------ texture cache support (shared by vita_gl_render.c and the host cross-check in ta_hle.c) */
+uint32_t ta_tex_byte_len(uint32_t tcw, uint32_t tsp)
+{
+    int w, h; ta_tex_size(tsp, &w, &h);
+    int mip = (int)(tcw >> 31), vq = (int)((tcw >> 30) & 1), fmt = (int)((tcw >> 27) & 7);
+    if (mip) h = w;
+    uint32_t n;
+    if (vq) n = 2048u + (uint32_t)(w * h) / 4u;
+    else if (fmt == 5) n = (uint32_t)(w * h) / 2u;
+    else if (fmt == 6) n = (uint32_t)(w * h);
+    else n = (uint32_t)(w * h) * 2u;
+    if (mip) n = n + n / 3u + 64u;
+    return n;
+}
+/* 4-lane multiplicative hash of n bytes (n multiple of 4 is hashed word-wise, a tail is ignored as before). */
+uint32_t ta_hash_bytes(const void *data, uint32_t n)
+{
+    const uint32_t *p = (const uint32_t *)data;
+    uint32_t words = n >> 2, i = 0;
+    uint32_t a = 2166136261u, b = 0x9E3779B9u, c = 0x85EBCA6Bu, d = 0xC2B2AE35u;
+    for (; i + 4 <= words; i += 4) {
+        a = (a ^ p[i]) * 16777619u; b = (b ^ p[i + 1]) * 16777619u; c = (c ^ p[i + 2]) * 16777619u; d = (d ^ p[i + 3]) * 16777619u;
+        a ^= a >> 15; b ^= b >> 15; c ^= c >> 15; d ^= d >> 15;
+    }
+    for (; i < words; i++) { a = (a ^ p[i]) * 16777619u; a ^= a >> 15; }
+    return a ^ (b * 3u) ^ (c * 5u) ^ (d * 7u) ^ n;
 }

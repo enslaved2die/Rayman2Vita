@@ -4,14 +4,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include "../runtime.h"
+#include "../hle/hle.h"
+/* --- stubs for the parts of hle.h / io.h that snd.c uses --- */
 uint8_t sh4_ram[SH4_RAM_SIZE];
 uint64_t hle_time_us(void) { return 0; }
-void hle_mmio_map(uint32_t a, uint32_t b, void *r, void *w) { (void)a; (void)b; (void)r; (void)w; }
-void hle_mmio_watch(uint32_t a, uint32_t b, void *c) { (void)a; (void)b; (void)c; }
+hle_mmio_rd g_stub_rd[8]; hle_mmio_wr g_stub_wr[8]; uint32_t g_stub_lo[8]; int g_stub_n;
+void hle_mmio_map(uint32_t lo, uint32_t hi, hle_mmio_rd rd, hle_mmio_wr wr) { (void)hi; if (g_stub_n < 8) { g_stub_lo[g_stub_n] = lo; g_stub_rd[g_stub_n] = rd; g_stub_wr[g_stub_n] = wr; g_stub_n++; } }
+void hle_mmio_watch(uint32_t lo, uint32_t hi, hle_mmio_wr cb) { (void)lo; (void)hi; (void)cb; }
 uint32_t hle_reg_get(uint32_t a) { (void)a; return 0; }
 void hle_reg_set(uint32_t a, uint32_t v) { (void)a; (void)v; }
 void hle_asic_raise_later(uint32_t m) { (void)m; }
+unsigned long hle_frame_count; uint32_t hle_ring[256][2]; uint32_t hle_ring_pos;
 int main(void) {
     snd_init(44100);
     FILE *f = fopen("../../assets/dc/DCDATA/Sound/DRIVERS/MANATEE.DRV", "rb"); if (!f) return 2;
