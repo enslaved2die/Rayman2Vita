@@ -144,22 +144,8 @@ __attribute__((weak)) void *CPA_LoadFile(const char *filename, size_t *out_size)
 /* ----------------------------------------------------------------------------
  * 1. Yamaha AICA ADPCM Adaptation & Quantization Tables
  * ---------------------------------------------------------------------------- */
-static const int16_t s_aica_step_table[89] = {
-    7,     8,     9,     10,    11,    12,    13,    14,    16,    17,
-    19,    21,    23,    25,    28,    31,    34,    37,    41,    45,
-    50,    55,    60,    66,    73,    80,    88,    97,    107,   118,
-    130,   143,   157,   173,   190,   209,   230,   253,   279,   307,
-    337,   371,   408,   449,   494,   544,   598,   658,   724,   796,
-    876,   963,   1060,  1166,  1282,  1411,  1552,  1707,  1878,  2066,
-    2272,  2499,  2749,  3024,  3327,  3660,  4026,  4428,  4871,  5358,
-    5894,  6484,  7132,  7845,  8630,  9493,  10442, 11487, 12635, 13899,
-    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
-};
-
-static const int8_t s_aica_index_table[16] = {
-    -1, -1, -1, -1, 2, 4, 6, 8,
-    -1, -1, -1, -1, 2, 4, 6, 8
-};
+static const int8_t  yam_diff[16] = {1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15};
+static const int32_t yam_scale[8] = {230, 230, 230, 230, 307, 409, 512, 614};
 
 /* ----------------------------------------------------------------------------
  * 2. Dreamcast Yamaha AICA DIPAN Attenuation Law (3 dB per step, 15 = Mute)
@@ -326,64 +312,45 @@ static inline void SND_CalculatePanGains(float pan, float vol, float *out_gain_l
  * 6. Yamaha AICA ADPCM Decoder Implementation
  * ---------------------------------------------------------------------------- */
 
-int16_t SND_Vita_DecodeNibble(uint8_t nibble, int32_t *pPredictor, int32_t *pStepIndex) {
-    if (!pPredictor || !pStepIndex) return 0;
-
-    int32_t step_idx = *pStepIndex;
-    if (step_idx < 0) step_idx = 0;
-    else if (step_idx > 88) step_idx = 88;
-
-    int32_t step = s_aica_step_table[step_idx];
-    int32_t diff = step >> 3;
-    if (nibble & 1) diff += (step >> 2);
-    if (nibble & 2) diff += (step >> 1);
-    if (nibble & 4) diff += step;
+int16_t SND_Vita_DecodeNibble(uint8_t nibble, int32_t *pPredictor, int32_t *pStep) {
+    if (!pPredictor || !pStep) return 0;
 
     int32_t pred = *pPredictor;
-    if (nibble & 8) {
-        pred -= diff;
-    } else {
-        pred += diff;
-    }
+    int32_t step = *pStep;
+    if (step < 127) step = 127;
 
-    /* Clamp predictor to 16-bit signed range [-32768, 32767] */
+    pred += (yam_diff[nibble & 0x0F] * step) / 8;
     if (pred > 32767) pred = 32767;
     else if (pred < -32768) pred = -32768;
     *pPredictor = pred;
 
-    /* Update step index with adaptation delta and clamp to [0, 88] */
-    step_idx += s_aica_index_table[nibble & 0x0F];
-    if (step_idx < 0) step_idx = 0;
-    else if (step_idx > 88) step_idx = 88;
-    *pStepIndex = step_idx;
+    int32_t st = (step * yam_scale[nibble & 7]) >> 8;
+    *pStep = (st < 127) ? 127 : ((st > 24576) ? 24576 : st);
 
     return (int16_t)pred;
 }
 
 void SND_Vita_DecodeAICA(const uint8_t *src, int16_t *dst, uint32_t num_samples) {
     if (!src || !dst || num_samples == 0) return;
-
-    int32_t predictor = 0;
-    int32_t step_index = 0;
-    uint32_t out_idx = 0;
-    uint32_t src_idx = 0;
-
-    while (out_idx < num_samples) {
-        uint8_t byte = src[src_idx++];
-        /* Sample 1: Low nibble */
-        dst[out_idx++] = SND_Vita_DecodeNibble(byte & 0x0F, &predictor, &step_index);
-        if (out_idx >= num_samples) break;
-
-        /* Sample 2: High nibble */
-        dst[out_idx++] = SND_Vita_DecodeNibble((byte >> 4) & 0x0F, &predictor, &step_index);
+    int32_t pred = 0;
+    int32_t step = 127;
+    for (uint32_t i = 0; i < num_samples; i++) {
+        uint8_t byte = src[i >> 1];
+        uint8_t nib = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+        pred += (yam_diff[nib] * step) / 8;
+        if (pred > 32767) pred = 32767;
+        else if (pred < -32768) pred = -32768;
+        dst[i] = (int16_t)pred;
+        int32_t st = (step * yam_scale[nib & 7]) >> 8;
+        step = (st < 127) ? 127 : ((st > 24576) ? 24576 : st);
     }
 }
 
 void SND_Vita_DecodeAICA_Stereo(const uint8_t *src, int16_t *dst, uint32_t num_frames) {
     if (!src || !dst || num_frames == 0) return;
 
-    int32_t pred_l = 0, step_l = 0;
-    int32_t pred_r = 0, step_r = 0;
+    int32_t pred_l = 0, step_l = 127;
+    int32_t pred_r = 0, step_r = 127;
     uint32_t frame_idx = 0;
     uint32_t src_idx = 0;
 
@@ -557,6 +524,28 @@ static int SND_ParseOSBData(const uint8_t *data, size_t size, SND_Vita_Bank *pBa
 static void SND_FreeBank(SND_Vita_Bank *pBank) {
     if (!pBank || !pBank->loaded) return;
 
+    SND_Vita_Lock();
+
+    /* Immediately stop and deactivate any voices using this bank's samples */
+    for (int i = 0; i < SND_VITA_NUM_VOICES; i++) {
+        if (g_voices[i].active) {
+            int match = (g_voices[i].bank_id == pBank->bank_id);
+            if (!match && pBank->sounds) {
+                for (uint32_t s = 0; s < pBank->num_sounds; s++) {
+                    if (g_voices[i].pcm_data == pBank->sounds[s].pcm_data) {
+                        match = 1;
+                        break;
+                    }
+                }
+            }
+            if (match) {
+                g_voices[i].active = 0;
+                g_voices[i].pcm_data = NULL;
+                g_voices[i].num_samples = 0;
+            }
+        }
+    }
+
     if (pBank->sounds) {
         for (uint32_t i = 0; i < pBank->num_sounds; i++) {
             if (pBank->sounds[i].pcm_data) {
@@ -570,6 +559,21 @@ static void SND_FreeBank(SND_Vita_Bank *pBank) {
     pBank->num_sounds = 0;
     pBank->loaded = 0;
     pBank->name[0] = '\0';
+
+    SND_Vita_Unlock();
+}
+
+int SND_Vita_LoadBankData(uint32_t bank_id, const uint8_t *data, size_t size, const char *name) {
+    if (!data || size < 16) return -1;
+
+    SND_Vita_Bank *pTargetBank = (bank_id == 0 && !g_fix_bank.loaded) ? &g_fix_bank : &g_level_bank;
+    SND_FreeBank(pTargetBank);
+
+    SND_Vita_Lock();
+    pTargetBank->bank_id = bank_id;
+    int res = SND_ParseOSBData(data, size, pTargetBank, name ? name : "level_bank");
+    SND_Vita_Unlock();
+    return res;
 }
 
 int SND_Vita_LoadFixBank(void) {
@@ -596,6 +600,7 @@ int SND_Vita_LoadFixBank(void) {
         return -1;
     }
 
+    g_fix_bank.bank_id = 0;
     int res = SND_ParseOSBData(data, sz, &g_fix_bank, "FIX.OSB");
     CPA_free(data);
     SND_Vita_Unlock();
@@ -605,9 +610,9 @@ int SND_Vita_LoadFixBank(void) {
 int SND_Vita_LoadBank(const char *szBankPath) {
     if (!szBankPath) return -1;
 
-    SND_Vita_Lock();
     SND_Vita_UnloadBank();
 
+    SND_Vita_Lock();
     size_t sz = 0;
     uint8_t *data = SND_LoadFileBuffer(szBankPath, &sz);
     if (!data) {
@@ -629,6 +634,7 @@ int SND_Vita_LoadBank(const char *szBankPath) {
         return -1;
     }
 
+    g_level_bank.bank_id = 1;
     int res = SND_ParseOSBData(data, sz, &g_level_bank, szBankPath);
     CPA_free(data);
     SND_Vita_Unlock();
@@ -998,17 +1004,20 @@ const SND_Vita_Sample *SND_Vita_GetBankSoundDescriptor(int bLevelBank, uint32_t 
     return pSample;
 }
 
-int SND_Vita_PlaySoundEx(uint32_t ulSoundId, float fVolume, float fPan, float fPitch, int bLoop) {
+int SND_Vita_PlaySoundEx(int slot_id, uint32_t ulSoundId, float fVolume, float fPan) {
     SND_Vita_Lock();
 
     /* 1. Locate sample descriptor in loaded banks */
     const SND_Vita_Sample *pSample = NULL;
+    uint32_t bank_id = 0;
     if (g_level_bank.loaded && ulSoundId < g_level_bank.num_sounds &&
         g_level_bank.sounds[ulSoundId].pcm_data) {
         pSample = &g_level_bank.sounds[ulSoundId];
+        bank_id = g_level_bank.bank_id;
     } else if (g_fix_bank.loaded && ulSoundId < g_fix_bank.num_sounds &&
                g_fix_bank.sounds[ulSoundId].pcm_data) {
         pSample = &g_fix_bank.sounds[ulSoundId];
+        bank_id = g_fix_bank.bank_id;
     }
 
     if (!pSample || !pSample->pcm_data || pSample->num_samples == 0) {
@@ -1018,39 +1027,44 @@ int SND_Vita_PlaySoundEx(uint32_t ulSoundId, float fVolume, float fPan, float fP
 
     /* 2. Find an available voice slot (or steal the lowest volume voice) */
     int chosen_slot = -1;
-    float lowest_vol = 999.0f;
-    int lowest_slot = 0;
+    if (slot_id >= 0 && slot_id < SND_VITA_NUM_VOICES) {
+        chosen_slot = slot_id;
+    } else {
+        float lowest_vol = 999.0f;
+        int lowest_slot = 0;
 
-    for (int i = 0; i < SND_VITA_NUM_VOICES; i++) {
-        if (!g_voices[i].active) {
-            chosen_slot = i;
-            break;
+        for (int i = 0; i < SND_VITA_NUM_VOICES; i++) {
+            if (!g_voices[i].active) {
+                chosen_slot = i;
+                break;
+            }
+            if (g_voices[i].volume < lowest_vol) {
+                lowest_vol = g_voices[i].volume;
+                lowest_slot = i;
+            }
         }
-        if (g_voices[i].volume < lowest_vol) {
-            lowest_vol = g_voices[i].volume;
-            lowest_slot = i;
-        }
-    }
 
-    if (chosen_slot < 0) {
-        chosen_slot = lowest_slot; /* Voice stealing */
+        if (chosen_slot < 0) {
+            chosen_slot = lowest_slot; /* Voice stealing */
+        }
     }
 
     /* 3. Assign voice parameters */
     SND_Vita_Voice *v = &g_voices[chosen_slot];
     v->active           = 0;
+    v->bank_id          = bank_id;
     v->sound_id         = ulSoundId;
     v->pcm_data         = pSample->pcm_data;
     v->num_samples      = pSample->num_samples;
     v->sample_rate      = pSample->sample_rate ? pSample->sample_rate : 22050;
     v->sample_pos       = 0;
     v->sample_pos_frac  = 0;
-    float pitch         = (fPitch <= 0.05f) ? 1.0f : fPitch;
+    float pitch         = 1.0f;
     v->pitch            = pitch;
     v->rate_step        = (uint32_t)(((uint64_t)(v->sample_rate * pitch) << 16) / g_nOutputSampleRate);
     v->volume           = (fVolume < 0.0f) ? 0.0f : ((fVolume > 1.0f) ? 1.0f : fVolume);
     v->pan              = (fPan < -1.0f) ? -1.0f : ((fPan > 1.0f) ? 1.0f : fPan);
-    v->loop             = bLoop ? 1 : pSample->loop;
+    v->loop             = pSample->loop;
     v->loop_start       = pSample->loop_start;
     v->loop_end         = (pSample->loop_end > 0) ? pSample->loop_end : pSample->num_samples;
     v->active           = 1;
@@ -1060,7 +1074,7 @@ int SND_Vita_PlaySoundEx(uint32_t ulSoundId, float fVolume, float fPan, float fP
 }
 
 int SND_Vita_PlaySound(uint32_t ulSoundId, float fVolume, float fPan) {
-    return SND_Vita_PlaySoundEx(ulSoundId, fVolume, fPan, 1.0f, 0);
+    return SND_Vita_PlaySoundEx(-1, ulSoundId, fVolume, fPan);
 }
 
 void SND_Vita_SetVoicePan(int voice_index, float fPan) {
@@ -1097,9 +1111,10 @@ void SND_Vita_SetVoicePitch(int voice_index, float fPitch) {
 }
 
 int SND_Vita_SendCommand(uint8_t uCmd, uint8_t uHandle, int32_t lParam1, int32_t lParam2) {
+    (void)lParam2;
     switch (uCmd) {
         case 0x11: /* Key-On / Trigger */
-            return SND_Vita_PlaySoundEx((uint32_t)lParam1, 1.0f, 0.0f, 1.0f, lParam2 ? 1 : 0);
+            return SND_Vita_PlaySoundEx((int)uHandle, (uint32_t)lParam1, 1.0f, 0.0f);
         case 0x12: /* Key-Off / Stop */
             SND_Vita_StopVoice((int)uHandle);
             return 0;

@@ -70,6 +70,7 @@ typedef struct SND_Vita_Sample {
 /* Sound Bank Container (e.g. FIX.OSB, BNK_xx.OSB) */
 typedef struct SND_Vita_Bank {
     char                name[64];
+    uint32_t            bank_id;
     uint32_t            num_sounds;
     SND_Vita_Sample    *sounds;
     int                 loaded;
@@ -82,6 +83,7 @@ typedef struct SND_Vita_Bank {
 /* Single SFX Voice */
 typedef struct SND_Vita_Voice {
     int                 active;
+    uint32_t            bank_id;
     uint32_t            sound_id;
     const int16_t      *pcm_data;
     uint32_t            num_samples;
@@ -234,6 +236,16 @@ int     SND_Vita_LoadFixBank(void);
 int     SND_Vita_LoadBank(const char *szBankPath);
 
 /**
+ * @brief Loads sound bank data directly from an in-memory SOSB container.
+ * @param bank_id Unique bank identifier (0 = fix bank, >= 1 = level bank).
+ * @param data    Pointer to raw SOSB container data in memory.
+ * @param size    Size of container buffer in bytes.
+ * @param name    Human-readable bank descriptor name.
+ * @return 0 on success, negative on error.
+ */
+int     SND_Vita_LoadBankData(uint32_t bank_id, const uint8_t *data, size_t size, const char *name);
+
+/**
  * @brief Unloads the current level sound bank and frees associated sample buffers.
  */
 void    SND_Vita_UnloadBank(void);
@@ -274,16 +286,15 @@ const SND_Vita_Sample *SND_Vita_GetSoundDescriptor(uint32_t ulSoundId);
 const SND_Vita_Sample *SND_Vita_GetBankSoundDescriptor(int bLevelBank, uint32_t ulSoundId);
 
 /**
- * @brief Plays a sound effect with volume, pan, pitch scale, and loop control.
+ * @brief Plays a sound effect with explicit slot targeting or auto-allocation.
  *
+ * @param slot_id   Target voice slot (0..15), or -1 for auto-allocation / stealing.
  * @param ulSoundId Sound index in the bank.
  * @param fVolume   Voice volume (0.0f silent to 1.0f full).
  * @param fPan      Stereo panning (-1.0f left, 0.0f center, +1.0f right).
- * @param fPitch    Pitch scale (1.0f = normal pitch).
- * @param bLoop     1 to loop, 0 for one-shot.
  * @return Allocated voice index (0..15), or -1 if no voice could be assigned.
  */
-int     SND_Vita_PlaySoundEx(uint32_t ulSoundId, float fVolume, float fPan, float fPitch, int bLoop);
+int     SND_Vita_PlaySoundEx(int slot_id, uint32_t ulSoundId, float fVolume, float fPan);
 
 /**
  * @brief Triggers a sound effect voice using a bank-relative Sound ID.

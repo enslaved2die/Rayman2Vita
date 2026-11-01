@@ -15,9 +15,14 @@ typedef unsigned int GLuint;
 extern "C" {
 #endif
 
+/* vita_gl_render_init: vglInit + GL state; with the render thread (R2_RENDER_THREAD, default 1) the thread is created here and runs vglInit itself (this call waits for it).
+ * ta_hle.c at STARTRENDER: if vita_gl_rt_active(): vita_gl_present_frame(f) (takes ownership of f; blocks when the renderer is 2 frames behind), else vita_gl_render_frame(f); vita_gl_swap(); ta_frame_free(f). */
 void vita_gl_render_init(void);
 void vita_gl_render_frame(const TaFrame *frame);
 void vita_gl_swap(void);
+void vita_gl_present_frame(TaFrame *frame);
+void vita_gl_present_raw(TaRaw *raw, uint32_t shad_scale);     /* deferred parse: raw TA packets of one scene (ta.h TaRaw), parsed on the render thread; takes ownership */
+int  vita_gl_rt_active(void);
 
 /* per-process GL submission counters (cheap; read by vita_main.c's periodic log and by the host fake-GL test) */
 typedef struct VitaGlPerf {
@@ -26,7 +31,6 @@ typedef struct VitaGlPerf {
 } VitaGlPerf;
 extern VitaGlPerf vita_gl_perf;
 
-GLuint vita_gl_get_or_create_texture(uint32_t tcw, uint32_t tsp);
 void vita_gl_texture_cache_clear(void);
 
 #ifdef __cplusplus

@@ -27,8 +27,58 @@ HLE_DIR         := $(RECOMP_DIR)/hle
 # OPT_HOT: flags for everything that is not cold. OPT_COLD=cold (default) marks guest functions that never ran in the profiled host scenes (re_analysis/dc/hot_funcs.txt, ~60% of the 5705
 # lifted functions) with GCC's cold attribute (optimised for size, placed in .text.unlikely) via hle/coldmark.py; OPT_COLD=none compiles everything with OPT_HOT; OPT_COLD=<attribute text>
 # passes that attribute instead. Whole-program variants: OPT_HOT="-Os ..." / "-O2 ...". Text sizes of the variants: re_analysis/dc/notes_perf_cpu2.md.
-OPT_HOT         ?= -O3 -fno-math-errno -fomit-frame-pointer
-OPT_COLD        ?= cold
+# ------------------------------------------------------------------------------
+# VARIANTS (performance experiments, see re_analysis/dc/notes_perf_variants.md):
+#   make -f Makefile.vita VARIANT=<name> BUILD_DIR=build_vita_var<N>
+# Each variant only sets V_* knobs below; anything given on the command line (OPT_HOT=..., EXTRA_CFLAGS=...) still wins. The variant name and the exact flags are compiled into
+# the binary (build_dir/variant.c) and printed as the first "[vita] variant:" line of rayman2.log and in every [perf] block, so pasted logs identify themselves.
+# ------------------------------------------------------------------------------
+VARIANT         ?= v0_base
+V_OPT_HOT       :=
+V_OPT_COLD      :=
+V_DEFS          :=
+V_ORDER         :=
+OS_COLD         := __attribute__((cold,optimize("Os")))
+ifeq ($(VARIANT),v0_base)
+else ifeq ($(VARIANT),v1_noaudio)
+V_DEFS          := -DR2_AUDIO_MODE=1
+else ifeq ($(VARIANT),v1b_armonly)
+V_DEFS          := -DR2_AUDIO_MODE=2
+else ifeq ($(VARIANT),v2a_cpu_any)
+V_DEFS          := -DR2_GAME_CPU=0 -DR2_AUDIO_CPU=0
+else ifeq ($(VARIANT),v2b_cpu_shared1)
+V_DEFS          := -DR2_GAME_CPU=SCE_KERNEL_CPU_MASK_USER_1 -DR2_AUDIO_CPU=SCE_KERNEL_CPU_MASK_USER_1
+else ifeq ($(VARIANT),v2c_cpu_g2a1)
+V_DEFS          := -DR2_GAME_CPU=SCE_KERNEL_CPU_MASK_USER_2 -DR2_AUDIO_CPU=SCE_KERNEL_CPU_MASK_USER_1
+else ifeq ($(VARIANT),v2d_cpu_g1a0)
+V_DEFS          := -DR2_GAME_CPU=SCE_KERNEL_CPU_MASK_USER_1 -DR2_AUDIO_CPU=SCE_KERNEL_CPU_MASK_USER_0
+else ifeq ($(VARIANT),v3a_O3_all)
+V_OPT_COLD      := none
+else ifeq ($(VARIANT),v3b_Os_all)
+V_DEFS          := -DR2_LAYOUT_PAD=20480
+V_OPT_HOT       := -Os -fno-math-errno -fomit-frame-pointer
+V_OPT_COLD      := none
+else ifeq ($(VARIANT),v3c_O2_oscold)
+V_OPT_HOT       := -O2 -fno-math-errno -fomit-frame-pointer
+V_OPT_COLD      := $(OS_COLD)
+else ifeq ($(VARIANT),v3d_O3_oscold)
+V_OPT_COLD      := $(OS_COLD)
+else ifeq ($(VARIANT),v3e_O3_packed)
+V_ORDER         := 1
+else ifeq ($(VARIANT),v3f_O2_oscold_packed)
+V_OPT_HOT       := -O2 -fno-math-errno -fomit-frame-pointer
+V_OPT_COLD      := $(OS_COLD)
+V_ORDER         := 1
+else ifeq ($(VARIANT),v4_subcheck)
+V_DEFS          := -DR2_FASTCHK_SUB
+else ifeq ($(VARIANT),v5_scale75)
+V_DEFS          := -DR2_INTERNAL_SCALE=75
+else
+$(error unknown VARIANT '$(VARIANT)': see Makefile.vita / re_analysis/dc/notes_perf_variants.md)
+endif
+
+OPT_HOT         ?= $(if $(V_OPT_HOT),$(V_OPT_HOT),-O3 -fno-math-errno -fomit-frame-pointer)
+OPT_COLD        ?= $(if $(V_OPT_COLD),$(V_OPT_COLD),cold)
 OPT             ?= $(OPT_HOT)
 HOT_LIST        ?= re_analysis/dc/hot_funcs.txt
 ifeq ($(OPT_COLD),none)
@@ -38,14 +88,27 @@ COLD_FILTER     := python3 $(HLE_DIR)/coldmark.py $(HOT_LIST)
 else
 COLD_FILTER     := python3 $(HLE_DIR)/coldmark.py $(HOT_LIST) '$(OPT_COLD)'
 endif
+
+# Render thread (R2_RENDER_THREAD): 1 (default) = dedicated GL thread; 0 = inline on game thread
+RENDER_THREAD   ?= 1
+ifeq ($(RENDER_THREAD),0)
+V_DEFS          += -DR2_RENDER_THREAD=0
+endif
+
 CFLAGS          := $(OPT) -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
                    -fno-strict-aliasing -ffunction-sections -fdata-sections \
-                   $(EXTRA_CFLAGS) \
+                   $(V_DEFS) $(EXTRA_CFLAGS) \
                    -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-label \
                    -DCPA_PLATFORM_VITA -DR2_DREAMCAST_BASELINE -D__vita__ \
                    -I$(RECOMP_DIR) -I$(HGEN) -I$(HLE_DIR) -Iinclude -Isrc/platform/vita
 
 LDFLAGS         := -Wl,-q -Wl,--gc-sections -L$(VITASDK)/arm-vita-eabi/lib
+# V_ORDER=1 (variants *_packed): a linker script (default script + hot list, hotorder.py) puts the .text.f_<addr> sections of the profiled hot functions (hot_funcs.txt, most-called first) contiguously at the
+# start of .text, so the hot set occupies ~1/3 of the pages / cache sets it is otherwise spread over (the lifter emits functions in address order; hot and cold interleave).
+HOT_ORDER       := $(BUILD_DIR)/hot_order.ld
+ifeq ($(V_ORDER),1)
+LDFLAGS         += -Wl,-T,$(HOT_ORDER)
+endif
 
 # PROFILE=1: per-frame split of GL submit / swap / TA SQ parse time in the [vita] log line (costs two timer reads per TA write).
 ifeq ($(PROFILE),1)
@@ -73,8 +136,8 @@ LIBS            := -lvitaGL \
                    -lstdc++ \
                    -lm
 
-# Audio module: cleanroom audio engine by default, or fallback to AICA emulator snd.c
-USE_CLEANROOM_AUDIO ?= 1
+# Audio module: cleanroom audio engine (0 = fallback to AICA emulator snd.c, 1 = cleanroom audio)
+USE_CLEANROOM_AUDIO ?= 0
 ifeq ($(USE_CLEANROOM_AUDIO),1)
 SND_SRC         ?= $(HLE_DIR)/snd_cleanroom.c
 EXTRA_OBJS      += $(BUILD_DIR)/snd_vita.o
@@ -104,6 +167,7 @@ COMMON_OBJS     := $(BUILD_DIR)/recomp_functab.o \
                    $(BUILD_DIR)/runtime.o \
                    $(BUILD_DIR)/hook_stubs.o
 
+COMMON_OBJS     += $(BUILD_DIR)/variant.o
 ALL_OBJS        := $(RECOMP_OBJS) $(COMMON_OBJS) $(HLE_OBJS) $(EXTRA_OBJS)
 
 ELF             := $(BUILD_DIR)/$(TARGET).elf
@@ -127,6 +191,19 @@ stubs: $(BUILD_DIR)/rename.sed $(BUILD_DIR)/hook_stubs.c
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+# variant.c: name + flags of this build (rewritten only when the text changes, so make stays quiet); linked into the binary and logged by vita_main.c / perf.c
+VARIANT_FLAGS   := OPT_HOT=[$(OPT_HOT)] OPT_COLD=[$(OPT_COLD)] V_DEFS=[$(V_DEFS)] EXTRA_CFLAGS=[$(EXTRA_CFLAGS)] ORDER=$(if $(V_ORDER),hot-first,none) PROFILE=$(PROFILE) AUDIO=$(if $(filter 1,$(USE_CLEANROOM_AUDIO)),cleanroom,aica)
+VAR_ESC         = $(subst ",\",$(subst \,\\,$(1)))
+.PHONY: FORCE
+FORCE:
+$(BUILD_DIR)/variant.c: FORCE | $(BUILD_DIR)
+	@printf 'const char r2_variant_name[] = "%s";\nconst char r2_variant_flags[] = "%s";\n' '$(call VAR_ESC,$(VARIANT))' '$(call VAR_ESC,$(VARIANT_FLAGS))' > $@.new; \
+	  if cmp -s $@.new $@; then rm -f $@.new; else mv $@.new $@; fi
+$(BUILD_DIR)/variant.o: $(BUILD_DIR)/variant.c
+	$(CC) $(CFLAGS) -c $< -o $@
+$(HOT_ORDER): $(HOT_LIST) $(HLE_DIR)/hotorder.py | $(BUILD_DIR)
+	$(CC) -x c /dev/null -Wl,--verbose -nostartfiles -nostdlib -o /dev/null 2>/dev/null | sed -n '/^======/,/^======/p' | sed '1d;$$d' | python3 $(HLE_DIR)/hotorder.py $(HOT_LIST) > $@
 
 $(BUILD_DIR)/rename.sed: $(HLE_DIR)/mkstubs.py $(HGEN)/recomp_decls.h | $(BUILD_DIR)
 	cd $(RECOMP_DIR) && python3 hle/mkstubs.py gen_fix
@@ -154,8 +231,8 @@ $(BUILD_DIR)/hle_%.o: $(HLE_DIR)/%.c $(HLE_DIR)/hle.h $(HLE_DIR)/hle_priv.h $(RE
 $(BUILD_DIR)/snd_vita.o: src/platform/vita/snd_vita.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(ELF): $(ALL_OBJS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LIBS) -o $@
+$(ELF): $(ALL_OBJS) $(if $(V_ORDER),$(HOT_ORDER)) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(LDFLAGS) $(filter-out %.ld,$^) $(LIBS) -o $@
 
 $(VELF): $(ELF)
 	$(VITA_ELF_CREATE) $< $@

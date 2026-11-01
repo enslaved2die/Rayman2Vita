@@ -2,6 +2,7 @@
  * registers, ASIC/PVR/AICA/maple register file, timers, hook infrastructure, tracing. See hle.h. */
 #define _DARWIN_C_SOURCE
 #include "hle_priv.h"
+#include "perf.h"
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -359,7 +360,13 @@ static uint32_t def_read(uint32_t a, int size) {
     if (!is_modelled_reg(k)) { hle_unhandled("rd", a, size, 0); poll_check(a, 0, 1); return 0; }
     RegEnt *r = reg_slot(k & ~3u);
     switch (k & ~3u) {
-    case 0xFFD8000Cu: v = tmu_tcnt0(); break;                                       /* TCNT0 */
+    case 0xFFD8000Cu:
+#ifdef R2_IO_HIST
+        { static struct { uint32_t pr; unsigned long n; } t[64]; static int nt;
+          int i; for (i = 0; i < nt && t[i].pr != G->pr; i++); if (i == nt && nt < 64) { t[nt].pr = G->pr; t[nt++].n = 0; } if (i < 64) t[i].n++;
+          static unsigned long cnt; if ((++cnt & 0xFFFFF) == 0) for (int j = 0; j < nt; j++) fprintf(stderr, "[tcnt] pr=%08x n=%lu\n", t[j].pr, t[j].n); }
+#endif
+        v = tmu_tcnt0(); break;                                       /* TCNT0 */
     case 0xFF800030u: v = 0x300 | (r->val & ~0x300u); break;                        /* PDTRA: cable type 3 = composite/NTSC */
     case 0x005F810Cu: v = spg_status(); break;                                      /* SPG_STATUS */
     case 0x005F6904u: v = 0; break;                                                 /* ISTEXT: no external (GD-ROM/AICA/modem) interrupts raised
@@ -663,13 +670,29 @@ static int asic_flush_one(void) {
 }
 static void asic_flush_all(void) { while (asic_flush_one()) {} }
 int hle_no_pace;                                   /* run_game --fast: do not sleep to hold 60 Hz (guest-visible time via TMU/SPG stays wall-clock) */
+/* Vblank pacing.  The guest takes one vblank per idle poll and (30 fps lock) waits for two per frame.  Old rule: next vblank due = delivery time + 16.7 ms, so a frame whose game code needs
+ * 34 ms (just over two vblanks) got its first vblank at +34 ms and then slept another full 16.7 ms for the second: 51 ms per frame (3 vblanks, 20 fps) although the work fits in 35 ms.  Real hardware has
+ * a fixed vblank timeline: vblanks that passed while the guest was busy are already pending.  Catch-up: keep a fixed timeline `due_ns` and deliver late vblanks immediately as long as the guest is
+ * less than two frames behind (beyond that - a load, a stall - the timeline is re-based like before).  next_vb_ns (the reference of the guest-clock ceiling) keeps its old meaning, so the guest clock and
+ * the AICA sample clock do not change; only paced runs are affected (--fast keeps the old rule, so the host digests stay comparable).  Disable: env R2_VBLANK_CATCHUP=0 (host) / file ux0:data/rayman2/NO_CATCHUP (Vita). */
+static uint64_t due_ns; static int vb_catchup = -1;
 static void deliver_vblank(SH4Ctx *c) {          /* paced 60 Hz VBlank-in, as the hardware would raise while the guest waits */
     if (cb_vblank) cb_vblank(c);
+    if (vb_catchup < 0) {
+#if defined(__vita__)
+        FILE *nf = fopen("ux0:data/rayman2/NO_CATCHUP", "rb"); vb_catchup = nf ? 0 : 1; if (nf) fclose(nf);
+#else
+        const char *e = getenv("R2_VBLANK_CATCHUP"); vb_catchup = !(e && *e == '0');
+#endif
+    }
     uint64_t t = now_ns(); uint32_t pr = c->pr;
-    if (t < next_vb_ns) {
-        if (!hle_no_pace) { struct timespec ts = {0, (long)(next_vb_ns - t)}; nanosleep(&ts, 0); t = now_ns(); }
+    int cu = vb_catchup && !hle_no_pace && due_ns;
+    uint64_t due = cu ? due_ns : next_vb_ns;
+    if (t < due) {
+        if (!hle_no_pace) { struct timespec ts = {0, (long)(due - t)}; uint64_t ts0 = r2_now_us(); nanosleep(&ts, 0); g_perf.t_vsleep += r2_now_us() - ts0; g_perf.vsleep_n++; t = now_ns(); }
         else { clock_skew_ns += next_vb_ns - t; t = now_ns(); }
     }
+    if (vb_catchup && !hle_no_pace) due_ns = (cu && t >= due && t - due < 2 * FRAME_NS) ? due + FRAME_NS : t + FRAME_NS;
     next_vb_ns = t + FRAME_NS; vb_delivered++;
     if (vb_delivered < 4) hle_log("[irq] vblank #%lu: list[0xA6]=%08x list[0xA8]=%08x flag884=%08x", vb_delivered, LD32(0x8C2EC5ACu + 0xA6 * 4), LD32(0x8C2EC5ACu + 0xA8 * 4), LD32(0x8C2ED884u));
     uint32_t f0 = LD32(0x8C2ED884u);

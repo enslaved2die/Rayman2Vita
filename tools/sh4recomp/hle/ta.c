@@ -5,6 +5,9 @@
 #include <math.h>
 
 static float f32(uint32_t w) { float f; memcpy(&f, &w, 4); return f; }
+/* byte/255.f for all 256 byte values, computed with the very same division (a divide is ~15-30 cycles on the Cortex-A9's non-pipelined VFP divider; packed colours need 4-8 per vertex) */
+static float s_u8f[256]; static int s_u8f_ok;
+static void u8f_init(void) { for (int i = 0; i < 256; i++) s_u8f[i] = (float)(uint32_t)i / 255.f; s_u8f_ok = 1; }
 static float f16hi(uint32_t half) { return f32(half << 16); }   /* 16-bit UV = top half of an IEEE float [DOC] */
 
 /* ------------------------------------------------------------------ header */
@@ -53,12 +56,19 @@ void ta_decode_header(TaState *s, const uint32_t w[8], const uint32_t *w2)
 
 /* ------------------------------------------------------------------ frame storage */
 /* Frames are recycled through a small pool: the vertex/strip/mod arrays keep their capacity from frame to frame (no per-frame malloc/realloc growth from 256 elements, no free). */
-#define FRAME_POOL 4
+#define FRAME_POOL 8
 static TaFrame *frame_pool[FRAME_POOL]; static int frame_pool_n;
+/* the render thread (vita_gl_render.c) returns frames to the pool while the guest thread takes new ones: tiny spin lock around the pool operations */
+static volatile int pool_lock;
+static inline void pool_acquire(void) { while (__sync_lock_test_and_set(&pool_lock, 1)) { } }
+static inline void pool_release(void) { __sync_lock_release(&pool_lock); }
 static TaFrame *frame_new(void)
 {
-    if (frame_pool_n) {
-        TaFrame *f = frame_pool[--frame_pool_n];
+    pool_acquire();
+    TaFrame *pf = frame_pool_n ? frame_pool[--frame_pool_n] : NULL;
+    pool_release();
+    if (pf) {
+        TaFrame *f = pf;
         TaVertex *v = f->verts; uint32_t cv = f->capverts; TaStrip *st = f->strips; uint32_t cs = f->capstrips; TaModTri *m = f->mods; uint32_t cm = f->capmods;
         memset(f, 0, sizeof *f);
         f->verts = v; f->capverts = cv; f->strips = st; f->capstrips = cs; f->mods = m; f->capmods = cm;
@@ -69,14 +79,20 @@ static TaFrame *frame_new(void)
 void ta_frame_free(TaFrame *f)
 {
     if (!f) return;
-    if (frame_pool_n < FRAME_POOL && f->capverts <= (1u << 20)) { frame_pool[frame_pool_n++] = f; return; }
+    if (f->capverts <= (1u << 20)) {
+        pool_acquire();
+        if (frame_pool_n < FRAME_POOL) { frame_pool[frame_pool_n++] = f; pool_release(); return; }
+        pool_release();
+    }
     free(f->verts); free(f->strips); free(f->mods); free(f);
 }
 
 #define GROW(arr, n, cap) do { if ((n) >= (cap)) { (cap) = (cap) ? (cap) * 2 : 256; (arr) = realloc((arr), (cap) * sizeof(*(arr))); } } while (0)
 static TaVertex *push_vtx(TaFrame *f) { GROW(f->verts, f->nverts, f->capverts); TaVertex *v = &f->verts[f->nverts++]; memset(v, 0, sizeof *v); f->stats.verts++; return v; }
+/* fast variant for the common path: the caller writes all 13 floats */
+static inline TaVertex *push_vtx_nz(TaFrame *f) { if (__builtin_expect(f->nverts >= f->capverts, 0)) GROW(f->verts, f->nverts, f->capverts); f->stats.verts++; return &f->verts[f->nverts++]; }
 
-void ta_init(TaCtx *c) { memset(c, 0, sizeof *c); c->cur = frame_new(); c->cur_list = -1; }
+void ta_init(TaCtx *c) { if (!s_u8f_ok) u8f_init(); memset(c, 0, sizeof *c); c->cur = frame_new(); c->cur_list = -1; c->vch = 1; }
 void ta_destroy(TaCtx *c) { ta_frame_free(c->cur); c->cur = NULL; }
 void ta_set_sink(TaCtx *c, TaSinkFn fn, void *u) { c->sink = fn; c->sink_user = u; }
 
@@ -102,19 +118,21 @@ static void open_strip(TaCtx *c)
     c->strip_open = 1;
 }
 
+static int vertex_chunks(const TaCtx *c);
+static inline void recompute_vch(TaCtx *c);
 TaFrame *ta_take_frame(TaCtx *c)
 {
     close_strip(c, 1);        /* a trailing strip without EOS is not an error at frame end: silently closed */
     TaFrame *f = c->cur;
     c->cur = frame_new();
-    c->have_pend = 0; c->fifo_n = 0; c->hdr_valid = 0; c->cur_list = -1; c->mod_vol = 0;
+    c->have_pend = 0; c->fifo_n = 0; c->hdr_valid = 0; c->cur_list = -1; c->mod_vol = 0; recompute_vch(c);
     return f;
 }
 
 /* ------------------------------------------------------------------ vertex decode */
-static void pk(float o[4], uint32_t argb) { o[0] = (argb >> 24) / 255.f; o[1] = ((argb >> 16) & 255) / 255.f; o[2] = ((argb >> 8) & 255) / 255.f; o[3] = (argb & 255) / 255.f; }
-static void fl(float o[4], uint32_t a, uint32_t r, uint32_t g, uint32_t b) { o[0] = f32(a); o[1] = f32(r); o[2] = f32(g); o[3] = f32(b); }
-static void inten(float o[4], const float face[4], float i) { o[0] = face[0]; o[1] = face[1] * i; o[2] = face[2] * i; o[3] = face[3] * i; }
+static inline void pk(float o[4], uint32_t argb) { o[0] = s_u8f[argb >> 24]; o[1] = s_u8f[(argb >> 16) & 255]; o[2] = s_u8f[(argb >> 8) & 255]; o[3] = s_u8f[argb & 255]; }
+static inline void fl(float o[4], uint32_t a, uint32_t r, uint32_t g, uint32_t b) { o[0] = f32(a); o[1] = f32(r); o[2] = f32(g); o[3] = f32(b); }
+static inline void inten(float o[4], const float face[4], float i) { o[0] = face[0]; o[1] = face[1] * i; o[2] = face[2] * i; o[3] = face[3] * i; }
 
 /* number of 32 B chunks of a para-7 vertex under the current header */
 static int vertex_chunks(const TaCtx *c)
@@ -126,6 +144,8 @@ static int vertex_chunks(const TaCtx *c)
     if (h->textured && h->col_type == TA_COL_FLOAT) return 2;                        /* vertex type 5/6 [DOC] */
     return 1;
 }
+
+static inline void recompute_vch(TaCtx *c) { c->vch = vertex_chunks(c); }
 
 static void do_vertex(TaCtx *c, const uint32_t *w, int nch)
 {
@@ -166,12 +186,12 @@ static void do_vertex(TaCtx *c, const uint32_t *w, int nch)
     }
     if (h->volume) { f->stats.warn_unsupported++; if (eos) { /* nothing stored */ } return; }
     if (!c->strip_open) open_strip(c);
-    TaVertex *v = push_vtx(f);
+    TaVertex *v = push_vtx_nz(f);                       /* every field is written below (no memset) */
     v->x = f32(w[1]); v->y = f32(w[2]); v->z = f32(w[3]);
-    uint32_t b8_11[4] = { 0, 0, 0, 0 }, o12_15[4] = { 0, 0, 0, 0 }; int has2 = nch == 2;
-    if (has2) { memcpy(b8_11, w + 8, 16); memcpy(o12_15, w + 12, 16); }
     int col = h->col_type;
     if (!h->textured) {
+        v->u = 0.f; v->v = 0.f;
+        v->off[0] = v->off[1] = v->off[2] = v->off[3] = 0.f;
         if (col == TA_COL_PACKED) pk(v->base, w[6]);                                    /* type 0 [DOC] */
         else if (col == TA_COL_FLOAT) fl(v->base, w[4], w[5], w[6], w[7]);              /* type 1 [DOC] */
         else inten(v->base, col == 3 ? c->last_face : h->face, f32(w[6]));              /* type 2 [DOC] */
@@ -179,8 +199,10 @@ static void do_vertex(TaCtx *c, const uint32_t *w, int nch)
         if (h->uv16) { v->u = f16hi(w[4] >> 16); v->v = f16hi(w[4] & 0xFFFF); }         /* types 4/6/8 [DOC] */
         else { v->u = f32(w[4]); v->v = f32(w[5]); }                                    /* types 3/5/7 [GAME: type 3 produced by game] */
         if (col == TA_COL_PACKED) { pk(v->base, w[6]); pk(v->off, w[7]); }              /* type 3/4 [GAME] */
-        else if (col == TA_COL_FLOAT) { fl(v->base, b8_11[0], b8_11[1], b8_11[2], b8_11[3]); fl(v->off, o12_15[0], o12_15[1], o12_15[2], o12_15[3]); } /* 5/6 */
-        else {
+        else if (col == TA_COL_FLOAT) {                                                 /* 5/6: always a 64-byte vertex (vertex_chunks) */
+            if (nch == 2) { fl(v->base, w[8], w[9], w[10], w[11]); fl(v->off, w[12], w[13], w[14], w[15]); }
+            else { memset(v->base, 0, sizeof v->base); memset(v->off, 0, sizeof v->off); }
+        } else {
             const float *fc = col == 3 ? c->last_face : h->face, *fo = col == 3 ? c->last_face_off : h->face_off;
             inten(v->base, fc, f32(w[6])); inten(v->off, fo, f32(w[7]));              /* 7/8 */
         }
@@ -208,15 +230,19 @@ static void do_param(TaCtx *c, const uint32_t *w, int nch)
     case TA_P_SPRITEHDR: {
         close_strip(c, 0);
         int list = (w[0] >> 24) & 7;
-        if (list >= TA_NUM_LISTS) { f->stats.warn_unsupported++; c->hdr_valid = 0; break; }
+        if (list >= TA_NUM_LISTS) { f->stats.warn_unsupported++; c->hdr_valid = 0; recompute_vch(c); break; }
         c->cur_list = list;
         if (para == TA_P_POLYHDR && (list == TA_L_OPAQUE_MOD || list == TA_L_TRANS_MOD)) {   /* modifier volume header [DOC] */
-            memset(&c->hdr, 0, sizeof c->hdr); c->hdr.ctl = w[0]; c->hdr.isp = w[1]; c->hdr.list = (uint8_t)list; c->hdr_valid = 1; break;
+            memset(&c->hdr, 0, sizeof c->hdr); c->hdr.ctl = w[0]; c->hdr.isp = w[1]; c->hdr.list = (uint8_t)list; c->hdr_valid = 1; c->raw_prev_ok = 0; recompute_vch(c); break;
         }
+        /* Kamui emits runs of identical headers: when every raw word (and the user-clip rect) equals the previous decoded header, c->hdr already holds the result */
+        if (c->raw_prev_ok && c->raw_prev_n == nch && !memcmp(c->raw_prev, w, (size_t)nch * 32) && !memcmp(c->raw_prev_clip, c->clip_rect, sizeof c->clip_rect)) { c->hdr_valid = 1; recompute_vch(c); break; }
         ta_decode_header(&c->hdr, w, nch == 2 ? w + 8 : NULL);
         memcpy(c->hdr.clip, c->clip_rect, sizeof c->hdr.clip);
         if (c->hdr.col_type == TA_COL_INTENSITY1 && !c->hdr.is_sprite) { memcpy(c->last_face, c->hdr.face, 16); memcpy(c->last_face_off, c->hdr.face_off, 16); }
         c->hdr_valid = 1;
+        memcpy(c->raw_prev, w, (size_t)nch * 32); c->raw_prev_n = nch; memcpy(c->raw_prev_clip, c->clip_rect, sizeof c->clip_rect); c->raw_prev_ok = 1;
+        recompute_vch(c);
         break; }
     case TA_P_VERTEX: do_vertex(c, w, nch); break;
     default: f->stats.warn_unsupported++; break;    /* 3, 6: reserved */
@@ -236,7 +262,7 @@ void ta_write32(TaCtx *c, const void *p)
     unsigned para = w[0] >> 29;
     int need = 1;
     if (para == TA_P_POLYHDR) need = ta_header_chunks(w[0]);
-    else if (para == TA_P_VERTEX) need = vertex_chunks(c);
+    else if (para == TA_P_VERTEX) need = c->vch;
     if (need == 2) { memcpy(c->pend, w, 32); c->have_pend = 1; return; }
     do_param(c, w, 1);
 }
@@ -267,6 +293,85 @@ TaDest ta_ext_write32(TaCtx *c, uint32_t ext, const void *d)
 TaDest ta_sq_flush(TaCtx *c, uint32_t sq, const void *d, uint32_t q0, uint32_t q1)
 {
     return ta_ext_write32(c, ta_sq_translate(sq, q0, q1), d);
+}
+
+/* ------------------------------------------------------------------ raw capture (deferred parse) */
+static TaRaw *raw_pool[FRAME_POOL]; static int raw_pool_n;
+static TaRaw *raw_new(void)
+{
+    pool_acquire(); TaRaw *r = raw_pool_n ? raw_pool[--raw_pool_n] : NULL; pool_release();
+    if (r) { r->nbytes = 0; r->chunks = 0; r->ntex = 0; return r; }
+    r = (TaRaw *)calloc(1, sizeof *r);
+    return r;
+}
+void ta_raw_free(TaRaw *r)
+{
+    if (!r) return;
+    if (r->cap <= (1u << 24)) { pool_acquire(); if (raw_pool_n < FRAME_POOL) { raw_pool[raw_pool_n++] = r; pool_release(); return; } pool_release(); }
+    free(r->data); free(r->tex); free(r);
+}
+static inline void cap_recompute(TaCap *c)
+{
+    int v = 1;
+    if (c->cur_list == TA_L_OPAQUE_MOD || c->cur_list == TA_L_TRANS_MOD) v = 2;
+    else if (c->hdr_sprite) v = 2;
+    else if (c->hdr_volume) v = c->hdr_textured ? 2 : 1;
+    else if (c->hdr_textured && c->hdr_col == TA_COL_FLOAT) v = 2;
+    c->vch = v;
+}
+void ta_cap_init(TaCap *c) { memset(c, 0, sizeof *c); c->cur = raw_new(); c->cur_list = -1; c->vch = 1; }
+TaRaw *ta_cap_take(TaCap *c)
+{
+    TaRaw *r = c->cur;
+    c->cur = raw_new();
+    c->pend = 0; c->cur_list = -1; c->last_valid = 0; cap_recompute(c);
+    return r;
+}
+static int cap_param(TaCap *c, unsigned para, uint32_t w0, uint32_t tsp, uint32_t tcw)
+{
+    switch (para) {
+    case TA_P_ENDLIST: return (c->cur_list >= 0 && c->cur_list < TA_NUM_LISTS) ? c->cur_list + 1 : 0;
+    case TA_P_POLYHDR:
+    case TA_P_SPRITEHDR: {
+        int list = (int)((w0 >> 24) & 7);
+        if (list >= TA_NUM_LISTS) return 0;                       /* rejected header: parser state unchanged */
+        c->cur_list = list;
+        if (para == TA_P_POLYHDR && (list == TA_L_OPAQUE_MOD || list == TA_L_TRANS_MOD)) { c->hdr_sprite = c->hdr_volume = c->hdr_textured = c->hdr_col = 0; cap_recompute(c); return 0; }
+        c->hdr_sprite = para == TA_P_SPRITEHDR; c->hdr_volume = (uint8_t)((w0 >> 6) & 1); c->hdr_textured = (uint8_t)((w0 >> 3) & 1); c->hdr_col = (uint8_t)((w0 >> 4) & 3);
+        cap_recompute(c);
+        if (c->hdr_textured && list != TA_L_OPAQUE_MOD && list != TA_L_TRANS_MOD && !(c->last_valid && c->last_tcw == tcw && c->last_tsp == tsp)) {
+            TaRaw *r = c->cur;
+            if (r->ntex == r->captex) { r->captex = r->captex ? r->captex * 2 : 256; r->tex = (uint32_t (*)[2])realloc(r->tex, r->captex * sizeof *r->tex); }
+            r->tex[r->ntex][0] = tcw; r->tex[r->ntex][1] = tsp; r->ntex++;
+            c->last_tcw = tcw; c->last_tsp = tsp; c->last_valid = 1;
+        }
+        return 0; }
+    default: return 0;
+    }
+}
+int ta_cap_write32(TaCap *c, const void *p)
+{
+    TaRaw *r = c->cur;
+    if (__builtin_expect(r->nbytes + 32 > r->cap, 0)) { uint32_t nc = r->cap ? r->cap * 2 : 65536; r->data = (uint8_t *)realloc(r->data, nc); r->cap = nc; }
+    uint32_t *w = (uint32_t *)(void *)(r->data + r->nbytes);       /* 32-byte steps from a malloc'ed base: aligned */
+    memcpy(w, p, 32); r->nbytes += 32; r->chunks++;
+    uint32_t w0 = w[0];
+    if (c->pend) { c->pend = 0; return cap_param(c, c->pend_w0 >> 29, c->pend_w0, c->pend_w2, c->pend_w3); }
+    unsigned para = w0 >> 29;
+    int need = 1;
+    if (para == TA_P_POLYHDR) need = ta_header_chunks(w0);
+    else if (para == TA_P_VERTEX) need = c->vch;
+    if (need == 2) { c->pend = 1; c->pend_w0 = w0; c->pend_w2 = w[2]; c->pend_w3 = w[3]; return 0; }
+    return cap_param(c, para, w0, w[2], w[3]);
+}
+void ta_cap_write(TaCap *c, const void *p, size_t n, uint32_t eol[TA_NUM_LISTS])
+{
+    for (size_t o = 0; o + 32 <= n; o += 32) { int e = ta_cap_write32(c, (const uint8_t *)p + o); if (e) eol[e - 1]++; }
+}
+TaFrame *ta_parse_raw(TaCtx *c, const TaRaw *r)
+{
+    ta_write(c, r->data, r->nbytes);
+    return ta_take_frame(c);
 }
 
 /* ------------------------------------------------------------------ dump */
@@ -343,13 +448,6 @@ static int same_draw_state(const TaState *a, const TaState *b)
     if (a->textured && (a->tcw != b->tcw || ((a->tsp ^ b->tsp) & TSP_DRAW_MASK))) return 0;
     return 1;
 }
-static void to_gl(TaGlVertex *o, const TaVertex *v, const float base[4], const float off[4])
-{
-    o->x = v->x; o->y = v->y; o->z = v->z; o->u = v->u; o->v = v->v;
-    o->r = base[1]; o->g = base[2]; o->b = base[3]; o->a = base[0];
-    o->or_ = off[1]; o->og = off[2]; o->ob = off[3]; o->oa = off[0];
-}
-
 /* growable vertex output */
 static int gl_reserve(TaGl *g, uint32_t *cap, uint32_t extra)
 {
@@ -364,7 +462,7 @@ static int clip_poly(ClipV *in, int n, ClipV *out, int axis, float lim, int keep
 {
     int m = 0;
     for (int i = 0; i < n; i++) {
-        const ClipV *p = &in[i], *q = &in[(i + 1) % n];
+        const ClipV *p = &in[i], *q = &in[i + 1 == n ? 0 : i + 1];
         float dp = keep_greater ? p->a[axis] - lim : lim - p->a[axis], dq = keep_greater ? q->a[axis] - lim : lim - q->a[axis];
         int ip = dp >= 0, iq = dq >= 0;
         if (ip) out[m++] = *p;
@@ -372,23 +470,62 @@ static int clip_poly(ClipV *in, int n, ClipV *out, int axis, float lim, int keep
     }
     return m;
 }
-static void shade_alpha(float *a, const TaState *st)
+/* ---- build helpers.  Everything below produces bit-identical output to the previous per-triangle implementation (hle/tests_ta/ta_ref.c keeps that version; bench_ta.c compares them): the
+ * changes are only about cost on an in-order Cortex-A9 (floorf/fminf/fabsf are libm calls on VFPv3, divisions are ~15-30 cycles, every strip vertex was converted 3x). ---- */
+/* TA_VITA_MATH: integer/bit versions of isfinite / floorf / fminf.  On the Cortex-A9 (VFPv3, no vrintm / vminnm) these are newlib calls (~30-60 cycles each, called 2-4x per triangle) or
+ * vcmp+vmrs pairs; on ARMv8 / x86 hosts they are single instructions and the libm version is faster, so the host build uses libm unless -DTA_VITA_MATH is given (bench_ta compares both
+ * against the old code bit for bit). */
+#if defined(__vita__) || defined(TA_VITA_MATH)
+static inline int fin_f(float x) { uint32_t u; memcpy(&u, &x, 4); return (u & 0x7F800000u) != 0x7F800000u; }
+/* floorf() for |x| < 2^23 via an int round trip; keeps -0.0, passes inf / NaN / huge values through (all already integral or non-numbers) */
+static inline float ffloor_f(float x)
 {
-    if (st->textured && st->shading == 1) *a = 1.f;            /* modulate: alpha = texture alpha */
-    if (!st->use_alpha) *a = 1.f;                              /* use-alpha off: alpha treated as 1 [DOC] */
+    if (!(fabsf(x) < 8388608.f)) return x;
+    if (x == 0.f) return x;
+    float t = (float)(int)x;
+    return t > x ? t - 1.f : t;
 }
-
+/* == fminf().  Only the +0 / -0 tie differs between libms: newlib (Vita) returns the second argument, glibc/macOS libm the negative zero; host test builds follow the host libm so
+ * the equality tests against the old code are bit-exact, the Vita build follows newlib (the sign of a zero UV is never visible). */
+static inline float fmin_f(float a, float b)
+{
+#if defined(__vita__)
+    return (a < b || b != b) ? a : b;
+#else
+    if (b != b) return a;
+    if (a != a) return b;
+    if (a < b) return a;
+    if (b < a) return b;
+    uint32_t ua; memcpy(&ua, &a, 4); return (ua >> 31) ? a : b;
+#endif
+}
+#else
+static inline int fin_f(float x) { return isfinite(x); }
+static inline float ffloor_f(float x) { return floorf(x); }
+static inline float fmin_f(float a, float b) { return fminf(a, b); }
+#endif
+/* position / uv from v, colours (a,r,g,b base + offset) from c; alpha adjusted to the TSP shading mode */
+static inline void conv_vtx(TaGlVertex *restrict t, const TaVertex *restrict v, const TaVertex *restrict c, int force_a1)
+{
+    t->x = v->x; t->y = v->y; t->z = v->z; t->u = v->u; t->v = v->v;
+    t->r = c->base[1]; t->g = c->base[2]; t->b = c->base[3]; t->a = force_a1 ? 1.f : c->base[0];
+    t->or_ = c->off[1]; t->og = c->off[2]; t->ob = c->off[3]; t->oa = c->off[0];
+}
 int ta_build_gl_ex(const TaFrame *f, TaGl *g, const TaBuildOpts *o)
 {
     memset(g, 0, sizeof *g);
-    return ta_build_gl_reuse(f, g, o);
+    int r = ta_build_gl_reuse(f, g, o);
+    if (r == 0) { free(g->sidx); g->sidx = NULL; g->sidx_cap = 0; }
+    return r;
 }
 /* Same as ta_build_gl_ex, but g must be zero-initialised once and may then be passed to every later call: its vertex / batch arrays keep their capacity (g->capverts / capbatches). */
 int ta_build_gl_reuse(const TaFrame *f, TaGl *g, const TaBuildOpts *o)
 {
     TaGlVertex *keep_v = g->verts; uint32_t keep_cv = g->capverts; TaBatch *keep_b = g->batches; uint32_t keep_cb = g->capbatches;
+    uint32_t *keep_si = g->sidx; uint32_t keep_sic = g->sidx_cap;
     memset(g, 0, sizeof *g);
     g->verts = keep_v; g->capverts = keep_cv; g->batches = keep_b; g->capbatches = keep_cb;
+    g->sidx = keep_si; g->sidx_cap = keep_sic;
     uint32_t cap = g->capverts;
     uint32_t need_b = f->nstrips ? f->nstrips : 1;
     if (g->capbatches < need_b) {
@@ -396,54 +533,68 @@ int ta_build_gl_reuse(const TaFrame *f, TaGl *g, const TaBuildOpts *o)
         if (!nb) { ta_gl_free(g); return -1; }
         g->batches = nb; g->capbatches = need_b;
     }
+    if (g->sidx_cap < need_b) {
+        uint32_t *ns = (uint32_t *)realloc(g->sidx, need_b * sizeof(uint32_t));
+        if (!ns) { ta_gl_free(g); return -1; }
+        g->sidx = ns; g->sidx_cap = need_b;
+    }
     if (gl_reserve(g, &cap, 3) != 0) { ta_gl_free(g); return -1; }
+
+    /* strips grouped by list, submission order kept inside a list (one pass over the large TaStrip records instead of five) */
+    uint32_t lcnt[TA_NUM_LISTS] = { 0 }, lpos[TA_NUM_LISTS], lbeg[TA_NUM_LISTS];
+    for (uint32_t i = 0; i < f->nstrips; i++) { const TaStrip *s = &f->strips[i]; if (s->count >= 3 && s->st.list < TA_NUM_LISTS) lcnt[s->st.list]++; }
+    { uint32_t acc = 0; for (int l = 0; l < TA_NUM_LISTS; l++) { lbeg[l] = lpos[l] = acc; acc += lcnt[l]; } }
+    for (uint32_t i = 0; i < f->nstrips; i++) { const TaStrip *s = &f->strips[i]; if (s->count >= 3 && s->st.list < TA_NUM_LISTS) g->sidx[lpos[s->st.list]++] = i; }
+
+    const int do_cull = o && o->cull, do_clip = o && o->clip;
+    const float cx0 = o ? o->clip_x0 : 0.f, cy0 = o ? o->clip_y0 : 0.f, cx1 = o ? o->clip_x1 : 0.f, cy1 = o ? o->clip_y1 : 0.f;
     for (int l = 0; l < TA_NUM_LISTS; l++) {
         g->list_first[l] = g->nbatches;
         if (l == TA_L_OPAQUE_MOD || l == TA_L_TRANS_MOD) continue;
-        for (uint32_t i = 0; i < f->nstrips; i++) {
-            const TaStrip *s = &f->strips[i];
-            if (s->st.list != l || s->count < 3) continue;
+        for (uint32_t si = lbeg[l]; si < lbeg[l] + lcnt[l]; si++) {
+            const TaStrip *s = &f->strips[g->sidx[si]];
+            const TaState *st = &s->st;
             TaBatch *b = g->nbatches ? &g->batches[g->nbatches - 1] : NULL;
-            int merge = b && g->nbatches > g->list_first[l] && ((l == TA_L_TRANS || (o && o->exact_merge)) ? same_state(&b->st, &s->st) : same_draw_state(&b->st, &s->st));
+            int merge = b && g->nbatches > g->list_first[l] && ((l == TA_L_TRANS || (o && o->exact_merge)) ? same_state(&b->st, st) : same_draw_state(&b->st, st));
             if (!merge) {
-                b = &g->batches[g->nbatches++]; b->st = s->st; b->first = g->nverts; b->count = 0;
+                b = &g->batches[g->nbatches++]; b->st = *st; b->first = g->nverts; b->count = 0;
             }
             const TaVertex *V = &f->verts[s->first];
-            for (uint32_t k = 0; k + 2 < s->count; k++) {
-                int idx[3] = { (int)k, (int)k + 1, (int)k + 2 };
-                if (k & 1) { int t = idx[0]; idx[0] = idx[1]; idx[1] = t; }   /* keep winding consistent along the strip */
-                const TaVertex *pv = &V[k + 2];                               /* provoking vertex for flat shading = last of the triangle */
-                TaGlVertex t3[3];
-                int ok = 1;
-                for (int j = 0; j < 3; j++) {
-                    const TaVertex *v = &V[idx[j]];
-                    to_gl(&t3[j], v, s->st.gouraud ? v->base : pv->base, s->st.gouraud ? v->off : pv->off);
-                    shade_alpha(&t3[j].a, &s->st);
-                    if (o && !(isfinite(t3[j].x) && isfinite(t3[j].y) && isfinite(t3[j].z) && t3[j].z > 0.f && isfinite(t3[j].u) && isfinite(t3[j].v))) ok = 0;
+            const uint32_t nv = s->count, ntri = nv - 2;
+            if (gl_reserve(g, &cap, 3 * ntri) != 0) { ta_gl_free(g); return -1; }
+            const int force_a1 = (st->textured && st->shading == 1) || !st->use_alpha;
+            const int gouraud = st->gouraud, textured = st->textured;
+            const int clamp_u = st->clamp_u, clamp_v = st->clamp_v, flip_u = st->flip_u, flip_v = st->flip_v;
+            const int cull_mode = st->cull_mode;
+            /* one triangle per strip position, converted straight into the output array (no temporaries / second copy) and kept when it survives.  The vertex conversion is a handful of
+             * loads/stores, cheaper than a scratch pass for the typical 3-vertex strip (8375 vertices in 2745 strips in a heavy intro frame). */
+            TaGlVertex *gv = g->verts; uint32_t nvl = g->nverts, bc = b->count;      /* register copies of g->nverts / b->count / g->verts (the Vita build is -fno-strict-aliasing: every float store would force a reload) */
+            for (uint32_t k = 0; k < ntri; k++) {
+                const TaVertex *v0 = &V[(k & 1) ? k + 1 : k], *v1 = &V[(k & 1) ? k : k + 1], *pv = &V[k + 2];   /* winding kept consistent along the strip; flat shading uses the last vertex */
+                TaGlVertex *d = gv + nvl;
+                if (gouraud) { conv_vtx(&d[0], v0, v0, force_a1); conv_vtx(&d[1], v1, v1, force_a1); conv_vtx(&d[2], pv, pv, force_a1); }
+                else         { conv_vtx(&d[0], v0, pv, force_a1); conv_vtx(&d[1], v1, pv, force_a1); conv_vtx(&d[2], pv, pv, force_a1); }
+                if (o && !(fin_f(d[0].x) & fin_f(d[0].y) & fin_f(d[0].z) & fin_f(d[1].x) & fin_f(d[1].y) & fin_f(d[1].z) & fin_f(d[2].x) & fin_f(d[2].y) & fin_f(d[2].z) &
+                           (d[0].z > 0.f) & (d[1].z > 0.f) & (d[2].z > 0.f) & fin_f(d[0].u) & fin_f(d[0].v) & fin_f(d[1].u) & fin_f(d[1].v) & fin_f(d[2].u) & fin_f(d[2].v))) continue;
+                if (textured) {   /* rebase UVs so GLES varyings stay small: wrap is periodic (repeat: 1, mirror: 2), clamp axes untouched */
+                    float mu = fmin_f(d[0].u, fmin_f(d[1].u, d[2].u)), mv = fmin_f(d[0].v, fmin_f(d[1].v, d[2].v));
+                    float ku = clamp_u ? 0.f : (flip_u ? ffloor_f(mu * 0.5f) * 2.f : ffloor_f(mu));
+                    float kv = clamp_v ? 0.f : (flip_v ? ffloor_f(mv * 0.5f) * 2.f : ffloor_f(mv));
+                    if (fabsf(mu) < 1e6f && fabsf(mv) < 1e6f) { d[0].u -= ku; d[0].v -= kv; d[1].u -= ku; d[1].v -= kv; d[2].u -= ku; d[2].v -= kv; }
                 }
-                if (!ok) continue;
-                if (s->st.textured) {   /* rebase UVs so GLES varyings stay small: wrap is periodic (repeat: 1, mirror: 2), clamp axes untouched */
-                    float mu = fminf(t3[0].u, fminf(t3[1].u, t3[2].u)), mv = fminf(t3[0].v, fminf(t3[1].v, t3[2].v));
-                    float ku = s->st.clamp_u ? 0.f : floorf(mu / (s->st.flip_u ? 2.f : 1.f)) * (s->st.flip_u ? 2.f : 1.f);
-                    float kv = s->st.clamp_v ? 0.f : floorf(mv / (s->st.flip_v ? 2.f : 1.f)) * (s->st.flip_v ? 2.f : 1.f);
-                    if (fabsf(mu) < 1e6f && fabsf(mv) < 1e6f) for (int j = 0; j < 3; j++) { t3[j].u -= ku; t3[j].v -= kv; }
-                }
-                if (o && o->cull && s->st.cull_mode >= 2) {
-                    float det = (t3[1].x - t3[0].x) * (t3[2].y - t3[0].y) - (t3[2].x - t3[0].x) * (t3[1].y - t3[0].y);
-                    if ((s->st.cull_mode == 2 && det < 0.f) || (s->st.cull_mode == 3 && det > 0.f)) continue;
+                if (do_cull && cull_mode >= 2) {
+                    float det = (d[1].x - d[0].x) * (d[2].y - d[0].y) - (d[2].x - d[0].x) * (d[1].y - d[0].y);
+                    if ((cull_mode == 2 && det < 0.f) || (cull_mode == 3 && det > 0.f)) continue;
                 }
                 int inside = 1;
-                if (o && o->clip)
+                if (do_clip)
                     for (int j = 0; j < 3; j++)
-                        if (t3[j].x < o->clip_x0 || t3[j].x > o->clip_x1 || t3[j].y < o->clip_y0 || t3[j].y > o->clip_y1) inside = 0;
-                if (inside) {
-                    if (gl_reserve(g, &cap, 3) != 0) { ta_gl_free(g); return -1; }
-                    memcpy(&g->verts[g->nverts], t3, sizeof t3); g->nverts += 3; b->count += 3;
-                    continue;
-                }
+                        if (d[j].x < cx0 || d[j].x > cx1 || d[j].y < cy0 || d[j].y > cy1) inside = 0;
+                if (inside) { nvl += 3; bc += 3; continue; }
+                g->nverts = nvl; b->count = bc;
                 ClipV pa[16], pb[16];
                 for (int j = 0; j < 3; j++) {
-                    float *a = pa[j].a; const TaGlVertex *t = &t3[j];
+                    float *a = pa[j].a; const TaGlVertex *t = &d[j];
                     a[0] = t->x; a[1] = t->y; a[2] = t->z; a[3] = t->u * t->z; a[4] = t->v * t->z;
                     a[5] = t->r * t->z; a[6] = t->g * t->z; a[7] = t->b * t->z; a[8] = t->a * t->z; a[9] = t->or_ * t->z; a[10] = t->og * t->z; a[11] = t->ob * t->z; a[12] = t->oa * t->z;   /* colours interpolate perspective-correctly (like uv): clip them as attr*invW */
                 }
@@ -452,17 +603,19 @@ int ta_build_gl_reuse(const TaFrame *f, TaGl *g, const TaBuildOpts *o)
                 n = clip_poly(pb, n, pa, 0, o->clip_x1, 0); if (n < 3) continue;
                 n = clip_poly(pa, n, pb, 1, o->clip_y0, 1); if (n < 3) continue;
                 n = clip_poly(pb, n, pa, 1, o->clip_y1, 0); if (n < 3) continue;
-                if (gl_reserve(g, &cap, 3 * (uint32_t)(n - 2)) != 0) { ta_gl_free(g); return -1; }
+                if (gl_reserve(g, &cap, 3 * (uint32_t)(n - 2) + 3 * (ntri - k)) != 0) { ta_gl_free(g); return -1; }
                 for (int m = 1; m + 1 < n; m++) {
                     const ClipV *tri[3] = { &pa[0], &pa[m], &pa[m + 1] };
                     for (int j = 0; j < 3; j++) {
-                        const float *a = tri[j]->a; TaGlVertex *d = &g->verts[g->nverts++];
-                        d->x = a[0]; d->y = a[1]; d->z = a[2]; d->u = a[3] / a[2]; d->v = a[4] / a[2];
-                        d->r = a[5] / a[2]; d->g = a[6] / a[2]; d->b = a[7] / a[2]; d->a = a[8] / a[2]; d->or_ = a[9] / a[2]; d->og = a[10] / a[2]; d->ob = a[11] / a[2]; d->oa = a[12] / a[2];
+                        const float *a = tri[j]->a; TaGlVertex *dd = &g->verts[g->nverts++];
+                        dd->x = a[0]; dd->y = a[1]; dd->z = a[2]; dd->u = a[3] / a[2]; dd->v = a[4] / a[2];
+                        dd->r = a[5] / a[2]; dd->g = a[6] / a[2]; dd->b = a[7] / a[2]; dd->a = a[8] / a[2]; dd->or_ = a[9] / a[2]; dd->og = a[10] / a[2]; dd->ob = a[11] / a[2]; dd->oa = a[12] / a[2];
                     }
                     b->count += 3;
                 }
+                gv = g->verts; nvl = g->nverts; bc = b->count;
             }
+            g->nverts = nvl; b->count = bc;
         }
         g->list_count[l] = g->nbatches - g->list_first[l];
     }
@@ -637,7 +790,7 @@ int ta_tex_decode(const uint8_t *vram, uint32_t vn, uint32_t tcw, uint32_t tsp, 
     return 0;
 }
 
-void ta_gl_free(TaGl *g) { free(g->verts); free(g->batches); memset(g, 0, sizeof *g); }
+void ta_gl_free(TaGl *g) { free(g->verts); free(g->batches); free(g->sidx); memset(g, 0, sizeof *g); }
 
 
 /* Reference (original) implementation, kept for the exactness test. */

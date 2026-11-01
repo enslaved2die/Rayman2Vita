@@ -87,11 +87,17 @@ __attribute__((weak)) void SND_Vita_Shutdown(void) {}
 __attribute__((weak)) int SND_Vita_IsInitialized(void) { return 1; }
 __attribute__((weak)) int SND_Vita_LoadFixBank(void) { return 0; }
 __attribute__((weak)) int SND_Vita_LoadBank(const char *path) { (void)path; return 0; }
+__attribute__((weak)) int SND_Vita_LoadBankData(uint32_t bank_id, const uint8_t *data, size_t size, const char *name) { (void)bank_id; (void)data; (void)size; (void)name; return 0; }
 __attribute__((weak)) void SND_Vita_UnloadBank(void) {}
 __attribute__((weak)) void SND_Vita_UnloadFixBank(void) {}
 __attribute__((weak)) int SND_Vita_PlaySound(uint32_t id, float v, float p) { (void)id; (void)v; (void)p; return 0; }
+__attribute__((weak)) int SND_Vita_PlaySoundEx(int slot, uint32_t id, float v, float p) { (void)slot; (void)id; (void)v; (void)p; return 0; }
+__attribute__((weak)) int SND_Vita_IsVoicePlaying(int voice_idx) { (void)voice_idx; return 0; }
 __attribute__((weak)) void SND_Vita_StopVoice(int idx) { (void)idx; }
 __attribute__((weak)) void SND_Vita_StopAllVoices(void) {}
+__attribute__((weak)) void SND_Vita_SetVoicePan(int idx, float p) { (void)idx; (void)p; }
+__attribute__((weak)) void SND_Vita_SetVoiceVolume(int idx, float v) { (void)idx; (void)v; }
+__attribute__((weak)) void SND_Vita_SetVoicePitch(int idx, float pitch) { (void)idx; (void)pitch; }
 __attribute__((weak)) int SND_Vita_PlayMusic(const char *path, int loop) { (void)path; (void)loop; return 0; }
 __attribute__((weak)) void SND_Vita_StopMusic(void) {}
 __attribute__((weak)) void SND_Vita_PauseMusic(void) {}
@@ -105,12 +111,24 @@ __attribute__((weak)) float SND_Vita_GetSFXVolume(void) { return 1.0f; }
 __attribute__((weak)) void SND_Vita_MixStereoBuffer(int16_t *buf, uint32_t frames) { (void)buf; (void)frames; }
 #endif
 
+/* Helper to resolve slot_id (0..7) accurately across all calls */
+static inline uint8_t get_slot_id(uint32_t handle) {
+    if (handle >= 0x8C2E2CD8u && handle < 0x8C2E34D8u) {
+        return (uint8_t)((handle - 0x8C2E2CD8u) >> 8);
+    }
+    if (handle) {
+        return (uint8_t)(LD8(handle + 1) & (SND_HLE_MAX_SLOTS - 1));
+    }
+    return 0;
+}
+
 /* ----------------------------------------------------------------------------
  * 2. Subsystem Lifecycle & Initialization Hooks
  * ---------------------------------------------------------------------------- */
 
 /* sdLibInit (0x8C0F0A48): Sega sound library initialization */
 static void hle_sdLibInit(SH4Ctx *c) {
+    hle_orig(c, 0x8C0F0A48);
     if (!s_cleanroom_inited) {
         LOG_INFO("sdLibInit (0x8C0F0A48): initializing cleanroom audio engine");
         SND_Vita_Init();
@@ -122,7 +140,6 @@ static void hle_sdLibInit(SH4Ctx *c) {
         }
         s_cleanroom_inited = 1;
     }
-    c->r[0] = 0; /* Return 0: Success */
 }
 
 /* sdDrvInit (0x8C0F0948): Sega sound driver upload and release */
@@ -142,11 +159,11 @@ static void hle_game_sound_init(SH4Ctx *c) {
 /* sdHandleSlotCreate (0x8C0F066C): creates a 0x100-byte voice handle slot */
 static void hle_sdHandleSlotCreate(SH4Ctx *c) {
     uint32_t handle = c->r[4];
-    uint8_t slot_id = (uint8_t)(s_slot_counter++ & (SND_HLE_MAX_SLOTS - 1));
+    hle_orig(c, 0x8C0F066C);
+    uint8_t slot_id = get_slot_id(handle);
     if (handle) {
         ST8(handle + 1, slot_id);
     }
-    c->r[0] = 0; /* Return 0: Success */
 }
 
 /* ----------------------------------------------------------------------------
@@ -156,18 +173,25 @@ static void hle_sdHandleSlotCreate(SH4Ctx *c) {
 /* sdBankLoad (0x8C0EFCB0): loads SOSB sound bank data */
 static void hle_sdBankLoad(SH4Ctx *c) {
     uint32_t bank_desc = c->r[4];
+    hle_orig(c, 0x8C0EFCB0);
     if (bank_desc) {
         uint32_t sosb_ptr = LD32(bank_desc + 8);
         if (SH4_FAST(sosb_ptr)) {
             uint32_t magic = LD32(sosb_ptr);
             if (magic == SND_MAGIC_SOSB) {
+                uint32_t bank_size = LD32(sosb_ptr + 8);
                 uint32_t sound_count = LD32(sosb_ptr + 12);
-                LOG_INFO("sdBankLoad (0x8C0EFCB0): SOSB container at 0x%08X (%u sounds)",
-                         sosb_ptr, sound_count);
+                uint32_t bank_id = LD32(bank_desc);
+                LOG_INFO("sdBankLoad (0x8C0EFCB0): SOSB container at 0x%08X (%u sounds, size %u)",
+                         sosb_ptr, sound_count, bank_size);
+                const uint8_t *sosb_data = hle_ptr(sosb_ptr);
+                if (bank_size < 16 || bank_size > 16 * 1024 * 1024) {
+                    bank_size = 2 * 1024 * 1024;
+                }
+                SND_Vita_LoadBankData(bank_id, sosb_data, bank_size, "level_bank");
             }
         }
     }
-    c->r[0] = 0; /* Return 0: Success */
 }
 
 /* sdBankUploadHelper (0x8C0EFC44): helper called during bank upload */
@@ -182,7 +206,7 @@ static void hle_sdBankUploadHelper(SH4Ctx *c) {
 /* sdVoiceStart / cmd 0x11 (0x8C0F06BC): triggers sound playback in a slot */
 static void hle_sdVoiceStart(SH4Ctx *c) {
     uint32_t handle   = c->r[4];
-    uint8_t  slot_id  = handle ? (LD8(handle + 1) & (SND_HLE_MAX_SLOTS - 1)) : 0;
+    uint8_t  slot_id  = get_slot_id(handle);
     uint8_t  bank_id  = (uint8_t)(c->r[5] & 0xFF);
     uint8_t  sound_id = (uint8_t)(c->r[6] & 0xFF);
     int8_t   flags    = (int8_t)(c->r[7] & 0xFF);
@@ -196,7 +220,7 @@ static void hle_sdVoiceStart(SH4Ctx *c) {
     slot->sample_pos = 0;
 
     /* Trigger voice playback via cleanroom mixer */
-    SND_Vita_PlaySound(sound_id, slot->volume, slot->pan);
+    SND_Vita_PlaySoundEx(slot_id, sound_id, slot->volume, slot->pan);
 
     c->r[0] = 0; /* Return 0: Success */
 }
@@ -204,7 +228,7 @@ static void hle_sdVoiceStart(SH4Ctx *c) {
 /* sdVoiceStop / cmd 0x12 (0x8C0F08E4): stops sound playback in a slot */
 static void hle_sdVoiceStop(SH4Ctx *c) {
     uint32_t handle  = c->r[4];
-    uint8_t  slot_id = handle ? (LD8(handle + 1) & (SND_HLE_MAX_SLOTS - 1)) : 0;
+    uint8_t  slot_id = get_slot_id(handle);
 
     s_stat_stops++;
     s_slots[slot_id].active     = 0;
@@ -218,7 +242,7 @@ static void hle_sdVoiceStop(SH4Ctx *c) {
 /* sdVoicePan / cmd 0x16 (0x8C0F0750): stereo panning update */
 static void hle_sdVoicePan(SH4Ctx *c) {
     uint32_t handle  = c->r[4];
-    uint8_t  slot_id = handle ? (LD8(handle + 1) & (SND_HLE_MAX_SLOTS - 1)) : 0;
+    uint8_t  slot_id = get_slot_id(handle);
     int8_t   pan_val = (int8_t)(c->r[5] & 0xFF);
 
     s_stat_pan_updates++;
@@ -228,6 +252,7 @@ static void hle_sdVoicePan(SH4Ctx *c) {
     else if (fPan > 1.0f) fPan = 1.0f;
 
     s_slots[slot_id].pan = fPan;
+    SND_Vita_SetVoicePan(slot_id, fPan);
 
     c->r[0] = 0; /* Return 0: Success */
 }
@@ -235,7 +260,7 @@ static void hle_sdVoicePan(SH4Ctx *c) {
 /* sdVoiceVol / cmd 0x15 (0x8C0F0878): voice volume / attenuation update */
 static void hle_sdVoiceVol(SH4Ctx *c) {
     uint32_t handle  = c->r[4];
-    uint8_t  slot_id = handle ? (LD8(handle + 1) & (SND_HLE_MAX_SLOTS - 1)) : 0;
+    uint8_t  slot_id = get_slot_id(handle);
     int8_t   vol_val = (int8_t)(c->r[5] & 0xFF);
 
     s_stat_vol_updates++;
@@ -253,6 +278,7 @@ static void hle_sdVoiceVol(SH4Ctx *c) {
     else if (fVol > 1.0f) fVol = 1.0f;
 
     s_slots[slot_id].volume = fVol;
+    SND_Vita_SetVoiceVolume(slot_id, fVol);
 
     c->r[0] = 0; /* Return 0: Success */
 }
@@ -260,7 +286,7 @@ static void hle_sdVoiceVol(SH4Ctx *c) {
 /* sdVoicePitch / cmd 0x18 (0x8C0F07D0): pitch / detune update */
 static void hle_sdVoicePitch(SH4Ctx *c) {
     uint32_t handle  = c->r[4];
-    uint8_t  slot_id = handle ? (LD8(handle + 1) & (SND_HLE_MAX_SLOTS - 1)) : 0;
+    uint8_t  slot_id = get_slot_id(handle);
     int16_t  pitch   = (int16_t)(c->r[5] & 0xFFFF);
 
     s_slots[slot_id].pitch = pitch;
@@ -276,9 +302,12 @@ static void hle_sdVoicePitch(SH4Ctx *c) {
 static void hle_sdGetStatus(SH4Ctx *c) {
     uint32_t handle  = c->r[4];
     uint32_t out_ptr = c->r[5];
-    uint8_t  slot_id = handle ? (LD8(handle + 1) & (SND_HLE_MAX_SLOTS - 1)) : 0;
+    uint8_t  slot_id = get_slot_id(handle);
 
     s_stat_status_polls++;
+    if (!SND_Vita_IsVoicePlaying(slot_id)) {
+        s_slots[slot_id].active = 0;
+    }
     if (out_ptr) {
         uint32_t status = s_slots[slot_id].active ? 1u : 0u; /* bit 0 = playing */
         ST32(out_ptr, status);
@@ -290,9 +319,12 @@ static void hle_sdGetStatus(SH4Ctx *c) {
 static void hle_sdGetFullStatus(SH4Ctx *c) {
     uint32_t handle    = c->r[4];
     uint32_t block_ptr = c->r[5];
-    uint8_t  slot_id   = handle ? (LD8(handle + 1) & (SND_HLE_MAX_SLOTS - 1)) : 0;
+    uint8_t  slot_id   = get_slot_id(handle);
 
     s_stat_status_polls++;
+    if (!SND_Vita_IsVoicePlaying(slot_id)) {
+        s_slots[slot_id].active = 0;
+    }
     if (block_ptr) {
         /* Clear block words */
         for (uint32_t o = 0; o < 0x20; o += 4) {
@@ -310,7 +342,7 @@ static void hle_sdGetFullStatus(SH4Ctx *c) {
 static void hle_sdGetPos(SH4Ctx *c) {
     uint32_t handle  = c->r[4];
     uint32_t out_ptr = c->r[5];
-    uint8_t  slot_id = handle ? (LD8(handle + 1) & (SND_HLE_MAX_SLOTS - 1)) : 0;
+    uint8_t  slot_id = get_slot_id(handle);
 
     if (out_ptr) {
         ST32(out_ptr, s_slots[slot_id].sample_pos);
