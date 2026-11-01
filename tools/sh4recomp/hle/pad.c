@@ -7,6 +7,7 @@
  *  - The original asks the SDK driver for the function word (0x8C0D8F0A) and the raw frame; here the function word is the fixed standard
  *    pad value 0x000F06FE (buttons FE|0600, RT, LT, joyX, joyY; no second stick) and the frame comes from pad_set_state().
  *  - FUN_8c0cf4ca's mode-1 conversion (FUN_8c0cf4a8, taken when SDK query 0x8C0D91F2(5) == 1) is not modelled (INFERRED not taken for a pad).
+ *  - Record 1 (port A slot 1) is named "Visual Memory" while pad_set_vmu(1) is in effect (hle/vmu.c); everything else about it stays "(no device)".
  *  - Records 1..5 and 6..23 are "(no device)" with type word 0, as the original produces when the driver reports nothing in the slot (INFERRED:
  *    the driver's info bytes were not available; the type word for an empty slot depends on them).
  */
@@ -23,6 +24,8 @@ enum {
     CAP_STD = 0x000F06FEu
 };
 static const char NAME[31] = "Dreamcast Controller          ";   /* 30 chars + NUL */
+static const char VNAME[31] = "Visual Memory                 ";   /* 30 chars + NUL: the string FUN_8c0881cc/8c088280 (Joystick.c) compares -> function mask 0x40 */
+static volatile int g_vmu = 0;                                    /* record 1 (port A slot 1 = unit 4) reports a VMU; set by hle/vmu.c */
 
 static volatile unsigned g_seq; static uint32_t g_buttons; static PadAnalog g_analog = { 0, 0, 128, 128, 128, 128 }; static volatile int g_conn = 1;
 
@@ -36,6 +39,7 @@ void pad_get_state(uint32_t *b, PadAnalog *a) {
     if (b) *b = bb; if (a) *a = aa;
 }
 void pad_set_connected(int c) { g_conn = c != 0; }
+void pad_set_vmu(int present) { g_vmu = present != 0; }
 
 static uint32_t sdk_state(uint32_t i) { return LD32(SDK_BASEPTR) + 1100u + 120u * i; }
 
@@ -85,6 +89,7 @@ void hle_pad_h_init(SH4Ctx *c) {
     }
     ST8(THR_HI, 0xC0); ST8(THR_LO, 0xA0);
     memcpy(hle_ptr(HLE_PAD_NAMEBUF), NAME, 30); ST8(HLE_PAD_NAMEBUF + 30, 0);
+    memcpy(hle_ptr(HLE_PAD_VMUNAME), VNAME, 30); ST8(HLE_PAD_VMUNAME + 30, 0);
     hle_log("[pad] pdInit(mode=%u) -> table 0x%08x, 24 records, controller %s", mode, TBL, g_conn ? "connected" : "absent");
     R(0) = 0;
 }
@@ -98,7 +103,9 @@ void hle_pad_h_poll(SH4Ctx *c) {
         ST32(r + 0x30, sdk_state(i)); ST32(r + 0x2C, prev);
         ST32(TYPEWORDS + 4 * i, 0);
         if (i >= 6) continue;                                            /* original: only stores state+20 at +0x24 */
-        if (i == 0 && g_conn) rec_pad(r, i, b, &a); else rec_no_device(r);
+        if (i == 0 && g_conn) rec_pad(r, i, b, &a);
+        else if (i == 1 && g_vmu) { rec_no_device(r); ST32(r + 0x24, HLE_PAD_VMUNAME); }   /* "Visual Memory" in A1: type word stays 0 (non-zero => classifier answers "unknown") */
+        else rec_no_device(r);
         uint32_t cur = LD32(r + 8), inv = ~cur; ST32(r + 12, inv);
         uint32_t x = prev ^ cur;
         if (LD32(POLARITY) == 0) { ST32(r + 16, cur & x); ST32(r + 20, x & inv); }
