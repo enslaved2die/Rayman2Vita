@@ -12,8 +12,8 @@
 #include "ta.h"
 #include "perf.h"
 #include "texmap.h"
-#if defined(__vita__)
-#include "vita_gl_render.h"
+#if defined(__vita__) || defined(R2_HOST_GL)
+#include "vita_gl_render.h"      /* R2_HOST_GL: host build that runs the real vita_gl_render.c against hle/tests_ta/fakegl (see tests_ta/Makefile `rungl`) */
 #endif
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +65,18 @@ static void wide_tick(void) {
     }
 }
 
+#if !defined(__vita__)
+/* host: raw TA packet capture for R2_FRAMES dumps (tastream.bin = all 32-byte TA FIFO packets since the previous STARTRENDER, input of hle/tests_ta/bench_ta.c) */
+static uint8_t *ts_buf; static size_t ts_n, ts_cap; static int ts_on = -1;
+static void ts_rec(const uint8_t *d, size_t n) {
+    if (ts_on < 0) ts_on = getenv("R2_FRAMES") != NULL;
+    if (!ts_on) return;
+    if (ts_n + n > ts_cap) { ts_cap = (ts_n + n) * 2 + 65536; ts_buf = (uint8_t *)realloc(ts_buf, ts_cap); }
+    memcpy(ts_buf + ts_n, d, n); ts_n += n;
+}
+#else
+#define ts_rec(d, n) ((void)0)
+#endif
 static void note_list_ends(void) {
     for (int i = 0; i < TA_NUM_LISTS; i++) {
         uint32_t n = tactx.cur->stats.list_end[i];
@@ -72,6 +84,7 @@ static void note_list_ends(void) {
     }
 }
 static void sq_sink(uint32_t phys, const uint8_t d[32]) {
+    if (phys >= 0x10000000u && phys < 0x10800000u) ts_rec(d, 32);
     if (hle_verbose >= 2 && phys >= 0x10000000u && phys < 0x10800000u) { uint32_t w0; memcpy(&w0, d, 4); hle_log("[ta] sq flush phys=%08x w0=%08x", phys, w0); }
 #if R2_PERF
     if ((g_perf.ta_sq_n++ & 31) == 0) { uint64_t t = r2_now_us(); ta_ext_write32(&tactx, phys, d); note_list_ends(); g_perf.t_ta_sq_probe += r2_now_us() - t; g_perf.ta_sq_probes++; return; }
@@ -80,6 +93,7 @@ static void sq_sink(uint32_t phys, const uint8_t d[32]) {
 static void dma_sink(uint32_t dst, const uint8_t *src, uint32_t len) {
     if (hle_verbose >= 2) hle_log("[ta] dma dst=%08x len=%u first=%08x", dst, len, len >= 4 ? *(const uint32_t *)src : 0);
     if (dst >= 0x10000000u && dst < 0x10800000u) {
+        ts_rec(src, len & ~31u);
 #if R2_PERF
         uint64_t t = r2_now_us(); ta_write(&tactx, src, len); note_list_ends(); g_perf.t_ta_dma += r2_now_us() - t; return;
 #else
@@ -159,8 +173,11 @@ static void tc_frame(const TaFrame *f)
     }
     if (tc.frames % 1000 == 0) tc_report("progress");
 }
+extern char hle_dump_dir[256];     /* (texmap.c) host: where dump_binary / hle_ta_pvr_snapshot write (R2_DUMP_DIR, per-frame subdirectory in R2_FRAMES mode) */
 static void dump_binary(const TaFrame *f, unsigned long no) {
-    FILE *o = fopen("build_hle/frame.bin", "wb"); if (!o) return;
+    char p[400];
+#define DP(n) (snprintf(p, sizeof p, "%s/%s", hle_dump_dir, n), p)
+    FILE *o = fopen(DP("frame.bin"), "wb"); if (!o) return;
     uint32_t hdr[4] = { 0x31465452u /* 'RTF1' */, f->nstrips, f->nverts, (uint32_t)no };
     fwrite(hdr, 4, 4, o);
     for (uint32_t i = 0; i < f->nstrips; i++) {
@@ -170,12 +187,15 @@ static void dump_binary(const TaFrame *f, unsigned long no) {
     }
     fwrite(f->verts, sizeof(TaVertex), f->nverts, o);
     fclose(o);
-    o = fopen("build_hle/vram.bin", "wb"); if (o) { fwrite(hle_vram_ptr(), 1, 8u << 20, o); fclose(o); }
-    o = fopen("build_hle/frame_mods.bin", "wb");   /* modifier-volume triangles: u32 n, u32 shad_scale, then n x { 9 floats, ctl, isp, list, vol } */
+    o = fopen(DP("vram.bin"), "wb"); if (o) { fwrite(hle_vram_ptr(), 1, 8u << 20, o); fclose(o); }
+    o = fopen(DP("frame_mods.bin"), "wb");   /* modifier-volume triangles: u32 n, u32 shad_scale, then n x { 9 floats, ctl, isp, list, vol } */
     if (o) { uint32_t h2[2] = { f->nmods, f->shad_scale }; fwrite(h2, 4, 2, o);
         for (uint32_t i = 0; i < f->nmods; i++) { const TaModTri *m = &f->mods[i]; fwrite(m->v, 4, 9, o); uint32_t q[4] = { m->ctl, m->isp, m->list, m->vol }; fwrite(q, 4, 4, o); } fclose(o); }
-    o = fopen("build_hle/pvrregs.bin", "wb");     /* palette RAM (1024 words) + PVR registers the texture/blend path reads (tools/ta_render.py) */
+    o = fopen(DP("pvrregs.bin"), "wb");     /* palette RAM (1024 words) + PVR registers the texture/blend path reads (tools/ta_render.py) */
     if (o) { uint32_t pr[1024 + 16] = { 0 }; hle_ta_pvr_snapshot(pr); fwrite(pr, 4, 1024 + 16, o); fclose(o); }
+    o = fopen(DP("pvrall.bin"), "wb"); if (o) { fwrite(hle_pvr_regs(), 4, 2048, o); fclose(o); }      /* whole flat register file (render-thread equality test) */
+    o = fopen(DP("tastream.bin"), "wb"); if (o) { if (ts_n) fwrite(ts_buf, 1, ts_n, o); fclose(o); }
+#undef DP
 }
 #endif
 
@@ -209,28 +229,121 @@ static void on_startrender(SH4Ctx *c) {
                 t->warn_vertex_no_header, t->warn_unsupported, t->warn_bad_list_end, t->sink_vram, t->sink_yuv, t->sink_tex, t->sink_unknown);
 #if !defined(__vita__)
     tc_frame(f);
-    const char *want = getenv("R2_FRAME");
-    int pick = want ? (!strcmp(want, "mod") ? (t->modtris > 0) : (!strcmp(want, "spr") ? (t->sprites > 0) : (ta_frames == strtoul(want, 0, 10)))) : (!dumped && t->verts > 0);   /* R2_FRAME=mod / spr: first frame with modifier-volume triangles / sprites */
-    if (pick && !dumped) {
-        dumped = 1;
-        FILE *o = fopen("build_hle/frame_menu.txt", "w");
-        if (o) { fprintf(o, "TA frame #%lu (guest frame count %lu)\n", ta_frames, hle_frame_count); ta_dump_frame(f, o, 64); fclose(o); }
-        dump_binary(f, ta_frames);
-        hle_log("[ta] dumped frame %lu -> build_hle/frame_menu.txt, build_hle/frame.bin, build_hle/vram.bin", ta_frames);
+    {
+        const char *want = getenv("R2_FRAME"), *many = getenv("R2_FRAMES");   /* R2_FRAMES=n1,n2,... dumps each into $R2_DUMP_DIR/f<n>/ (needs the directory tree: created here) */
+        if (many) {
+            char key[32]; snprintf(key, sizeof key, ",%lu,", ta_frames); char lst[1024]; snprintf(lst, sizeof lst, ",%s,", many);
+            if (strstr(lst, key)) {
+                const char *base = getenv("R2_DUMP_DIR"); if (!base) base = "build_hle";
+                char d[256]; snprintf(d, sizeof d, "%s/f%lu", base, ta_frames); char cmd[300]; snprintf(cmd, sizeof cmd, "mkdir -p %s", d); if (system(cmd)) {}
+                snprintf(hle_dump_dir, sizeof hle_dump_dir, "%s", d);
+                FILE *o = fopen((snprintf(cmd, sizeof cmd, "%s/frame_menu.txt", d), cmd), "w"); if (o) { fprintf(o, "TA frame #%lu (guest frame count %lu)\n", ta_frames, hle_frame_count); ta_dump_frame(f, o, 64); fclose(o); }
+                dump_binary(f, ta_frames);
+                hle_log("[ta] dumped frame %lu -> %s", ta_frames, d);
+                snprintf(hle_dump_dir, sizeof hle_dump_dir, "build_hle");
+            }
+            ts_n = 0;
+        } else {
+        int pick = want ? (!strcmp(want, "mod") ? (t->modtris > 0) : (!strcmp(want, "spr") ? (t->sprites > 0) : (ta_frames == strtoul(want, 0, 10)))) : (!dumped && t->verts > 0);   /* R2_FRAME=mod / spr: first frame with modifier-volume triangles / sprites */
+        if (pick && !dumped) {
+            dumped = 1;
+            FILE *o = fopen("build_hle/frame_menu.txt", "w");
+            if (o) { fprintf(o, "TA frame #%lu (guest frame count %lu)\n", ta_frames, hle_frame_count); ta_dump_frame(f, o, 64); fclose(o); }
+            dump_binary(f, ta_frames);
+            hle_log("[ta] dumped frame %lu -> build_hle/frame_menu.txt, build_hle/frame.bin, build_hle/vram.bin", ta_frames);
+        }
+        }
     }
 #endif
-#if defined(__vita__)
+#if defined(__vita__) || defined(R2_HOST_GL)
+    if (vita_gl_rt_active()) { vita_gl_present_frame(f); return; }      /* render thread owns f from here */
     vita_gl_render_frame(f);
     vita_gl_swap();
 #endif
     ta_frame_free(f);
 }
 
+/* ---- deferred parse (render thread active, R2_TA_DEFERRED): the guest thread only captures the raw packets (ta_cap_*), the render thread parses them (vita_gl_render.c).
+ * What the guest needs at store time is kept: the list-end ASIC interrupts (framing state machine in TaCap), the scene boundaries (LIST_INIT / STARTRENDER) and the textures used. ---- */
+#if !defined(R2_TA_DEFERRED) && (defined(__vita__) || defined(R2_HOST_GL))
+#define R2_TA_DEFERRED 1
+#endif
+#if R2_TA_DEFERRED
+static TaCap tacap; static TaRaw *rawq[SCENEQ]; static int rawq_n; static int deferred;
+static void sq_sink_d(uint32_t phys, const uint8_t d[32]) {
+    if (phys < 0x10000000u || phys >= 0x10800000u) return;                      /* other SQ destinations: nothing the renderer uses */
+#if R2_PERF
+    if ((g_perf.ta_sq_n++ & 31) == 0) { uint64_t t = r2_now_us(); int e = ta_cap_write32(&tacap, d); if (e) hle_asic_raise_later(1u << END_BIT[e - 1]); g_perf.t_ta_sq_probe += r2_now_us() - t; g_perf.ta_sq_probes++; return; }
+#endif
+    int e = ta_cap_write32(&tacap, d);
+    if (e) hle_asic_raise_later(1u << END_BIT[e - 1]);
+}
+static void dma_sink_d(uint32_t dst, const uint8_t *src, uint32_t len) {
+    if (dst < 0x10000000u || dst >= 0x10800000u) return;
+#if R2_PERF
+    uint64_t t = r2_now_us();
+#endif
+    uint32_t eol[TA_NUM_LISTS] = { 0 };
+    ta_cap_write(&tacap, src, len, eol);
+    for (int i = 0; i < TA_NUM_LISTS; i++) for (uint32_t k = 0; k < eol[i]; k++) hle_asic_raise_later(1u << END_BIT[i]);     /* same order as note_list_ends(): by list, after the whole burst */
+#if R2_PERF
+    g_perf.t_ta_dma += r2_now_us() - t;
+#endif
+}
+static void on_listinit_d(SH4Ctx *c) {
+    (void)c;
+    if (tacap.cur->chunks == 0) return;
+    TaRaw *r = ta_cap_take(&tacap);
+    if (rawq_n == SCENEQ) { ta_raw_free(rawq[0]); memmove(rawq, rawq + 1, (SCENEQ - 1) * sizeof rawq[0]); rawq_n--; hle_log("[ta] scene queue overflow: oldest dropped"); }
+    rawq[rawq_n++] = r;
+}
+#if !defined(__vita__)
+static void test_burn(void) {      /* host test knob: R2_TEST_WORK_US=n busy-waits n us per rendered frame (emulates a heavy scene for pacing experiments) */
+    static long us = -1; if (us < 0) { const char *e = getenv("R2_TEST_WORK_US"); us = e ? atol(e) : 0; }
+    if (us > 0) { uint64_t t0 = r2_now_us(); while (r2_now_us() - t0 < (uint64_t)us) { } }
+}
+#else
+#define test_burn() ((void)0)
+#endif
+static void on_startrender_d(SH4Ctx *c) {
+    (void)c; test_burn();
+    ta_frames++;
+    wide_tick();
+    TaRaw *r;
+    if (rawq_n) { r = rawq[0]; memmove(rawq, rawq + 1, (--rawq_n) * sizeof rawq[0]); }
+    else r = ta_cap_take(&tacap);
+    vita_gl_present_raw(r, hle_reg_get(0xA05F8074u));      /* FPU_SHAD_SCALE as of STARTRENDER */
+}
+#else
+static int deferred;
+#endif
+
 void hle_ta_init(void) {
+#ifdef R2_HOST_GL
+    vita_gl_render_init();      /* render thread (if enabled) + fake vglInit */
+#endif
     ta_init(&tactx);
+#if defined(__vita__) || defined(R2_HOST_GL)
+    deferred = R2_TA_DEFERRED + 0 && vita_gl_rt_active();
+#if !defined(__vita__)
+    if (getenv("R2_TACHK") || getenv("R2_FRAMES") || getenv("R2_FRAME") || getenv("R2_TA_INLINE")) deferred = 0;      /* host dump / cross-check need the parsed frame on the guest thread */
+#endif
+#endif
+#if R2_TA_DEFERRED
+    if (deferred) {
+        ta_cap_init(&tacap);
+        hle_set_sq_sink(sq_sink_d);
+        hle_set_ta_dma_sink(dma_sink_d);
+        hle_set_startrender_cb(on_startrender_d);
+        hle_set_listinit_cb(on_listinit_d);
+        hle_log("[ta] deferred parse: TA packets are captured on the guest thread, parsed on the render thread");
+    } else
+#endif
+    {
     hle_set_sq_sink(sq_sink);
     hle_set_ta_dma_sink(dma_sink);
     hle_set_startrender_cb(on_startrender);
     hle_set_listinit_cb(on_listinit);
+    }
     hle_texmap_init();
 }

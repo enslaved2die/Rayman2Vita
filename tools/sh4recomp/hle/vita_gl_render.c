@@ -30,6 +30,15 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <math.h>
+#include <time.h>
+#if defined(__vita__)
+static inline uint32_t fp_get(void) { uint32_t v; __asm__ volatile("vmrs %0, fpscr" : "=r"(v)); return v & 0x03C00000u; }      /* RMode[23:22], FZ[24], DN[25] */
+static inline void fp_set(uint32_t m) { uint32_t v; __asm__ volatile("vmrs %0, fpscr" : "=r"(v)); v = (v & ~0x03C00000u) | m; __asm__ volatile("vmsr fpscr, %0" : : "r"(v)); }
+#else
+#include <fenv.h>
+static inline uint32_t fp_get(void) { return (uint32_t)fegetround(); }
+static inline void fp_set(uint32_t m) { fesetround((int)m); }
+#endif
 
 /* R2_INTERNAL_SCALE (percent, build constant): render at a lower internal resolution; the display unit upscales the framebuffer to the 960x544 screen.  Only the sizes the Vita
  * display engine scales in hardware are valid: 100 (960x544), 75 (720x408), 67 (640x368), 50 (480x272).  Cuts fill-rate (translucent overdraw, fog pass) at the cost of sharpness;
@@ -61,23 +70,48 @@
 #define TEX_CACHE_SIZE 4096
 #define TEX_CACHE_MASK (TEX_CACHE_SIZE - 1)
 
-/* Decoded-texture cache.  Key = (tcw, tsp & HLE_TEX_KEY_TSP): only the TSP size bits and ignore-texture-alpha change the decoded texels; blend / shading / fog bits never did,
- * and filter / wrap are applied to the GL texture object at bind time (apply_tex_params), so one decode + one upload serves every way the same surface is drawn.  Validity:
- * hle_texstamp_valid() (texmap.c): VRAM page epochs first (O(1)), content hash only when a page of the texture was written, palette epoch for 4/8bpp. */
+/* ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ * Render thread design (R2_RENDER_THREAD, see re_analysis/dc/notes_render_thread.md)
+ *   guest thread (vita_gl_present_frame, called at STARTRENDER):  validates / decodes textures, snapshots every piece of PVR state the renderer reads into a RenderJob, hands the job over.
+ *   render thread (or the same thread when R2_RENDER_THREAD=0: identical code path): uploads textures, builds the GL batches from the TaFrame, draws, swaps.
+ * The renderer never touches guest-written memory (VRAM, PVR registers, guest RAM): only the RenderJob.  The decoded-texture cache is split in two tables with the SAME slot indices:
+ *   GTex (guest thread only): key (tcw, tsp&KEY), VRAM epoch stamp, validity bookkeeping.   RTex (render thread only): the GL texture object + its filter/wrap state.
+ * A job carries the texture "ops" (slot, pixels to upload) the guest decided on and the "refs" (key -> slot) of every texture the frame draws; ops of frame N are executed before frame N is drawn
+ * and frames are executed in order, so RTex always reflects the guest's view as of the frame being drawn.
+ * ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 typedef struct {
     uint32_t tcw, tsp;                  /* key (tsp already masked) */
     HleTexStamp stamp;                  /* VRAM epoch / palette epoch / content hash at decode time */
-    int chk_frame;                      /* frame number of the last successful validity check (once per frame) */
-    GLuint tex_id;
+    int chk_frame;                      /* guest frame number of the last successful validity check (once per frame) */
     uint8_t used;
     int dec_frame;
+} GTexEntry;
+typedef struct {
+    GLuint tex_id;
+    uint8_t levels;                     /* mip levels of the uploaded texture */
     GLint minf, magf, wrap_s, wrap_t;   /* parameters currently set on the GL texture object (0 = unknown) */
-} TexCacheEntry;
+} RTexEntry;
+static GTexEntry s_gtex[TEX_CACHE_SIZE];
+static RTexEntry s_rtex[TEX_CACHE_SIZE];
 
-static TexCacheEntry s_tex_cache[TEX_CACHE_SIZE];
-static uint32_t *s_decode_buf = NULL;   /* 1024x1024 RGBA8 */
-static int s_frame_no = 0;
-static GLuint s_cur_tex = (GLuint)-1;   /* texture bound to GL_TEXTURE_2D as far as this file knows ((GLuint)-1 = unknown) */
+typedef struct { uint16_t slot; uint8_t reset, levels; uint16_t w, h; uint32_t *pix; } TexOp;   /* pix == NULL with reset: delete the slot's GL texture */
+typedef struct { uint32_t tcw, tsp; int slot; } TexRef;
+typedef struct RenderJob {
+    TaFrame *frame;                     /* owned by the job: freed by the render side after drawing (NULL until parsed when raw != NULL) */
+    TaRaw *raw; uint32_t shad_scale;    /* deferred parse: captured packets, parsed by the render thread; FPU_SHAD_SCALE as of STARTRENDER */
+    uint32_t regs[2048];                /* PVR register file 0x5F8000..0x5F9FFF at STARTRENDER (palette RAM at word 0x400, fog table at 0x80 ...) */
+    float bg[3][4]; uint32_t bg_isp, bg_tsp, bg_tcw; int have_bg;   /* ISP_BACKGND plane (lives in VRAM) */
+    int wide;                           /* hle_ta_wide_active() */
+    uint32_t fpmode;                    /* FP rounding / flush-to-zero mode of the guest thread at STARTRENDER (the SH-4 code runs with FPSCR.RM=1 = round-to-zero in the hardware FPSCR; the old inline renderer inherited it, the render thread must run the same arithmetic) */
+    TexOp *ops; uint32_t nops, capops;
+    TexRef *refs; uint32_t nrefs, caprefs;
+    uint64_t t_prep_us;
+} RenderJob;
+#define PVR_REGJ(j, addr) ((j)->regs[((addr) - 0x005F8000u) >> 2])
+
+static uint32_t s_gframe_no = 0;        /* guest-side frame counter (texture validity is checked at most once per frame) */
+static uint32_t s_frame_no = 0;         /* render-side frame counter (logs) */
+static GLuint s_cur_tex = (GLuint)-1;   /* texture bound to GL_TEXTURE_2D as far as the render side knows ((GLuint)-1 = unknown) */
 #define DUMP_DIR "ux0:data/rayman2/"
 static void gl_logf(const char *fmt, ...);
 #ifndef R2_TEX_AGE
@@ -106,14 +140,14 @@ static void gl_logf(const char *fmt, ...);
 #ifndef R2_GL_DEBUG
 #define R2_GL_DEBUG 0                   /* 1: log translucent-list batches every 60th frame (each gl_logf is an SD-card fopen) */
 #endif
-static uint32_t s_tex_misses, s_tex_redecodes;
+static uint32_t s_tex_misses, s_tex_redecodes;     /* guest side */
 VitaGlPerf vita_gl_perf;
 
-/* PVR registers read straight from the flat register file (boot.c), no snapshot copy. */
+/* PVR registers read straight from the flat register file (boot.c) - GUEST thread only (texture decode palette / control registers at hand-off time). */
 #define PVR_REG(addr) (hle_pvr_regs()[((addr) - 0x005F8000u) >> 2])
 
 /* ----------------------------------------------------------------------------
- * Texture decode & upload (decoder lives in ta.c)
+ * Texture bookkeeping + decode (guest side), upload + bind (render side)
  * ---------------------------------------------------------------------------- */
 
 static inline void bind_tex(GLuint id)
@@ -124,12 +158,11 @@ static inline void bind_tex(GLuint id)
 
 /* filter / wrap of the texture object for a given TSP word.  PVR2 TSP: bit15 ClampV, bit16 ClampU, bit17 FlipV, bit18 FlipU (same as TaState.clamp_v/clamp_u/flip_v/flip_u; the old
  * u/v swap smeared planks/rock and cut Lum glows in half).  Only touches GL when a value differs from what the object already has. */
-static void apply_tex_params(TexCacheEntry *e, uint32_t tsp)
+static void apply_tex_params(RTexEntry *e, uint32_t tsp)
 {
     int filt = (int)((tsp >> 13) & 3);                /* 0 point, 1 bilinear, 2/3 trilinear */
-    int levels = ta_tex_levels(e->tcw, e->tsp);
     GLint magf = filt ? GL_LINEAR : GL_NEAREST, minf;
-    if (levels > 1) minf = filt == 0 ? GL_NEAREST_MIPMAP_NEAREST : filt == 1 ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR;
+    if (e->levels > 1) minf = filt == 0 ? GL_NEAREST_MIPMAP_NEAREST : filt == 1 ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR;
     else minf = magf;
     int clamp_v = (int)((tsp >> 15) & 1), clamp_u = (int)((tsp >> 16) & 1), flip_v = (int)((tsp >> 17) & 1), flip_u = (int)((tsp >> 18) & 1);
     GLint ws = clamp_u ? GL_CLAMP_TO_EDGE : flip_u ? GL_MIRRORED_REPEAT : GL_REPEAT, wt = clamp_v ? GL_CLAMP_TO_EDGE : flip_v ? GL_MIRRORED_REPEAT : GL_REPEAT;
@@ -141,43 +174,23 @@ static void apply_tex_params(TexCacheEntry *e, uint32_t tsp)
     if (e->wrap_t != wt) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt); e->wrap_t = wt; vita_gl_perf.tex_params++; }
 }
 
-static int decode_and_upload_texture(TexCacheEntry *e, uint32_t tcw, uint32_t tsp)
+/* GUEST: decode the texture of (tcw, tsp) from VRAM into a fresh pixel buffer (the render side uploads and frees it).  Returns the buffer or NULL. */
+static uint32_t *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph)
 {
     uint8_t *vram = hle_vram_ptr();
-    if (!vram) return 0;
-    if (!s_decode_buf) {
-        s_decode_buf = (uint32_t *)malloc(1024 * 1024 * sizeof(uint32_t));
-        if (!s_decode_buf) return 0;
-    }
+    if (!vram) return NULL;
     int w, h;
     ta_tex_size(tsp, &w, &h);
-    int mip = (int)(tcw >> 31);
-    if (mip) h = w;                                   /* mip chains are square */
-
+    if (tcw >> 31) h = w;                             /* mip chains are square */
+    uint32_t *px = (uint32_t *)malloc((size_t)w * h * sizeof(uint32_t));
+    if (!px) return NULL;
     const uint32_t *pr = hle_pvr_regs();
     TaTexEnv env = { pr + 0x400, PVR_REG(0x005F8108u), PVR_REG(0x005F80E4u) };   /* palette RAM, PAL_RAM_CTRL, TEXT_CONTROL */
     int fmt = (int)((tcw >> 27) & 7);
     if (!(fmt == 5 || fmt == 6)) env.pal = NULL;
-
-#if R2_PERF
-    uint64_t t_dec0 = r2_now_us();
-#endif
-    ta_tex_decode(vram, 8u << 20, tcw, tsp, &env, 0, (int)((tsp >> 19) & 1), s_decode_buf);
-
-    e->dec_frame = s_frame_no;
-    hle_texstamp_set(&e->stamp, tcw, tsp);
-    e->chk_frame = s_frame_no;
-    if (e->tex_id == 0) glGenTextures(1, &e->tex_id);
-    if (e->tex_id == 0) return 0;
-    bind_tex(e->tex_id);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, s_decode_buf);
-    vita_gl_perf.tex_uploads++;
-    if (ta_tex_levels(tcw, tsp) > 1) glGenerateMipmap(GL_TEXTURE_2D);   /* the PVR mip levels are box-filtered versions of level 0 in the source files */
-#if R2_PERF
-    g_perf.t_texdec += r2_now_us() - t_dec0; g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)w * h * 4;
-#endif
-    e->minf = e->magf = e->wrap_s = e->wrap_t = 0;    /* (re)apply filter / wrap for the TSP the caller draws with */
-    return 1;
+    ta_tex_decode(vram, 8u << 20, tcw, tsp, &env, 0, (int)((tsp >> 19) & 1), px);
+    *pw = w; *ph = h;
+    return px;
 }
 
 static inline uint32_t tex_hash(uint32_t tcw, uint32_t tsp)
@@ -187,52 +200,113 @@ static inline uint32_t tex_hash(uint32_t tcw, uint32_t tsp)
     return h & TEX_CACHE_MASK;
 }
 
-/* Is the cached decode still valid?  Checked at most once per frame per texture (the guest cannot write VRAM while a frame is rendered).  The game writes textures through paths
- * that never call kmLoadTexture and surfaces overlap, so the per-surface generation counter missed updates and left textures stale/black; the VRAM page epochs see every write
- * path, and the content hash backs them up whenever a page of the texture was written (identical rewrites and neighbouring-texture writes do not force a re-decode). */
-static int entry_valid(TexCacheEntry *e)
+/* GUEST: is the cached decode still valid?  Checked at most once per frame per texture.  The game writes textures through paths that never call kmLoadTexture and surfaces overlap, so the
+ * per-surface generation counter missed updates and left textures stale/black; the VRAM page epochs see every write path, and the content hash backs them up whenever a page of the
+ * texture was written (identical rewrites and neighbouring-texture writes do not force a re-decode). */
+static int entry_valid(GTexEntry *e)
 {
-    if (R2_TEX_AGE && s_frame_no - e->dec_frame > R2_TEX_AGE) return 0;   /* DEBUG experiment */
-    if (e->chk_frame == s_frame_no) return 1;
+    if (R2_TEX_AGE && (int)s_gframe_no - e->dec_frame > R2_TEX_AGE) return 0;   /* DEBUG experiment */
+    if (e->chk_frame == (int)s_gframe_no) return 1;
     if (!hle_texstamp_valid(&e->stamp, e->tcw, e->tsp)) return 0;
-    e->chk_frame = s_frame_no;
+    e->chk_frame = (int)s_gframe_no;
     return 1;
 }
 
-/* Returns the GL texture for (tcw, tsp), decoding it if needed, with filter / wrap set for this tsp.  The texture may or may not be left bound: callers bind it themselves. */
-GLuint vita_gl_get_or_create_texture(uint32_t tcw, uint32_t tsp_full)
+static TexOp *job_op(RenderJob *j)
+{
+    if (j->nops == j->capops) { j->capops = j->capops ? j->capops * 2 : 16; j->ops = (TexOp *)realloc(j->ops, j->capops * sizeof(TexOp)); }
+    return &j->ops[j->nops++];
+}
+/* GUEST: make sure the texture (tcw, tsp_full) is current in the GL cache as of this frame; queue an upload op when it is new or stale.  Returns the slot or -1. */
+static int guest_texture_slot(RenderJob *j, uint32_t tcw, uint32_t tsp_full)
 {
     const uint32_t tsp = tsp_full & HLE_TEX_KEY_TSP;
     uint32_t h = tex_hash(tcw, tsp);
-    TexCacheEntry *slot = NULL;
+    GTexEntry *slot = NULL; int reset = 0;
     for (uint32_t i = 0; i < TEX_CACHE_SIZE; i++) {
-        TexCacheEntry *e = &s_tex_cache[(h + i) & TEX_CACHE_MASK];
+        GTexEntry *e = &s_gtex[(h + i) & TEX_CACHE_MASK];
         if (!e->used) { slot = e; break; }
         if (e->tcw == tcw && e->tsp == tsp) {
-            if (!entry_valid(e)) { s_tex_redecodes++; decode_and_upload_texture(e, tcw, tsp); }
+            int sl = (int)(e - s_gtex);
+            if (!entry_valid(e)) {
+                s_tex_redecodes++;
+                int w, hh; uint32_t *px = decode_texture(tcw, tsp, &w, &hh);
+                if (!px) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = 0; memset(e, 0, sizeof *e); return -1; }
+                hle_texstamp_set(&e->stamp, tcw, tsp); e->dec_frame = (int)s_gframe_no; e->chk_frame = (int)s_gframe_no;
+                TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 0; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh; op->levels = (uint8_t)ta_tex_levels(tcw, tsp);
+            }
+            return sl;
+        }
+    }
+    if (!slot) {                                      /* cache full: evict the home bucket */
+        slot = &s_gtex[h]; reset = 1;
+        memset(slot, 0, sizeof *slot);
+    }
+    int sl = (int)(slot - s_gtex);
+    s_tex_misses++;
+    memset(slot, 0, sizeof *slot);
+    slot->tcw = tcw; slot->tsp = tsp;
+    int w, hh; uint32_t *px = decode_texture(tcw, tsp, &w, &hh);
+    if (!px) { memset(slot, 0, sizeof *slot); if (reset) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = 0; } return -1; }
+    hle_texstamp_set(&slot->stamp, tcw, tsp); slot->dec_frame = (int)s_gframe_no; slot->chk_frame = (int)s_gframe_no; slot->used = 1;
+    TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = (uint8_t)reset; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh; op->levels = (uint8_t)ta_tex_levels(tcw, tsp);
+    return sl;
+}
+
+/* RENDER: execute the texture ops of a job (GL object create / delete / upload) */
+static void render_exec_ops(RenderJob *j)
+{
+    for (uint32_t i = 0; i < j->nops; i++) {
+        TexOp *op = &j->ops[i]; RTexEntry *e = &s_rtex[op->slot];
+        if (op->reset && e->tex_id) { glDeleteTextures(1, &e->tex_id); s_cur_tex = (GLuint)-1; memset(e, 0, sizeof *e); }
+        if (!op->pix) continue;
+#if R2_PERF
+        uint64_t t0 = r2_now_us();
+#endif
+        if (e->tex_id == 0) glGenTextures(1, &e->tex_id);
+        if (e->tex_id) {
+            bind_tex(e->tex_id);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, op->w, op->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, op->pix);
+            vita_gl_perf.tex_uploads++;
+            e->levels = op->levels;
+            if (op->levels > 1) glGenerateMipmap(GL_TEXTURE_2D);   /* the PVR mip levels are box-filtered versions of level 0 in the source files */
+            e->minf = e->magf = e->wrap_s = e->wrap_t = 0;        /* (re)apply filter / wrap for the TSP the batch draws with */
+#if R2_PERF
+            g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)op->w * op->h * 4;
+#endif
+        }
+#if R2_PERF
+        g_perf.t_texdec += r2_now_us() - t0;
+#endif
+        free(op->pix); op->pix = NULL;
+    }
+    j->nops = 0;
+}
+/* RENDER: GL texture for a (tcw, tsp) the job's refs know, with filter / wrap set for this tsp; 0 = draw untextured */
+static GLuint render_texture(const RenderJob *j, const uint16_t *tab, uint32_t tcw, uint32_t tsp_full)
+{
+    const uint32_t tsp = tsp_full & HLE_TEX_KEY_TSP;
+    uint32_t h = tex_hash(tcw, tsp) & 2047;
+    for (uint32_t i = 0; i < 2048; i++) {
+        uint16_t v = tab[(h + i) & 2047];
+        if (!v) return 0;
+        const TexRef *r = &j->refs[v - 1];
+        if (r->tcw == tcw && r->tsp == tsp) {
+            if (r->slot < 0) return 0;
+            RTexEntry *e = &s_rtex[r->slot];
+            if (!e->tex_id) return 0;
             apply_tex_params(e, tsp_full);
             return e->tex_id;
         }
     }
-    if (!slot) {                                      /* cache full: evict the home bucket */
-        slot = &s_tex_cache[h];
-        if (slot->tex_id) { glDeleteTextures(1, &slot->tex_id); s_cur_tex = (GLuint)-1; }
-        memset(slot, 0, sizeof *slot);
-    }
-    s_tex_misses++;
-    memset(slot, 0, sizeof *slot);
-    slot->tcw = tcw; slot->tsp = tsp;
-    if (decode_and_upload_texture(slot, tcw, tsp)) slot->used = 1;
-    else { if (slot->tex_id) { glDeleteTextures(1, &slot->tex_id); s_cur_tex = (GLuint)-1; } memset(slot, 0, sizeof *slot); return 0; }
-    apply_tex_params(slot, tsp_full);
-    return slot->tex_id;
+    return 0;
 }
 
 void vita_gl_texture_cache_clear(void)
 {
     for (uint32_t i = 0; i < TEX_CACHE_SIZE; i++) {
-        if (s_tex_cache[i].used && s_tex_cache[i].tex_id) glDeleteTextures(1, &s_tex_cache[i].tex_id);
-        memset(&s_tex_cache[i], 0, sizeof s_tex_cache[i]);
+        if (s_rtex[i].tex_id) glDeleteTextures(1, &s_rtex[i].tex_id);
+        memset(&s_rtex[i], 0, sizeof s_rtex[i]); memset(&s_gtex[i], 0, sizeof s_gtex[i]);
     }
     s_cur_tex = (GLuint)-1;
 }
@@ -241,7 +315,7 @@ void vita_gl_texture_cache_clear(void)
  * vitaGL lifecycle & rendering
  * ---------------------------------------------------------------------------- */
 
-void vita_gl_render_init(void)
+static void gl_init_context(void)
 {
     vglInitExtended(8 * 1024 * 1024, SCREEN_W, SCREEN_H, 16 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
     glViewport(0, 0, SCREEN_W, SCREEN_H);
@@ -250,7 +324,6 @@ void vita_gl_render_init(void)
     glDepthMask(GL_TRUE);
     glDepthRangef(0.0f, 1.0f);
     vita_gl_texture_cache_clear();
-    if (!s_decode_buf) s_decode_buf = (uint32_t *)malloc(1024 * 1024 * sizeof(uint32_t));
 }
 
 static const GLenum s_gl_depth_funcs[8] = { GL_NEVER, GL_LESS, GL_EQUAL, GL_LEQUAL, GL_GREATER, GL_NOTEQUAL, GL_GEQUAL, GL_ALWAYS };
@@ -449,25 +522,17 @@ static float perf_area(const TaGlVertex *v, uint32_t n)
     }
     return a * (0.5f / (640.0f * 480.0f));
 }
-static uint64_t s_t_swap_end; static int s_t_swap_end_prev_valid;
+static uint64_t s_t_swap_end; static int s_t_swap_end_prev_valid; static uint64_t s_t_present_end;
 #endif
-static void vita_gl_render_frame_impl(const TaFrame *frame_in);
-void vita_gl_render_frame(const TaFrame *frame_in)
+static void render_job_exec(RenderJob *job);
+#define PH(a, b) ((unsigned long long)((a) > (b) ? (a) - (b) : 0))
+static void rt_log(const char *ln) { if (r2_perf_sink) r2_perf_sink(ln); else { fputs(ln, stderr); fputc(10, stderr); } }
+/* per-phase timestamps of the frame being rendered (render thread; logged for the first RT_PHASE_FRAMES frames: where do the 2.9 s of the first real frame go?) */
+#define RT_PHASE_FRAMES 8
+static struct { uint64_t t0, ops, build, clear0, clear1, draw0, first_draw0, first_draw1, draws_end, end; unsigned ndraw_slow; } s_ph;
+static void vita_gl_render_frame_impl(RenderJob *job)
 {
-#if R2_PERF
-    uint64_t t0 = r2_now_us();
-    if (s_t_swap_end) g_perf.t_guest += t0 - s_t_swap_end;
-    uint32_t d0 = vita_gl_perf.draws, f0 = vita_gl_perf.fog_draws, sc0 = vita_gl_perf.state_calls, ss0 = vita_gl_perf.state_skipped, tb0 = vita_gl_perf.tex_binds, ba0 = vita_gl_perf.batches; uint64_t v0 = vita_gl_perf.verts;
-#endif
-    vita_gl_render_frame_impl(frame_in);
-#if R2_PERF
-    g_perf.t_render += r2_now_us() - t0;
-    g_perf.draws += vita_gl_perf.draws - d0; g_perf.fog_draws += vita_gl_perf.fog_draws - f0; g_perf.state_calls += vita_gl_perf.state_calls - sc0; g_perf.state_skipped += vita_gl_perf.state_skipped - ss0;
-    g_perf.tex_binds += vita_gl_perf.tex_binds - tb0; g_perf.batches += vita_gl_perf.batches - ba0; g_perf.verts += vita_gl_perf.verts - v0;
-#endif
-}
-static void vita_gl_render_frame_impl(const TaFrame *frame_in)
-{
+    const TaFrame *frame_in = job->frame;
     const TaFrame *frame = frame_in;
     if (!frame) return;
 #ifdef R2_FAKE_SHADOW   /* debug: synthetic closed box volume + every polygon a receiver, to exercise the stencil path where no shadow is on screen */
@@ -485,12 +550,15 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
     debug_capture_poll();
     if (s_dump_pending) dump_frame_bin(frame);
 
-    if (s_frame_no <= 12) gl_logf("[vita] render_frame call #%d strips=%u verts=%u hle_frame_count=%lu", s_frame_no, (unsigned)frame->nstrips, (unsigned)frame->nverts, (unsigned long)hle_frame_count);
+    if (R2_GL_DEBUG && s_frame_no <= 12) gl_logf("[vita] render_frame call #%d strips=%u verts=%u hle_frame_count=%lu", s_frame_no, (unsigned)frame->nstrips, (unsigned)frame->nverts, (unsigned long)hle_frame_count);
     static TaGl gl;                                   /* persistent: vertex / batch arrays keep their capacity from frame to frame */
     TaBuildOpts opts = { 1, 1, -2.0f, -2.0f, 642.0f, 482.0f, 0 };   /* software cull + clip to the screen (+2 px) */
 #if R2_PERF
     uint64_t t_b0 = r2_now_us();
 #endif
+    s_ph.t0 = r2_now_us();
+    render_exec_ops(job);                             /* texture creation / upload of this frame (decoded on the guest thread) */
+    s_ph.ops = r2_now_us();
     if (ta_build_gl_reuse(frame, &gl, &opts) != 0) return;
     static int s_dbg_once; if (!s_dbg_once) { s_dbg_once = 1; gl_logf("[vita] vita_gl_render build marker: " __DATE__ " " __TIME__ " sort+nozwrite-trans v5 perf-gl"); }
     if (gl.nverts == 0 || gl.nbatches == 0) return;
@@ -503,19 +571,20 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
     }
     float cut = ta_gl_depth_cut(&gl);
     ta_gl_make_clip(gl.verts, gl.nverts, cut, s_cv);
+    s_ph.build = r2_now_us();
 #if R2_PERF
     g_perf.t_build += r2_now_us() - t_b0; g_perf.strips += frame->nstrips; g_perf.tris += gl.nverts / 3;
 #endif
-    static uint32_t fog_table[128]; static uint32_t s_fog_epoch_seen;
-    if (hle_pvr_fog_epoch() != s_fog_epoch_seen || s_frame_no == 1) { hle_ta_fog_table(fog_table); s_fog_epoch_seen = hle_pvr_fog_epoch(); }   /* fog table only re-read when a fog register changed */
-    const uint32_t fog_den = PVR_REG(0x005F80B8u), fog_ram = PVR_REG(0x005F80B0u);
+    uint32_t fog_table[128];
+    for (int i = 0; i < 128; i++) fog_table[i] = job->regs[0x80 + i] & 0xFFFFu;     /* fog table registers 0xA05F8200.. as of STARTRENDER */
+    const uint32_t fog_den = PVR_REGJ(job, 0x005F80B8u), fog_ram = PVR_REGJ(job, 0x005F80B0u);
     const float fog_r = ((fog_ram >> 16) & 255) / 255.0f, fog_g = ((fog_ram >> 8) & 255) / 255.0f, fog_b = (fog_ram & 255) / 255.0f;
     vita_gl_perf.frames++; vita_gl_perf.batches += gl.nbatches;
     gc_reset();
 
     /* Frame clear. Wide mode (default): the viewport is the whole display, so one glClear covers it (colour = ISP_BACKGND plane colour when the game defines one).
      * 4:3: whole display black first (pillarbox bars), then the viewport area only with the background colour. */
-    const int wide = hle_ta_wide_active();
+    const int wide = job->wide;
     const int vp_x = wide ? 0 : VIEW_X, vp_w = wide ? SCREEN_W : VIEW_W;
     glDisable(GL_SCISSOR_TEST);
     glViewport(vp_x, 0, vp_w, SCREEN_H);
@@ -529,12 +598,13 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
     if (have_shadow && !R2_NOCLEARST) { glStencilMask(0xFF); glClearStencil(0); }
     const GLbitfield clear_bits = GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | ((have_shadow && !R2_NOCLEARST) ? GL_STENCIL_BUFFER_BIT : 0);
     {   /* ISP_BACKGND plane: the game sets an untextured flat plane (0x8080ff on the menu, brown in the lava level); it fills the 4:3 area behind everything. */
-        float bg[3][4]; uint32_t bisp, btsp, btcw;
-        int have_bg = hle_ta_background(bg, &bisp, &btsp, &btcw);
+        float (*bg)[4] = job->bg; uint32_t bisp = job->bg_isp, btsp = job->bg_tsp, btcw = job->bg_tcw;
+        int have_bg = job->have_bg;
 #ifndef R2_BG_BLACK
 #define R2_BG_BLACK 0
 #endif
         if (have_bg) { static int once; if (!once) { once = 1; gl_logf("[vita] ISP_BACKGND plane colour a=%.2f r=%.2f g=%.2f b=%.2f isp=%08x tsp=%08x tcw=%08x", bg[0][0], bg[0][1], bg[0][2], bg[0][3], (unsigned)bisp, (unsigned)btsp, (unsigned)btcw); } }
+        s_ph.clear0 = r2_now_us();
         if (wide) {
             if (have_bg && !R2_BG_BLACK) glClearColor(bg[0][1], bg[0][2], bg[0][3], 1.0f); else glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
             glClear(clear_bits);
@@ -548,6 +618,7 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
             }
         }
     }
+    s_ph.clear1 = r2_now_us();
     glEnable(GL_SCISSOR_TEST);
     glScissor(vp_x, 0, vp_w, SCREEN_H);
 
@@ -566,11 +637,19 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
     glDisable(GL_CULL_FACE);                          /* ISP culling is done in ta_build_gl_ex */
 
-    if (s_frame_no <= 12) gl_logf("[vita] frame %d nmods=%u have_shadow=%d shad=%x", s_frame_no, (unsigned)frame->nmods, have_shadow, (unsigned)frame->shad_scale);
+    if (R2_GL_DEBUG && s_frame_no <= 12) gl_logf("[vita] frame %d nmods=%u have_shadow=%d shad=%x", s_frame_no, (unsigned)frame->nmods, have_shadow, (unsigned)frame->shad_scale);
     int st_cur = 0;                                   /* current stencil state of the batch loop (see below) */
-    uint32_t pt_ref = PVR_REG(0x005F811Cu) & 255;     /* PT_ALPHA_REF; 0 (never written) -> alpha > 0 */
-    const int trans_sorted = !(PVR_REG(0x005F8098u) & 1);   /* ISP_FEED_CFG bit0 = 0: translucent list is depth-sorted */
+    static uint16_t ref_tab[2048];                    /* (tcw, tsp key) -> index+1 into job->refs, rebuilt per frame */
+    memset(ref_tab, 0, sizeof ref_tab);
+    for (uint32_t i = 0; i < job->nrefs; i++) {
+        uint32_t h = tex_hash(job->refs[i].tcw, job->refs[i].tsp) & 2047;
+        while (ref_tab[h]) h = (h + 1) & 2047;
+        ref_tab[h] = (uint16_t)(i + 1);
+    }
+    uint32_t pt_ref = PVR_REGJ(job, 0x005F811Cu) & 255;     /* PT_ALPHA_REF; 0 (never written) -> alpha > 0 */
+    const int trans_sorted = !(PVR_REGJ(job, 0x005F8098u) & 1);   /* ISP_FEED_CFG bit0 = 0: translucent list is depth-sorted */
 
+    s_ph.draw0 = r2_now_us(); s_ph.first_draw0 = s_ph.first_draw1 = 0;
     /* Draw order: opaque, punch-through, translucent (submission order inside a list). */
     static const int s_draw_lists[3] = { TA_L_OPAQUE, TA_L_PUNCH, TA_L_TRANS };
     for (int li = 0; li < 3; li++) {
@@ -580,7 +659,7 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
         /* Translucent list: ISP_FEED_CFG bit0 = 0 -> the PVR sorts back-to-front (farthest = smallest 1/W first); translucent polygons never write depth
          * (otherwise a transparent texel of a near layer, e.g. foliage, would reject the sky behind it: that was the "periwinkle cut-outs" bug). */
         static uint32_t s_ord[4096]; static float s_key[4096];
-        const int dbg = (s_frame_no <= 12 || (R2_GL_DEBUG && s_frame_no % 60 == 0)) && list_id == TA_L_TRANS;
+        const int dbg = R2_GL_DEBUG && (s_frame_no <= 12 || s_frame_no % 60 == 0) && list_id == TA_L_TRANS;
         uint32_t n_ord = n_b < 4096 ? n_b : 4096;
         const int sorted = list_id == TA_L_TRANS && trans_sorted;
         if (sorted) {
@@ -592,8 +671,8 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
             for (uint32_t i = 1; i < n_ord; i++) { uint32_t o = s_ord[i]; float k = s_key[o]; uint32_t j = i; while (j > 0 && s_key[s_ord[j - 1]] > k) { s_ord[j] = s_ord[j - 1]; j--; } s_ord[j] = o; }   /* stable insertion sort */
         }
         if (dbg) {
-            uint32_t feed = PVR_REG(0x005F8098u);
-            gl_logf("[vita] frame %d wide_active=%d pref=%d vp_x=%d vp_w=%d ISP_FEED_CFG=%08x sorted=%d trans_batches=%u (of %u) nverts=%u", s_frame_no, hle_ta_wide_active(), hle_ta_wide_pref(), vp_x, vp_w, (unsigned)feed, !(feed & 1), (unsigned)n_b, gl.nbatches, gl.nverts);
+            uint32_t feed = PVR_REGJ(job, 0x005F8098u);
+            gl_logf("[vita] frame %d wide_active=%d pref=%d vp_x=%d vp_w=%d ISP_FEED_CFG=%08x sorted=%d trans_batches=%u (of %u) nverts=%u", s_frame_no, job->wide, hle_ta_wide_pref(), vp_x, vp_w, (unsigned)feed, !(feed & 1), (unsigned)n_b, gl.nbatches, gl.nverts);
             for (uint32_t i = 0; sorted && i < n_ord && i < 8; i++) gl_logf("[vita]   ord[%u]=%u key=%g", i, s_ord[i], s_key[s_ord[i]]);
         }
         for (uint32_t bi = 0; bi < n_ord; bi++) {
@@ -636,7 +715,7 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
             }
 
             GLuint tex_id = 0;
-            if (st->textured) tex_id = vita_gl_get_or_create_texture(st->tcw, st->tsp);
+            if (st->textured) tex_id = render_texture(job, ref_tab, st->tcw, st->tsp);
             if (tex_id) {
                 gc_tex2d(1);
                 bind_tex(tex_id);
@@ -660,7 +739,20 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
                 }
                 if (amax > 1.0f / 255.0f) { gc_color_ptr(&s_fv[0].r); pre_fogged = 1; }
             }
+            uint64_t td0 = r2_now_us();
             glDrawArrays(GL_TRIANGLES, batch->first, batch->count);
+            if (!s_ph.first_draw1) { s_ph.first_draw0 = td0; s_ph.first_draw1 = r2_now_us(); }
+#if R2_PERF
+            {   /* first-use cost detector: a single draw call that takes > 5 ms is (almost certainly) vitaGL creating a shader / fragment program for a state combination it had not seen (task 3, notes_render_thread.md) */
+                uint64_t dt = r2_now_us() - td0; static int s_slow_logged;
+                if (dt > 5000 && s_slow_logged < 64 && r2_perf_sink) {
+                    char ln[300]; s_slow_logged++;
+                    snprintf(ln, sizeof ln, "[perf] SLOW DRAW %llu us (render frame %d, guest frame %lu): list %d tex=%d shade=%d alpha_test=%d blend=%d/%d use_alpha=%d fmt=%d verts=%u",
+                             (unsigned long long)dt, s_frame_no, hle_frame_count, list_id, st->textured, st->shading, list_id == TA_L_PUNCH, st->src_blend, st->dst_blend, st->use_alpha, st->pixel_format, batch->count);
+                    r2_perf_sink(ln);
+                }
+            }
+#endif
             vita_gl_perf.draws++; vita_gl_perf.verts += batch->count;
 #if R2_PERF
             g_perf.area[list_id == TA_L_TRANS ? 2 : list_id == TA_L_PUNCH ? 1 : 0] += perf_area(&gl.verts[batch->first], batch->count);
@@ -696,6 +788,7 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
         }
     }
 
+    s_ph.draws_end = r2_now_us();
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_VERTEX_ARRAY);
@@ -707,12 +800,12 @@ static void vita_gl_render_frame_impl(const TaFrame *frame_in)
     if (have_shadow && !R2_NOENDDIS) { glDisable(GL_STENCIL_TEST); glStencilMask(0xFF); }
 
     if (s_dump_pending) {
-        gl_logf("[gl] dump: frame %d verts=%u batches=%u cut=%g texmiss=%u redecode=%u hashbytes=%llu mods=%u glerr=0x%x", s_frame_no, gl.nverts, gl.nbatches, cut, s_tex_misses, s_tex_redecodes, (unsigned long long)hle_texstats.hash_bytes, (unsigned)frame->nmods, (unsigned)glGetError());
+        gl_logf("[gl] dump: frame %d verts=%u batches=%u cut=%g texmiss=%u redecode=%u hashbytes=%llu mods=%u glerr=0x%x", s_frame_no, gl.nverts, gl.nbatches, cut, s_tex_misses, s_tex_redecodes, (unsigned long long)0, (unsigned)frame->nmods, (unsigned)glGetError());
         s_shot_after_swap = 1; s_dump_pending = 0;      /* vitaGL's glReadPixels reads the presented (front) buffer: capture after the swap */
     }
 }
 
-void vita_gl_swap(void)
+static void render_swap(void)
 {
 #if R2_PERF
     uint64_t t0 = r2_now_us();
@@ -722,6 +815,18 @@ void vita_gl_swap(void)
     if (s_t_swap_end_prev_valid) {
         uint32_t per = (uint32_t)(t1 - s_t_swap_end); g_perf.t_period += per; if (per > g_perf.max_period_us) g_perf.max_period_us = per;
         if (per > 16700) g_perf.over17++; if (per > 33400) g_perf.over34++; if (per > 50000) g_perf.over50++;
+        static uint64_t l_ren, l_swp, l_prep, l_up, l_wait;
+#define DLT(cur, last) ((cur) >= (last) ? (cur) - (last) : (cur))      /* g_perf is zeroed by every report */
+        if (per > 200000 && r2_perf_sink) {     /* a frame > 200 ms: say what the pipeline spent it on (the v11 log only had windowed averages) */
+            static int n_log; char ln[400];
+            if (n_log++ < 100) {
+                snprintf(ln, sizeof ln, "[perf] SLOW FRAME %u ms (render frame %d, guest frame %lu): render %llu us (of which uploads %llu) swap %llu us | guest-side prep %llu us, blocked at hand-off %llu us, tex uploads so far %u",
+                         per / 1000, s_frame_no, hle_frame_count, (unsigned long long)DLT(g_perf.t_render, l_ren), (unsigned long long)DLT(g_perf.t_texdec, l_up), (unsigned long long)DLT(g_perf.t_swap, l_swp),
+                         (unsigned long long)DLT(g_perf.t_prep, l_prep), (unsigned long long)DLT(g_perf.t_rt_wait, l_wait), vita_gl_perf.tex_uploads);
+                r2_perf_sink(ln);
+            }
+        }
+        l_ren = g_perf.t_render; l_swp = g_perf.t_swap; l_prep = g_perf.t_prep; l_up = g_perf.t_texdec; l_wait = g_perf.t_rt_wait;
     }
     s_t_swap_end_prev_valid = 1; s_t_swap_end = t1; g_perf.frames++;
     if (g_perf.frames >= R2_PERF_FRAMES) r2_perf_report(hle_frame_count);
@@ -731,13 +836,336 @@ void vita_gl_swap(void)
     if (s_shot_after_swap) { s_shot_after_swap = 0; dump_shot_ppm(); }
 }
 
+/* ----------------------------------------------------------------------------
+ * Start-up warm-up of the fixed-function pipeline (task 3 of notes_render_thread.md).
+ * vitaGL's fixed-function layer generates Cg source per (texture on/off, texenv mode, alpha-test mode, ...) and compiles it with libshacccg/shark the FIRST time a draw uses that
+ * combination (disk cache ux0:data/shader_cache/vN/{v,f}/HASH.gxp is consulted first), and creates a GXM fragment program per (shader, blend factors / colour mask) pair the first time it is
+ * drawn.  On a real Vita the first 300-frame window of the v11 log had one 10.2 s frame and 85 ms average submit time: that is these first-use costs landing in the middle of the intro.
+ * Drawing one invisible (1x1 scissor) triangle per state combination here moves all of it in front of the first game frame (and, with the disk cache populated by this first run, makes
+ * later runs start fast).  The set below is every combination vita_gl_render_frame can request: opaque / punch-through (alpha test) / translucent (blend pairs from src_factor/dst_factor,
+ * the common ones), x untextured + textured REPLACE / MODULATE / DECAL, the table-fog pass (untextured, SRC_ALPHA/ONE_MINUS_SRC_ALPHA) and the shadow volume passes (colour mask off; quad blend).
+ * ---------------------------------------------------------------------------- */
+#ifndef R2_GL_WARMUP
+#if defined(__vita__)
+#define R2_GL_WARMUP 32                                /* DEFAULT 32 (one full glClear: v rt2 showed the first glClear of the first real frame taking 1.0 s on a real Vita); the full mask (31) hung Vita3K at guest frame 4; run-time kill switch: file ux0:data/rayman2/NO_WARMUP; mask bits: 1 opaque+punch, 2 translucent pairs, 4 shadow passes, 8 delete the dummy texture, 16 glFinish, 32 a full glClear (Vita3K bisect knobs) */
+#else
+#define R2_GL_WARMUP 0                                  /* host fake: off unless R2_GL_WARMUP=1 in the environment (keeps digests comparable with the old code) */
+#endif
+#endif
+static void warm_clear(void)     /* first glClear (vitaGL's clear programs; ~1.0 s on the first real frame in the rt2 log): colour+depth like a normal frame, and with stencil like a shadow frame */
+{
+    glDisable(GL_SCISSOR_TEST); glClearColor(0.f, 0.f, 0.f, 1.f); glClearDepthf(0.f); glClearStencil(0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+}
+static void gl_warmup(void)
+{
+#if !defined(__vita__)
+    int wu = 0; { const char *e = getenv("R2_GL_WARMUP"); if (e && *e) wu = atoi(e); } if (!wu) return;
+#else
+    int wu = R2_GL_WARMUP;
+    if (wu) { FILE *f = fopen("ux0:data/rayman2/NO_WARMUP", "rb"); if (f) { fclose(f); wu = 0; } }
+    if (!wu) return;
+#endif
+    uint64_t t0 = r2_now_us();
+    if (!(wu & 31)) { warm_clear(); glFinish(); gl_logf("[vita] GL warm-up: first glClear in %llu ms", (unsigned long long)((r2_now_us() - t0) / 1000)); return; }
+    static TaClipVertex v[3] = { { -1.f, -1.f, 0.5f, 0.f, 0.f, 1.f, 1.f, 1.f, 1.f }, { 1.f, -1.f, 0.5f, 1.f, 0.f, 1.f, 1.f, 1.f, 1.f }, { 0.f, 1.f, 0.5f, 0.5f, 1.f, 1.f, 1.f, 1.f, 1.f } };
+    GLuint tex = 0; static const uint32_t px[4] = { 0xFF8080FFu, 0xFFFFFFFFu, 0x80FFFFFFu, 0xFF000000u };
+    glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex); s_cur_tex = tex;
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glDisable(GL_CULL_FACE); glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE);
+    glEnable(GL_SCISSOR_TEST); glScissor(0, 0, 1, 1);
+    float id[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    glMatrixMode(GL_PROJECTION); glLoadMatrixf(id); glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+    glVertexPointer(3, GL_FLOAT, sizeof(TaClipVertex), &v[0].px); glTexCoordPointer(2, GL_FLOAT, sizeof(TaClipVertex), &v[0].u);
+    gc_reset(); gc_color_ptr(&v[0].r);
+    glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_COLOR_ARRAY); glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    static const GLint envs[3] = { GL_REPLACE, GL_MODULATE, GL_DECAL };
+    unsigned draws = 0;
+#define WARM_DRAW(texmode)  do { if ((texmode) < 0) gc_tex2d(0); else { gc_tex2d(1); gc_texenv(envs[texmode]); } glDrawArrays(GL_TRIANGLES, 0, 3); draws++; } while (0)
+    if (wu & 1) for (int alpha = 0; alpha < 2; alpha++) {                       /* opaque (alpha 0) and punch-through (alpha test GEQUAL), blend off */
+        gc_blend(0); gc_alpha_test(alpha); if (alpha) gc_alpha_ref(128);
+        for (int m = -1; m < 3; m++) WARM_DRAW(m);
+    }
+    if (wu & 2) {
+    gc_alpha_test(0); gc_blend(1);                                   /* translucent: blend pairs */
+    static const GLenum pairs[][2] = { { GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA }, { GL_ONE, GL_ONE }, { GL_SRC_ALPHA, GL_ONE }, { GL_ONE, GL_ONE_MINUS_SRC_ALPHA },
+                                       { GL_ZERO, GL_SRC_COLOR }, { GL_DST_COLOR, GL_ZERO }, { GL_ZERO, GL_ONE_MINUS_SRC_ALPHA }, { GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA },
+                                       { GL_DST_COLOR, GL_SRC_COLOR }, { GL_ONE, GL_ZERO } };
+    for (unsigned p = 0; p < sizeof pairs / sizeof pairs[0]; p++) {
+        gc_blend_func(pairs[p][0], pairs[p][1]);
+        WARM_DRAW(-1); WARM_DRAW(1);                                 /* untextured + MODULATE for every pair */
+        if (p == 0 || p == 1 || p == 3) { WARM_DRAW(0); WARM_DRAW(2); }   /* the common ones also REPLACE / DECAL */
+    }
+    }
+    if (wu & 4) {
+    gc_blend(0);                                                     /* shadow volumes: colour mask off, then the darkening quad (blend SRC_ALPHA/ONE_MINUS_SRC_ALPHA, stencil) */
+    gc_tex2d(0);
+    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE); glEnable(GL_STENCIL_TEST); glStencilMask(0x01); glStencilFunc(GL_ALWAYS, 0, 0); glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
+    glDrawArrays(GL_TRIANGLES, 0, 3); draws++;
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); glStencilMask(0); glStencilFunc(GL_EQUAL, 0x81, 0x81); glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    gc_blend(1); gc_blend_func(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDrawArrays(GL_TRIANGLES, 0, 3); draws++;
+    glDisable(GL_STENCIL_TEST); glStencilMask(0xFF);
+    }
+    gc_blend(0); gc_tex2d(0);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY); glDisableClientState(GL_COLOR_ARRAY); glDisableClientState(GL_VERTEX_ARRAY);
+    glDisable(GL_SCISSOR_TEST); glDepthMask(GL_TRUE);
+    if (wu & 8) { glBindTexture(GL_TEXTURE_2D, 0); glDeleteTextures(1, &tex); s_cur_tex = (GLuint)-1; }
+    gc_reset();
+    if (wu & 32) warm_clear();
+    if (wu & 16) glFinish();
+#undef WARM_DRAW
+    gl_logf("[vita] GL warm-up: %u draws in %llu ms (first-use shader / fragment-program creation, see notes_render_thread.md)", draws, (unsigned long long)((r2_now_us() - t0) / 1000));
+}
+static void gl_start(void)
+{
+    uint64_t t0 = r2_now_us();
+    gl_init_context();
+    uint64_t t1 = r2_now_us();
+    gl_warmup();
+    { char ln[200]; snprintf(ln, sizeof ln, "[perf] GL start: vglInitExtended + state %llu ms, warm-up (mask %d) %llu ms", (unsigned long long)((t1 - t0) / 1000), R2_GL_WARMUP, (unsigned long long)((r2_now_us() - t1) / 1000)); rt_log(ln); }
+}
+
+/* ----------------------------------------------------------------------------
+ * Job preparation (guest thread) and execution (render thread or inline)
+ * ---------------------------------------------------------------------------- */
+#define RT_JOBS 3                                   /* ring slots: R2_RT_DEPTH (2) jobs in flight + the one being prepared */
+static RenderJob s_jobs[RT_JOBS + 1];
+static int s_job_next;                              /* guest: next ring slot to prepare */
+static int s_rt_on;                                 /* 1: render thread running */
+
+/* GUEST: build the job for `frame`: textures, register snapshot, background plane, wide flag */
+static RenderJob *prepare_job(TaFrame *frame, TaRaw *raw, uint32_t shad)
+{
+    RenderJob *j = &s_jobs[s_job_next];
+    uint64_t t0 = r2_now_us();
+    s_gframe_no++;
+    j->frame = frame; j->raw = raw; j->shad_scale = shad; j->nops = 0; j->nrefs = 0;
+    memcpy(j->regs, hle_pvr_regs(), sizeof j->regs);
+    j->have_bg = hle_ta_background(j->bg, &j->bg_isp, &j->bg_tsp, &j->bg_tcw);
+    j->wide = hle_ta_wide_active();
+    j->fpmode = fp_get();
+    /* every texture a drawn strip uses (unique by key), validated / decoded now while the guest cannot be writing VRAM.  Deferred parse: the headers captured with the packets
+     * (a superset of the textures of strips with >= 3 vertices) */
+    static struct { uint32_t tcw, tsp, stamp; } seen[2048]; static uint32_t seen_gen;
+    seen_gen++;
+    uint32_t n_in = frame ? frame->nstrips : raw->ntex;
+    for (uint32_t i = 0; i < n_in; i++) {
+        uint32_t tcw, tsp_full;
+        if (frame) {
+            const TaStrip *st = &frame->strips[i];
+            if (!st->st.textured || st->count < 3 || st->st.list == TA_L_OPAQUE_MOD || st->st.list == TA_L_TRANS_MOD) continue;
+            tcw = st->st.tcw; tsp_full = st->st.tsp;
+        } else { tcw = raw->tex[i][0]; tsp_full = raw->tex[i][1]; }
+        uint32_t tsp = tsp_full & HLE_TEX_KEY_TSP, h = tex_hash(tcw, tsp) & 2047; int found = 0;
+        for (uint32_t k = 0; k < 2048; k++) {
+            uint32_t q = (h + k) & 2047;
+            if (seen[q].stamp != seen_gen) { seen[q].stamp = seen_gen; seen[q].tcw = tcw; seen[q].tsp = tsp; break; }
+            if (seen[q].tcw == tcw && seen[q].tsp == tsp) { found = 1; break; }
+        }
+        if (found) continue;
+        if (j->nrefs >= 1024) continue;               /* more than 1024 distinct textures in one frame: the rest draws untextured */
+        if (j->nrefs == j->caprefs) { j->caprefs = j->caprefs ? j->caprefs * 2 : 64; j->refs = (TexRef *)realloc(j->refs, j->caprefs * sizeof(TexRef)); }
+        TexRef *r = &j->refs[j->nrefs++]; r->tcw = tcw; r->tsp = tsp; r->slot = guest_texture_slot(j, tcw, tsp_full);
+    }
+    j->t_prep_us = r2_now_us() - t0;
+#if R2_PERF
+    g_perf.t_prep += j->t_prep_us;
+#endif
+    return j;
+}
+
+static void render_job_exec(RenderJob *j)
+{
+#if R2_PERF
+    uint64_t t0 = r2_now_us();
+#endif
+    uint32_t fp_saved = fp_get();
+    if (fp_saved != j->fpmode) fp_set(j->fpmode);     /* no-op inline; on the render thread: the guest's rounding mode */
+    vita_gl_render_frame_impl(j);
+    if (fp_saved != j->fpmode) fp_set(fp_saved);
+#if R2_PERF
+    g_perf.t_render += r2_now_us() - t0;
+#endif
+}
+
+/* ---- threading ---- */
+#ifndef R2_RENDER_THREAD
+#define R2_RENDER_THREAD 1                          /* 1: GL on a dedicated thread (default); 0: everything inline on the game thread; runtime override: file ux0:data/rayman2/NO_RENDER_THREAD */
+#endif
+#ifdef R2_DEBUG_POLL
+#undef R2_RENDER_THREAD
+#define R2_RENDER_THREAD 0                          /* the debug capture reads guest memory from the renderer */
+#endif
+#ifndef R2_RT_DEPTH
+#define R2_RT_DEPTH 2                               /* jobs in flight (queued + being drawn): the guest can run at most this many frames ahead of the GPU frame being built */
+#endif
+#ifndef R2_RENDER_CPU
+#define R2_RENDER_CPU SCE_KERNEL_CPU_MASK_USER_0    /* game thread = USER_1, audio = USER_2 (vita_main.c) */
+#endif
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>
+typedef SceUID RSem;
+static void rsem_init(RSem *s, int n) { *s = sceKernelCreateSema("r2_rt", 0, n, 0x7FFFFFFF, NULL); }
+static void rsem_wait(RSem *s) { sceKernelWaitSema(*s, 1, NULL); }
+static void rsem_post(RSem *s) { sceKernelSignalSema(*s, 1); }
+#else
+#include <pthread.h>
+typedef struct { pthread_mutex_t m; pthread_cond_t c; int n; } RSem;
+static void rsem_init(RSem *s, int n) { pthread_mutex_init(&s->m, NULL); pthread_cond_init(&s->c, NULL); s->n = n; }
+static void rsem_wait(RSem *s) { pthread_mutex_lock(&s->m); while (s->n <= 0) pthread_cond_wait(&s->c, &s->m); s->n--; pthread_mutex_unlock(&s->m); }
+static void rsem_post(RSem *s) { pthread_mutex_lock(&s->m); s->n++; pthread_cond_signal(&s->c); pthread_mutex_unlock(&s->m); }
+#endif
+static RSem s_sem_free, s_sem_job, s_sem_ready;
+static int s_ring_head, s_ring_tail;                // guest advances head, render advances tail (each owns its index)
+static RenderJob *s_ring[RT_JOBS + 1];
+#if defined(R2_RT_STRESS)
+static void rt_stress_delay(void) { static __thread unsigned r = 12345; r = r * 1103515245u + 12345u; if ((r >> 16) % 5 == 0) { struct timespec ts = { 0, (long)((r >> 8) % 3000000u) }; nanosleep(&ts, NULL); } }
+#else
+#define rt_stress_delay() ((void)0)
+#endif
+
+static uint64_t s_ph_wait;
+static void render_thread_loop(void)
+{
+    /* vglInit and the warm-up run here while the game thread is already loading (render_init does not wait): guest hand-offs queue up until this thread is ready */
+    gl_start();
+    for (;;) {
+        uint64_t t0 = r2_now_us();
+        rsem_wait(&s_sem_job);
+#if R2_PERF
+        g_perf.t_rt_idle += r2_now_us() - t0;
+#endif
+        s_ph_wait = r2_now_us() - t0;
+        RenderJob *j = s_ring[s_ring_tail]; s_ring_tail = (s_ring_tail + 1) % (RT_JOBS + 1);
+        if (!j) break;                              /* shutdown marker */
+        rt_stress_delay();
+        if (j->raw) {                               /* deferred parse: raw packets -> TaFrame on this thread (parse state persists across frames in s_rctx, packets arrive in guest order) */
+#if R2_PERF
+            uint64_t tp = r2_now_us();
+#endif
+            static TaCtx s_rctx; static int s_rctx_ok;
+            if (!s_rctx_ok) { ta_init(&s_rctx); s_rctx_ok = 1; }
+            j->frame = ta_parse_raw(&s_rctx, j->raw);
+            j->frame->shad_scale = j->shad_scale;
+            ta_raw_free(j->raw); j->raw = NULL;
+#if R2_PERF
+            g_perf.t_parse += r2_now_us() - tp;
+#endif
+        }
+        render_job_exec(j);
+        uint64_t t_sw0 = r2_now_us();
+        render_swap();
+        if (s_frame_no <= RT_PHASE_FRAMES) {
+            char ln[420]; uint64_t t_sw1 = r2_now_us();
+            snprintf(ln, sizeof ln, "[perf] RT first frames #%d: waited for job %llu us | ops/uploads %llu | build+cut %llu | up to clear %llu | glClear %llu | setup %llu | draws %llu (first glDrawArrays %llu) | swap %llu | total %llu us (verts %u)",
+                     s_frame_no, (unsigned long long)s_ph_wait, PH(s_ph.ops, s_ph.t0), PH(s_ph.build, s_ph.ops), PH(s_ph.clear0, s_ph.build),
+                     PH(s_ph.clear1, s_ph.clear0), PH(s_ph.draw0, s_ph.clear1), PH(s_ph.draws_end, s_ph.draw0), PH(s_ph.first_draw1, s_ph.first_draw0),
+                     (unsigned long long)(t_sw1 - t_sw0), (unsigned long long)(t_sw1 - s_ph.t0), (unsigned)j->frame->nverts);
+            rt_log(ln);
+        }
+        ta_frame_free(j->frame); j->frame = NULL;
+        rsem_post(&s_sem_free);
+    }
+}
+#if defined(__vita__)
+static int render_thread_entry(SceSize args, void *argp) { (void)args; (void)argp; render_thread_loop(); return 0; }
+#else
+static void *render_thread_entry(void *arg) { (void)arg; render_thread_loop(); return NULL; }
+#endif
+
+int vita_gl_rt_active(void) { return s_rt_on; }
+
+void vita_gl_render_init(void)
+{
+    int want = R2_RENDER_THREAD;
+#if defined(__vita__)
+    if (want) { FILE *f = fopen("ux0:data/rayman2/NO_RENDER_THREAD", "rb"); if (f) { fclose(f); want = 0; } }
+#else
+    { const char *e = getenv("R2_RENDER_THREAD"); if (e && *e) want = atoi(e) != 0; }
+    if (getenv("R2_TACHK")) want = 0;      /* the host cross-check builds frames on the guest thread with the same (static-buffer) depth-cut code */
+#endif
+    if (!want) { gl_start(); return; }
+    rsem_init(&s_sem_free, R2_RT_DEPTH); rsem_init(&s_sem_job, 0); rsem_init(&s_sem_ready, 0);
+#if defined(__vita__)
+    SceUID th = sceKernelCreateThread("rayman2_render", render_thread_entry, 0x10000100, 256 * 1024, 0, R2_RENDER_CPU, NULL);
+    if (th < 0 || sceKernelStartThread(th, 0, NULL) < 0) { gl_logf("[vita] render thread create failed 0x%08x: rendering inline", th); gl_start(); return; }
+#else
+    pthread_t th; if (pthread_create(&th, NULL, render_thread_entry, NULL)) { gl_start(); return; }
+    pthread_detach(th);
+#endif
+    s_rt_on = 1;                                    /* vglInit runs on the render thread; the game thread does not wait for it (jobs queue in the ring) */
+}
+
+/* GUEST at STARTRENDER, threaded path: takes ownership of `frame`.  Blocks while R2_RT_DEPTH jobs are in flight (back-pressure). */
+void vita_gl_present_frame(TaFrame *frame)
+{
+    uint64_t now = r2_now_us();
+#if R2_PERF
+    if (s_t_present_end) g_perf.t_guest += now - s_t_present_end;
+    uint64_t tw = now;
+#endif
+    rt_stress_delay();
+    rsem_wait(&s_sem_free);
+#if R2_PERF
+    g_perf.t_rt_wait += r2_now_us() - tw;
+#endif
+    RenderJob *j = prepare_job(frame, NULL, frame->shad_scale);
+    s_job_next = (s_job_next + 1) % (RT_JOBS + 1);
+    s_ring[s_ring_head] = j; s_ring_head = (s_ring_head + 1) % (RT_JOBS + 1);
+    rsem_post(&s_sem_job);
+#if R2_PERF
+    s_t_present_end = r2_now_us();
+#endif
+}
+
+/* GUEST at STARTRENDER, deferred parse: takes ownership of the raw scene */
+void vita_gl_present_raw(TaRaw *raw, uint32_t shad_scale)
+{
+    uint64_t now = r2_now_us();
+#if R2_PERF
+    if (s_t_present_end) g_perf.t_guest += now - s_t_present_end;
+    uint64_t tw = now;
+#endif
+    rt_stress_delay();
+    rsem_wait(&s_sem_free);
+#if R2_PERF
+    g_perf.t_rt_wait += r2_now_us() - tw;
+#endif
+    RenderJob *j = prepare_job(NULL, raw, shad_scale);
+    s_job_next = (s_job_next + 1) % (RT_JOBS + 1);
+    s_ring[s_ring_head] = j; s_ring_head = (s_ring_head + 1) % (RT_JOBS + 1);
+    rsem_post(&s_sem_job);
+#if R2_PERF
+    s_t_present_end = r2_now_us();
+#endif
+}
+
+/* ---- inline (single-thread) path, API unchanged: vita_gl_render_frame(f); vita_gl_swap(); caller frees f ---- */
+void vita_gl_render_frame(const TaFrame *frame)
+{
+#if R2_PERF
+    uint64_t t0 = r2_now_us();
+    if (s_t_swap_end) g_perf.t_guest += t0 - s_t_swap_end;
+#endif
+    RenderJob *j = prepare_job((TaFrame *)frame, NULL, frame->shad_scale);
+    s_job_next = (s_job_next + 1) % (RT_JOBS + 1);
+    render_job_exec(j);
+    j->frame = NULL;
+}
+void vita_gl_swap(void) { render_swap(); }
+
 #else
 
 /* Host stubs when building without the Vita toolchain */
 void vita_gl_render_init(void) {}
 void vita_gl_render_frame(const TaFrame *frame) { (void)frame; }
 void vita_gl_swap(void) {}
-GLuint vita_gl_get_or_create_texture(uint32_t tcw, uint32_t tsp) { (void)tcw; (void)tsp; return 0; }
+void vita_gl_present_frame(TaFrame *frame) { ta_frame_free(frame); }
+void vita_gl_present_raw(TaRaw *raw, uint32_t shad_scale) { (void)shad_scale; ta_raw_free(raw); }
+int vita_gl_rt_active(void) { return 0; }
 void vita_gl_texture_cache_clear(void) {}
 
 #endif

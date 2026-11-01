@@ -51,6 +51,7 @@ typedef struct {
     int      arm_running;          /* ARM7 released from reset by the guest */
     uint64_t samples;              /* AICA sample frames generated */
     uint64_t arm_instr;            /* ARM instructions interpreted (idle loop iterations skipped are not counted) */
+    uint64_t arm_bulk;             /* part of arm_instr accounted in bulk (MANATEE delay loop): NOT dispatched one by one, so (arm_instr - arm_bulk) is the real interpreter dispatch count */
     uint64_t arm_idle_skips;
     uint64_t keyon;                /* channel key-on events */
     uint64_t ringcmds;             /* 32-bit commands consumed by the driver from the SH-4 -> ARM ring (write ptr advances) */

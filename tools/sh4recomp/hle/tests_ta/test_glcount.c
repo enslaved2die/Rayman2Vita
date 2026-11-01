@@ -3,13 +3,13 @@
  * hashed for texture validation.  Build it against two source trees (before / after) to compare:   see Makefile target test-glcount.
  * usage: test_glcount frame.bin vram.bin pvrregs.bin pvrfog.bin [frames=6] */
 #include "vitaGL.h"
-FakeGl fg;
 #include "../vita_gl_render.c"
 #include <stdio.h>
 #include <stdlib.h>
 
 uint8_t sh4_ram[SH4_RAM_SIZE];
 unsigned long hle_frame_count; int hle_verbose;
+uint64_t hle_io_t_us, hle_io_calls, hle_io_bytes; unsigned long sh4_stat_io_rd, sh4_stat_io_wr;      /* (perf.c references) */
 uint32_t sh4_io_read(uint32_t a, int s) { (void)a; (void)s; return 0; }
 void sh4_io_write(uint32_t a, int s, uint32_t v) { (void)a; (void)s; (void)v; }
 void hle_log(const char *f, ...) { (void)f; }

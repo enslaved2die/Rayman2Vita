@@ -56,13 +56,16 @@ static void h_load(SH4Ctx *c) {
 /* Snapshot of the PVR state the texture/blend decode needs (layout shared with tools/ta_render.py's pvrregs.bin):
  * out[0..1023] palette RAM (0xA05F9000), then PAL_RAM_CTRL, TEXT_CONTROL, PT_ALPHA_REF, ISP_FEED_CFG, FOG_COL_RAM, FOG_COL_VERT, FOG_DENSITY,
  * FOG_CLAMP_MAX, FOG_CLAMP_MIN, FPU_CULL_VAL, FPU_PARAM_CFG, HALF_OFFSET, FB_R_CTRL, ISP_BACKGND_T, ISP_BACKGND_D, BORDER_COL. */
+#if !defined(__vita__)
+char hle_dump_dir[256] = "build_hle";
+#endif
 void hle_ta_pvr_snapshot(uint32_t *out) {
     static const uint32_t regs[13] = { 0xA05F8108u, 0xA05F80E4u, 0xA05F811Cu, 0xA05F8098u, 0xA05F80B0u, 0xA05F80B4u, 0xA05F80B8u, 0xA05F80BCu,
                                        0xA05F80C0u, 0xA05F8078u, 0xA05F807Cu, 0xA05F8080u, 0xA05F8044u };
     memcpy(out, hle_pvr_regs() + 0x400, 1024 * sizeof(uint32_t));       /* palette RAM = words 0x400.. of the flat PVR register file */
     for (unsigned i = 0; i < 13; i++) out[1024 + i] = hle_reg_get(regs[i]);
 #if !defined(__vita__)
-    { FILE *o = fopen("build_hle/pvrfog.bin", "wb"); if (o) { uint32_t ft[143]; hle_ta_fog_table(ft); float bc[3][4]; uint32_t bi = 0, bt = 0, bk = 0; hle_ta_background(bc, &bi, &bt, &bk);
+    { char pp[400]; snprintf(pp, sizeof pp, "%s/pvrfog.bin", hle_dump_dir); FILE *o = fopen(pp, "wb"); if (o) { uint32_t ft[143]; hle_ta_fog_table(ft); float bc[3][4]; uint32_t bi = 0, bt = 0, bk = 0; hle_ta_background(bc, &bi, &bt, &bk);
         ft[128] = bi; ft[129] = bt; ft[130] = bk; for (int n = 0; n < 3; n++) for (int c = 0; c < 4; c++) { uint32_t u; memcpy(&u, &bc[n][c], 4); ft[131 + n * 4 + c] = u; } fwrite(ft, 4, 143, o); fclose(o); } }   /* host debug: fog table + background plane for tools/ta_render.py */
 #endif
     out[1037] = hle_reg_get(0xA05F808Cu); out[1038] = hle_reg_get(0xA05F8088u); out[1039] = hle_reg_get(0xA05F8040u);   /* ISP_BACKGND_T, ISP_BACKGND_D, BORDER_COL */

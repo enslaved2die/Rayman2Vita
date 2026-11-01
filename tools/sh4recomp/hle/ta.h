@@ -104,6 +104,27 @@ typedef struct TaFrame {
     uint32_t shad_scale;              /* FPU_SHAD_SCALE (0xA05F8074) sampled when the frame is handed out: bit8 = 'intensity' (0 = scale applies), [7:0] = shadow scale/256 [DOC] */
 } TaFrame;
 
+/* ---- deferred parsing (render thread): the guest-side sinks only capture the raw 32-byte packets of a scene (TaRaw) and frame them just enough to know
+ *  - which packets end a list (the guest needs the ASIC list-end interrupt at the moment of the store),
+ *  - which textures the scene uses (header words), so the guest thread can validate / decode them against VRAM at STARTRENDER;
+ * the render thread then runs the ordinary parser (ta_write / do_vertex / ... on a private TaCtx) over the packets.  Parse results are identical to parsing inline. ---- */
+typedef struct TaRaw {
+    uint8_t *data; uint32_t nbytes, cap;      /* packets, arrival order (data is 16-byte aligned) */
+    uint32_t chunks;                          /* packets received (== TaStats.chunks of the parsed frame) */
+    uint32_t (*tex)[2]; uint32_t ntex, captex;   /* (tcw, tsp) of every textured, non-modifier polygon/sprite header (consecutive repeats dropped) */
+} TaRaw;
+typedef struct TaCap {
+    TaRaw *cur;
+    int cur_list, vch, pend; uint32_t pend_w0, pend_w2, pend_w3;
+    uint8_t hdr_sprite, hdr_volume, hdr_textured, hdr_col;   /* fields of the last decoded header that decide the size of a vertex packet (persist across frames like TaCtx.hdr) */
+    uint32_t last_tcw, last_tsp; int last_valid;
+} TaCap;
+void   ta_cap_init(TaCap *c);
+int    ta_cap_write32(TaCap *c, const void *p32);                   /* returns 1 + list index when the packet is an end-of-list of a valid list, else 0 */
+void   ta_cap_write(TaCap *c, const void *p, size_t nbytes, uint32_t eol[TA_NUM_LISTS]);   /* eol[l] += end-of-list count per list */
+TaRaw *ta_cap_take(TaCap *c);                                       /* closes the scene (same boundary as ta_take_frame) and starts a new one */
+void   ta_raw_free(TaRaw *r);
+
 typedef enum { TA_DEST_TAFIFO = 0, TA_DEST_YUV, TA_DEST_TEXTURE, TA_DEST_VRAM, TA_DEST_UNKNOWN } TaDest;
 
 /* Optional sink for 32-byte writes that are not the polygon FIFO (VRAM direct, YUV, TA-texture). May be NULL. */
@@ -119,9 +140,13 @@ typedef struct TaCtx {
     int cur_list; int strip_open; uint32_t strip_idx;
     uint32_t mod_vol;                     /* running volume index within the current frame's modifier lists */
     uint32_t fifo_words[8]; int fifo_n;   /* word-wise FIFO writes */
+    int vch;                              /* cached vertex_chunks(): 32-byte chunks of a para-7 vertex under the current header / list (recomputed when either changes) */
+    uint32_t raw_prev[16]; int raw_prev_n; int raw_prev_clip[4]; int raw_prev_ok;   /* raw words of the last decoded polygon header: an identical header skips ta_decode_header */
     TaSinkFn sink; void *sink_user;
 } TaCtx;
 
+/* parse a captured scene (TaRaw) on the calling thread; c must be a private TaCtx fed only through this function, scenes in capture order */
+TaFrame *ta_parse_raw(TaCtx *c, const TaRaw *r);
 void ta_init(TaCtx *c);
 void ta_destroy(TaCtx *c);
 void ta_set_sink(TaCtx *c, TaSinkFn fn, void *user);
@@ -167,6 +192,7 @@ typedef struct TaGl {
     TaGlVertex *verts; uint32_t nverts;
     TaBatch *batches; uint32_t nbatches;
     uint32_t capverts, capbatches;    /* allocated capacity (kept across ta_build_gl_reuse calls) */
+    uint32_t *sidx; uint32_t sidx_cap;                      /* strip indices grouped by list (build scratch) */
     uint32_t list_first[TA_NUM_LISTS], list_count[TA_NUM_LISTS];  /* batch index ranges per list type (batches are grouped by list) */
 } TaGl;
 /* Convert strips -> triangle lists (even/odd winding corrected so a fixed cull mode works), sprites -> 2 tris,

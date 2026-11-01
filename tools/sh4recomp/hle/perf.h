@@ -37,8 +37,19 @@ typedef struct R2Perf {
     /* audio thread (written there): totals since start, latest split from snd_get_stats */
     volatile uint64_t aud_us_tot, aud_blocks; volatile uint32_t aud_us_max_win;
     volatile uint32_t aud_arm_us, aud_vox_us, aud_avg_us, aud_max_us;
+    volatile uint64_t aud_arm_instr, aud_arm_bulk, aud_samples;   /* cumulative ARM7 instructions (total / of which bulk-skipped delay loop) and AICA samples, set by the audio thread from snd_get_stats */
+    /* guest-thread breakdown of what the "guest" column is made of (microseconds / counts since the last report) */
+    uint64_t t_vsleep, vsleep_n;            /* nanosleep() in deliver_vblank: the guest waiting for the next 60 Hz vblank (boot.c). Counted INSIDE "guest" but is idle time */
+    uint64_t t_snd_tick, snd_tick_n;        /* stream catch-up dispatcher (snd.c sf_disp): up to 8 stream chunk feeds incl. their file reads per sound tick */
+    uint64_t t_snd_lock, snd_lock_n;        /* guest thread waiting for the AICA lock held by the audio thread (snd.c) */
+    /* render thread (R2_RENDER_THREAD): written by the guest thread: prep = texture validation/decode + PVR state snapshot at hand-off, rt_wait = blocked at hand-off because the renderer is behind (back-pressure);
+     * written by the render thread: rt_idle = waiting for a job */
+    uint64_t t_snap;         /* time of the snapshot (set by r2_perf_report) */
+    uint64_t t_prep, t_rt_wait, t_rt_idle, t_parse;   /* t_parse: render thread parsing the captured TA packets (deferred parse) */
 } R2Perf;
 extern R2Perf g_perf;
 extern void (*r2_perf_sink)(const char *line);   /* Vita: set by vita_main.c to its rayman2.log writer (one call per line); host: stderr */
-void r2_perf_report(unsigned long guest_frame);   /* prints + resets the window; call after a frame is complete */
+void r2_perf_report(unsigned long guest_frame);
+void r2_perf_format(const R2Perf *snap, unsigned long guest_frame, void (*sink)(const char *line));   /* formats one window (any thread; sink NULL = r2_perf_sink / stderr) */
+extern void (*r2_perf_post)(const R2Perf *snap, unsigned long guest_frame);   /* if set, r2_perf_report hands the snapshot here instead of formatting inline */   /* prints + resets the window; call after a frame is complete */
 #endif
