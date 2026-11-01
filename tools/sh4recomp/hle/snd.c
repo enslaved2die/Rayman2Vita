@@ -40,7 +40,7 @@ static inline void lk_unlock(void) { pthread_mutex_unlock(&g_lk); }
 static int g_trace;
 static int g_evlog;                                     /* R2_SND_EV=1: per-voice key-on/off/end/loop event log */
 static uint64_t st_samples_fwd(void);
-#define EV(...) do { if (g_evlog) { fprintf(stderr, "[ev] t=%.4f ", (double)st_samples_fwd() / 44100.0); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+#define EV(...) do { if (g_evlog) { fprintf(stderr, "[ev] t=%.4f f=%lu ", (double)st_samples_fwd() / 44100.0, hle_frame_count); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 static int g_vdump_s;                                   /* R2_SND_VDUMP=<s>: dump every active voice every <s> seconds of AICA time (stuck/orphan voice diagnosis) */
 static int g_ringlog;                                   /* R2_SND_RING=1: log music stream ring refills vs. voice wraps */
 static uint64_t g_rw_bytes[2], g_rw_n[2], g_rw_wraps[2]; static uint32_t g_rw_lo[2], g_rw_hi[2];
@@ -69,6 +69,7 @@ typedef struct {
     uint64_t t0;                 /* st_samples at key-on (voice dump) */
 } Chan;
 static Chan chn[64];
+static uint64_t g_amask;           /* bit ch set <=> chn[ch].active (kept in step at the three places that change it): render_sample walks only the set bits */
 static uint8_t g_keyed[64];       /* latched KYONB per channel (see keyonex) */
 static uint8_t g_dirty[64];       /* channel registers written since the last key-on (diagnostic) */
 static uint64_t st_restart_stale;
@@ -118,8 +119,18 @@ static void build_tables(void) {
 }
 
 /* ============================================================================================================================ memory */
-static inline uint32_t ram_rd(uint32_t a, int sz) { a &= ARAM_SIZE - 1; uint32_t v = 0; if (a + sz > ARAM_SIZE) return 0; memcpy(&v, &aram[a], sz); return v; }
-static inline void     ram_wr(uint32_t a, int sz, uint32_t v) { a &= ARAM_SIZE - 1; if (a + sz > ARAM_SIZE) return; memcpy(&aram[a], &v, sz); }
+#define SND_INL static inline __attribute__((always_inline))
+/* constant-size fast paths: the old memcpy(&v, &aram[a], sz) with a run-time `sz` was an out-of-line libc call on every ARM fetch / load / store (the Vita's newlib memcpy) */
+SND_INL uint32_t ram_rd(uint32_t a, int sz) {
+    a &= ARAM_SIZE - 1; if (a + (uint32_t)sz > ARAM_SIZE) return 0;
+    if (sz == 4) { uint32_t v; memcpy(&v, &aram[a], 4); return v; }
+    if (sz == 1) return aram[a];
+    { uint16_t v; memcpy(&v, &aram[a], 2); return v; }
+}
+SND_INL void ram_wr(uint32_t a, int sz, uint32_t v) {
+    a &= ARAM_SIZE - 1; if (a + (uint32_t)sz > ARAM_SIZE) return;
+    if (sz == 4) memcpy(&aram[a], &v, 4); else if (sz == 1) aram[a] = (uint8_t)v; else { uint16_t x = (uint16_t)v; memcpy(&aram[a], &x, 2); }
+}
 
 static void update_fiq_level(void);
 static void keyonex(void);
@@ -233,7 +244,7 @@ static inline uint32_t chn_reg(int ch, int r) { return aregs[(ch * 0x80 + r) >> 
 static void chan_start(int ch) {
     Chan *c = &chn[ch];
     memset(c, 0, sizeof *c);
-    c->active = 1; c->eg = 0; c->att = 1023.0f; c->t0 = st_samples;
+    c->active = 1; g_amask |= 1ull << ch; c->eg = 0; c->att = 1023.0f; c->t0 = st_samples;
     uint32_t r10 = chn_reg(ch, 0x10);
     if ((r10 & 31) == 31) { c->att = 0.0f; c->eg = 1; }
     c->ad_pred = 0; c->ad_step = 127;
@@ -266,7 +277,7 @@ static void keyonex(void) {
         Chan *c = &chn[ch];
         if (on) {
             if (!g_keyed[ch] || (g_keyon_old && (!c->active || c->eg == 3))) { g_keyed[ch] = 1; g_dirty[ch] = 0; chan_start(ch); }
-            else if (!c->active || c->eg == 3) { st_keyon_ignored++; EV("KEYON_IGNORED ch%d (latched on, active=%d eg=%d)", ch, c->active, c->eg); }
+            else if (!c->active || c->eg == 3) { st_keyon_ignored++; EV("KEYON_IGNORED ch%d (latched on, active=%d eg=%d) sa=%06x%s", ch, c->active, c->eg, (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)), (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) == 0x18000 || (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) == 0x1E000 ? " RING-VOICE" : ""); }
         } else {
             g_keyed[ch] = 0;
             if (c->active && c->eg != 3) { c->eg = 3; EV("KEYOFF ch%d pos=%u att=%.0f rr=%u", ch, c->pos, c->att, chn_reg(ch, 0x14) & 31); }
@@ -278,7 +289,8 @@ static void keyonex(void) {
 /* render one output sample of all channels -> l, r (float, 16-bit scale) */
 static inline void render_sample(float *outl, float *outr) {
     float l = 0, r = 0;
-    for (int ch = 0; ch < 64; ch++) {
+    for (uint64_t m = g_amask; m; m &= m - 1) {
+        const int ch = __builtin_ctzll(m);
         Chan *c = &chn[ch];
         if (!c->active) continue;
         const uint32_t *rg = &aregs[(ch * 0x80) >> 2];
@@ -289,7 +301,7 @@ static inline void render_sample(float *outl, float *outr) {
         case 1: { unsigned d1 = (r10 >> 6) & 31; float dl = (float)(((r14 >> 5) & 31) << 5);
                   c->att += g_dec_step[d1]; if (c->att >= dl) { c->att = dl; c->eg = 2; } break; }
         case 2: { unsigned d2 = (r10 >> 11) & 31; c->att += g_dec_step[d2]; if (c->att > 1023.0f) c->att = 1023.0f; break; }
-        default: { unsigned rr = r14 & 31; c->att += g_dec_step[rr]; if (c->att >= 1023.0f) { c->att = 1023.0f; c->active = 0; EV("REL_END ch%d", ch); } break; }
+        default: { unsigned rr = r14 & 31; c->att += g_dec_step[rr]; if (c->att >= 1023.0f) { c->att = 1023.0f; c->active = 0; g_amask &= ~(1ull << ch); EV("REL_END ch%d", ch); } break; }
         }
         if (!c->active) continue;
         /* sample */
@@ -323,7 +335,7 @@ static inline void render_sample(float *outl, float *outr) {
                     }
                     c->pos = lsa;
                     if (pcms >= 2) { c->ad_pos = lsa; if (pcms != 3) { c->ad_pred = c->lsa_saved ? c->lsa_pred : 0; c->ad_step = c->lsa_saved ? c->lsa_step : 127; } /* pcms 3 = ADPCM long-stream: decoder state continues across the loop (ring-buffer streams) */ c->s0 = adpcm_next(c, base, lsa); c->s1 = adpcm_next(c, base, lsa); continue; }
-                } else { c->active = 0; EV("SAMPLE_END ch%d sa=%06x lea=%u eg=%d", ch, base, lea, c->eg); break; }
+                } else { c->active = 0; g_amask &= ~(1ull << ch); EV("SAMPLE_END ch%d sa=%06x lea=%u eg=%d", ch, base, lea, c->eg); break; }
             }
             c->s0 = c->s1;
             uint32_t nx = c->pos + 1;
@@ -364,19 +376,29 @@ static void exception(uint32_t newmode, uint32_t vec, uint32_t lr, uint32_t fiq_
     A.r[14] = lr; A.r[15] = vec;
 }
 
-static uint32_t mrd(uint32_t a, int sz) {
+SND_INL uint32_t mrd(uint32_t a, int sz) {
     if (a < 0x800000u) return ram_rd(a, sz);
     if (a >= 0x800000u && a < 0x808000u) return reg_read(a - 0x800000u, sz, 1);
     return 0;
 }
-static void mwr(uint32_t a, int sz, uint32_t v) {
+SND_INL void mwr(uint32_t a, int sz, uint32_t v) {
     if (a < 0x800000u) { ram_wr(a, sz, v); return; }
     if (a >= 0x800000u && a < 0x808000u) reg_write(a - 0x800000u, sz, v, 1);
 }
 static inline uint32_t ror32(uint32_t x, unsigned n) { n &= 31; return n ? (x >> n) | (x << (32 - n)) : x; }
 
 /* operand 2; returns value, carry in *co */
-static uint32_t shifter(uint32_t i, uint32_t pc, int *co) {
+static uint32_t shifter_slow(uint32_t i, uint32_t pc, int *co);
+SND_INL uint32_t shifter(uint32_t i, uint32_t pc, int *co) {
+    if (i & 0x02000000u) {                                  /* rotated immediate */
+        uint32_t imm = i & 0xFF; unsigned rot = ((i >> 8) & 15) * 2;
+        if (!rot) { *co = (A.cpsr & FC) != 0; return imm; }
+        uint32_t v = (imm >> rot) | (imm << (32 - rot)); *co = (v >> 31) & 1; return v;
+    }
+    if ((i & 0xFF0) == 0 && (i & 15) != 15) { *co = (A.cpsr & FC) != 0; return A.r[i & 15]; }   /* plain register, LSL #0 */
+    return shifter_slow(i, pc, co);
+}
+static uint32_t shifter_slow(uint32_t i, uint32_t pc, int *co) {
     int c = (A.cpsr & FC) != 0;
     if (i & 0x02000000u) {
         uint32_t imm = i & 0xFF; unsigned rot = ((i >> 8) & 15) * 2;
@@ -408,7 +430,8 @@ static uint32_t shifter(uint32_t i, uint32_t pc, int *co) {
     *co = c; return v;
 }
 
-static inline int cond_ok(uint32_t cc) {
+SND_INL int cond_ok(uint32_t cc) {
+    if (cc == 14) return 1;
     uint32_t f = A.cpsr;
     int n = !!(f & FN), z = !!(f & FZ), c = !!(f & FC), v = !!(f & FV);
     switch (cc) {
@@ -427,13 +450,90 @@ static void branch_restore(void) {          /* "S" form write to PC: CPSR <- SPS
     A.cpsr = sp;
 }
 
-static int arm_step(void) {      /* returns cycles used */
+
+/* ---- decoded-instruction cache for the hot ARM7 instruction classes ----
+ * One entry per instruction word of ARAM[0, DT_MAX): the decoded fields of the most common classes (data processing with a rotated immediate or a plain register operand,
+ * LDR/STR with immediate offset and no write-back, B/BL). An entry is valid iff entry.raw equals the word currently in ARAM (no invalidation needed: self-modifying code,
+ * SH-4 uploads and streams just fail the comparison and re-decode). Anything else (kind 0) runs the generic interpreter below, unchanged. Semantics, flags and cycle counts are
+ * those of the generic code (checked bit-exactly against the frozen engine by tests_snd/cmp.sh over a recorded 155 s trace). */
+#define DT_MAX 0x10000u
+/* data-processing kinds carry the opcode in the low nibble (kind = base + opc): one indirect jump per instruction, the ALU operation is a compile-time constant in its case */
+enum { K_GEN = 0, K_DPI = 0x10, K_DPI_S = 0x20, K_DPR = 0x30, K_DPR_S = 0x40, K_DPSH = 0x50, K_DPSH_S = 0x60, K_LDW = 0x70, K_LDB, K_STW, K_STB, K_LDW_PI, K_LDB_PI, K_STW_PI, K_STB_PI, K_B, K_BL };
+typedef struct { uint32_t raw, imm; uint8_t kind, opc, rd, rn, rm, aux; } DEnt;
+static DEnt g_dt[DT_MAX / 4];
+static void dt_decode(DEnt *e, uint32_t i, uint32_t pc) {
+    e->raw = i; e->kind = K_GEN;
+    uint32_t op1 = (i >> 25) & 7; int rn = (i >> 16) & 15, rd = (i >> 12) & 15;
+    if (op1 == 0 && (i & 0x90) == 0x90) return;
+    if (op1 <= 1) {
+        uint32_t opc = (i >> 21) & 15; int S = (i >> 20) & 1;
+        if (!S && opc >= 8 && opc <= 11) return;
+        if (rn == 15 || rd == 15) return;
+        e->opc = (uint8_t)opc; e->rn = (uint8_t)rn; e->rd = (uint8_t)rd;
+        if (i & 0x02000000u) {
+            uint32_t imm = i & 0xFF; unsigned rot = ((i >> 8) & 15) * 2;
+            uint32_t v = rot ? (imm >> rot) | (imm << (32 - rot)) : imm;
+            e->imm = v; e->aux = rot ? (uint8_t)((v >> 31) & 1) : 2;      /* aux: carry-out of the operand, 2 = unchanged (current C) */
+            e->kind = (S ? K_DPI_S : K_DPI) + opc;
+        } else if ((i & 0xFF0) == 0 && (i & 15) == 15) { e->imm = pc + 8; e->aux = 2; e->kind = (S ? K_DPI_S : K_DPI) + opc; }                      /* mov lr, pc & co */
+        else if ((i & 0xFF0) == 0) { e->rm = (uint8_t)(i & 15); e->aux = 2; e->kind = (S ? K_DPR_S : K_DPR) + opc; }
+        else if (!(i & 0x10) && (i & 15) != 15) { e->rm = (uint8_t)(i & 15); e->kind = (S ? K_DPSH_S : K_DPSH) + opc; }                                  /* register shifted by an immediate */
+        return;
+    }
+    if (op1 == 2) {
+        int P = (i >> 24) & 1, W = (i >> 21) & 1, U = (i >> 23) & 1, B = (i >> 22) & 1, L = (i >> 20) & 1;
+        if (W || rd == 15) return;
+        uint32_t off = i & 0xFFF;
+        if (!P) {                                                 /* post-indexed: address = base, base += off */
+            if (rn == 15) return;
+            e->rd = (uint8_t)rd; e->rn = (uint8_t)rn; e->imm = U ? off : (uint32_t)0 - off;
+            e->kind = L ? (B ? K_LDB_PI : K_LDW_PI) : (B ? K_STB_PI : K_STW_PI);
+            return;
+        }
+        e->rd = (uint8_t)rd;
+        if (rn == 15) { e->rn = 16; e->imm = U ? pc + 8 + off : pc + 8 - off; } else { e->rn = (uint8_t)rn; e->imm = U ? off : (uint32_t)0 - off; }
+        e->kind = L ? (B ? K_LDB : K_LDW) : (B ? K_STB : K_STW);
+        return;
+    }
+    if (op1 == 5) { int32_t off = (int32_t)(i << 8) >> 6; e->imm = pc + 8 + (uint32_t)off; e->kind = (i & 0x01000000u) ? K_BL : K_B; }
+}
+/* data processing core for rd != 15 (same formulas as the generic path) */
+SND_INL void dp_core(uint32_t opc, int S, int rd, uint32_t a, uint32_t b, int co) {
+    uint32_t res = 0, C = 0, V = 0; int logic = 0, wr = 1; uint64_t t; int cf = !!(A.cpsr & FC);
+    switch (opc) {
+    case 0: res = a & b; logic = 1; break;
+    case 1: res = a ^ b; logic = 1; break;
+    case 2: t = (uint64_t)a - b; res = (uint32_t)t; C = a >= b; V = ((a ^ b) & (a ^ res)) >> 31; break;
+    case 3: t = (uint64_t)b - a; res = (uint32_t)t; C = b >= a; V = ((b ^ a) & (b ^ res)) >> 31; break;
+    case 4: t = (uint64_t)a + b; res = (uint32_t)t; C = (uint32_t)(t >> 32); V = (~(a ^ b) & (a ^ res)) >> 31; break;
+    case 5: t = (uint64_t)a + b + cf; res = (uint32_t)t; C = (uint32_t)(t >> 32); V = (~(a ^ b) & (a ^ res)) >> 31; break;
+    case 6: t = (uint64_t)a - b - (!cf); res = (uint32_t)t; C = (uint64_t)a >= (uint64_t)b + (!cf); V = ((a ^ b) & (a ^ res)) >> 31; break;
+    case 7: t = (uint64_t)b - a - (!cf); res = (uint32_t)t; C = (uint64_t)b >= (uint64_t)a + (!cf); V = ((b ^ a) & (b ^ res)) >> 31; break;
+    case 8: res = a & b; logic = 1; wr = 0; break;
+    case 9: res = a ^ b; logic = 1; wr = 0; break;
+    case 10: t = (uint64_t)a - b; res = (uint32_t)t; C = a >= b; V = ((a ^ b) & (a ^ res)) >> 31; wr = 0; break;
+    case 11: t = (uint64_t)a + b; res = (uint32_t)t; C = (uint32_t)(t >> 32); V = (~(a ^ b) & (a ^ res)) >> 31; wr = 0; break;
+    case 12: res = a | b; logic = 1; break;
+    case 13: res = b; logic = 1; break;
+    case 14: res = a & ~b; logic = 1; break;
+    default: res = ~b; logic = 1; break;
+    }
+    if (wr) A.r[rd] = res;
+    if (S) {
+        setnz(res);
+        if (logic) A.cpsr = (A.cpsr & ~FC) | (co ? FC : 0);
+        else A.cpsr = (A.cpsr & ~(FC | FV)) | (C ? FC : 0) | (V ? FV : 0);
+    }
+}
+
+__attribute__((noinline)) static int arm_step_gen(void) {      /* generic interpreter: returns cycles used */
     uint32_t pc = A.r[15] & ~3u, i = mrd(pc, 4);
     A.r[15] = pc + 4;
     st_arm_instr++;
     uint32_t cc = i >> 28;
     if (!cond_ok(cc)) return ARM_CYCLES_PER_INSN;
     int cyc = ARM_CYCLES_PER_INSN;
+
     uint32_t op1 = (i >> 25) & 7;
     if (op1 == 0 && (i & 0x90) == 0x90) {          /* multiplies / swap / halfword */
         if ((i & 0x60) == 0) {
@@ -590,14 +690,78 @@ static void arm_reset(void) {
     if (TRACE) fprintf(stderr, "[aica] ARM released from reset; driver code at 0: %08x %08x ... idle_ok=%d SCIEB-image@38=%08x\n", ram_rd(0, 4), ram_rd(0x100, 4), idle_ok, ram_rd(0x38, 4));
 }
 
+/* Delay loop of the MANATEE driver (mov r3,#n ... ldr r2,[ip,#48]; subs r3,r3,#1; bne back): the body has no side effect (a register read), costs 3+2+3 cycles per round and
+ * leaves N=0 Z=0 C=1 V=0, r2 = the register value. Rounds are executed in bulk, exactly as many as the stepwise loop would run before the budget check stops it
+ * (an instruction starts iff budget > 0); the last round(s) are left to the normal stepper. Verified bit-exact by tests_snd/cmp.sh. */
+static int delay_skip(int64_t *budget) {
+    if (ram_rd(0x7284, 4) != 0xe59c2030u || ram_rd(0x7288, 4) != 0xe2533001u || ram_rd(0x728c, 4) != 0x1afffffcu) return 0;
+    uint32_t r3 = A.r[3];
+    if (r3 < 3 || r3 > 100000 || *budget < 14) return 0;
+    int64_t k = (*budget - 6) / 8 + 1;                    /* rounds that can START and complete while the budget stays positive before every instruction */
+    int64_t m = r3 - 2; if (m > k - 1) m = k - 1;         /* leave >= 2 to the stepper: its subs/bne then see r3 > 1 */
+    if (m < 1) return 0;
+    uint32_t addr = A.r[12] + 48;
+    A.r[2] = ror32(mrd(addr & ~3u, 4), (addr & 3) * 8);
+    A.r[3] = r3 - (uint32_t)m;
+    A.cpsr = (A.cpsr & ~(FN | FZ | FC | FV)) | FC;
+    A.r[15] = 0x7284;
+    st_arm_instr += 3 * (uint64_t)m;
+    *budget -= 8 * m;
+    return 1;
+}
+#define DP_ONE(BASE, S, OPC, GETB) case (BASE) + (OPC): { GETB; dp_core((OPC), (S), e->rd, A.r[e->rn], b, co); budget -= 2; continue; }
+#define DP_CASES(BASE, S, GETB) \
+    DP_ONE(BASE, S, 0, GETB) DP_ONE(BASE, S, 1, GETB) DP_ONE(BASE, S, 2, GETB) DP_ONE(BASE, S, 3, GETB) DP_ONE(BASE, S, 4, GETB) DP_ONE(BASE, S, 5, GETB) DP_ONE(BASE, S, 6, GETB) DP_ONE(BASE, S, 7, GETB) \
+    DP_ONE(BASE, S, 8, GETB) DP_ONE(BASE, S, 9, GETB) DP_ONE(BASE, S, 10, GETB) DP_ONE(BASE, S, 11, GETB) DP_ONE(BASE, S, 12, GETB) DP_ONE(BASE, S, 13, GETB) DP_ONE(BASE, S, 14, GETB) DP_ONE(BASE, S, 15, GETB)
+/* The interpreter loop. `pc` lives in a local while only decoded-cache instructions run (A.r[15] is synchronised before anything that can look at / change it: exceptions, the
+ * generic stepper, the delay-loop skip, stores, which may reach the register file). Per instruction the semantics, flags and cycle counts are those of arm_step_gen(). */
 static inline void arm_cycles(int64_t cycles) {
-    arm_budget += cycles;
-    while (arm_budget > 0) {
-        if (fiq_pend && !(A.cpsr & 0x40)) { exception(0x11, 0x1C, (A.r[15] & ~3u) + 4, 0x40); }
-        if (idle_ok && A.r[15] == 0x194 && ram_rd(0x22c, 1) == 0 && ram_rd(0x22e, 1) == 0 && !(fiq_pend && !(A.cpsr & 0x40))
-            && ram_rd(0x13000, 4) == ram_rd(ram_rd(0x1808, 4), 4)) { st_idle++; arm_budget = 0; break; }
-        arm_budget -= arm_step();
+    int64_t budget = arm_budget + cycles;
+    uint32_t pc = A.r[15];
+    uint64_t ninstr = 0;
+    while (budget > 0) {
+        if (fiq_pend && !(A.cpsr & 0x40)) { A.r[15] = pc; exception(0x11, 0x1C, (pc & ~3u) + 4, 0x40); pc = A.r[15]; }
+        if (pc == 0x194) {
+            if (idle_ok && ram_rd(0x22c, 1) == 0 && ram_rd(0x22e, 1) == 0 && !(fiq_pend && !(A.cpsr & 0x40))
+                && ram_rd(0x13000, 4) == ram_rd(ram_rd(0x1808, 4), 4)) { st_idle++; budget = 0; break; }
+        } else if (pc == 0x7284) {
+            A.r[15] = pc; st_arm_instr += ninstr; ninstr = 0;
+            if (delay_skip(&budget)) { pc = A.r[15]; continue; }
+        }
+        const uint32_t pcm = pc & ~3u;
+        if (pcm < DT_MAX) {
+            uint32_t i; memcpy(&i, &aram[pcm], 4);
+            DEnt *e = &g_dt[pcm >> 2];
+            if (e->raw != i) dt_decode(e, i, pcm);
+            if (e->kind != K_GEN) {
+                ninstr++; pc = pcm + 4;
+                if (!cond_ok(i >> 28)) { budget -= ARM_CYCLES_PER_INSN; continue; }
+                switch (e->kind) {
+                DP_CASES(K_DPI, 0, uint32_t b = e->imm; int co = 0; (void)co)
+                DP_CASES(K_DPI_S, 1, uint32_t b = e->imm; int co = e->aux == 2 ? (A.cpsr & FC) != 0 : e->aux)
+                DP_CASES(K_DPR, 0, uint32_t b = A.r[e->rm]; int co = 0; (void)co)
+                DP_CASES(K_DPR_S, 1, uint32_t b = A.r[e->rm]; int co = (A.cpsr & FC) != 0)
+                DP_CASES(K_DPSH, 0, int co; uint32_t b = shifter(i, pcm, &co))
+                DP_CASES(K_DPSH_S, 1, int co; uint32_t b = shifter(i, pcm, &co))
+                case K_LDW: { uint32_t addr = (e->rn == 16 ? 0 : A.r[e->rn]) + e->imm; A.r[e->rd] = ror32(mrd(addr & ~3u, 4), (addr & 3) * 8); budget -= 3; continue; }
+                case K_LDB: { uint32_t addr = (e->rn == 16 ? 0 : A.r[e->rn]) + e->imm; A.r[e->rd] = mrd(addr, 1); budget -= 3; continue; }
+                case K_LDW_PI: { uint32_t addr = A.r[e->rn]; A.r[e->rn] = addr + e->imm; A.r[e->rd] = ror32(mrd(addr & ~3u, 4), (addr & 3) * 8); budget -= 3; continue; }
+                case K_LDB_PI: { uint32_t addr = A.r[e->rn]; A.r[e->rn] = addr + e->imm; A.r[e->rd] = mrd(addr, 1); budget -= 3; continue; }
+                case K_STW: { uint32_t addr = (e->rn == 16 ? 0 : A.r[e->rn]) + e->imm; A.r[15] = pc; mwr(addr & ~3u, 4, A.r[e->rd]); pc = A.r[15]; budget -= 2; continue; }
+                case K_STB: { uint32_t addr = (e->rn == 16 ? 0 : A.r[e->rn]) + e->imm; A.r[15] = pc; mwr(addr, 1, A.r[e->rd] & 0xFF); pc = A.r[15]; budget -= 2; continue; }
+                case K_STW_PI: { uint32_t addr = A.r[e->rn]; A.r[e->rn] = addr + e->imm; A.r[15] = pc; mwr(addr & ~3u, 4, A.r[e->rd]); pc = A.r[15]; budget -= 2; continue; }
+                case K_STB_PI: { uint32_t addr = A.r[e->rn]; A.r[e->rn] = addr + e->imm; A.r[15] = pc; mwr(addr, 1, A.r[e->rd] & 0xFF); pc = A.r[15]; budget -= 2; continue; }
+                case K_BL: A.r[14] = pcm + 4; pc = e->imm; budget -= 3; continue;
+                default: pc = e->imm; budget -= 3; continue;       /* K_B */
+                }
+            }
+        }
+        A.r[15] = pc; st_arm_instr += ninstr; ninstr = 0;
+        budget -= arm_step_gen();
+        pc = A.r[15];
     }
+    A.r[15] = pc; st_arm_instr += ninstr;
+    arm_budget = budget;
 }
 
 /* ============================================================================================================================ timers / main step */
@@ -644,13 +808,24 @@ static inline int32_t soft_limit(int32_t x) {
     return x < 0 ? -o : o;
 }
 static uint64_t st_samples_fwd(void) { return st_samples; }
+static uint64_t mix_now_us(void);
+static uint64_t st_tp_arm, st_tp_vox, st_tp_n; static double g_clock_cal_us;     /* probe sums (us) over st_tp_n probed samples */
 /* advance the emulated machine by n AICA sample periods; out (may be NULL) gets stereo int16 at 44.1 kHz. Caller holds the lock. */
+static uint64_t g_slow_ns; static uint64_t mix_now_us(void);
 static void advance_locked(int n, int16_t *out) {
     float mv = (aregs[0x2800 / 4] & 15) == 0 ? 0.0f : powf(2.0f, ((float)(aregs[0x2800 / 4] & 15) - 15.0f) * 0.5f);   /* MVOL: 15 = 0 dB, 3 dB/step (approximation) */
     for (int k = 0; k < n; k++) {
+        /* cost probe: every 64th sample is timed in its two halves (timers+ARM7 | voices) with the clock read at the boundaries; snd_get_stats extrapolates to a 1024-frame block */
+        const int probe = (k & 63) == 0; uint64_t tp0 = 0, tp1 = 0;
+        if (probe) tp0 = mix_now_us();
         timers_tick();
         if (arm_run_flag) arm_cycles(ARM_CYCLES_PER_SAMPLE);
+        if (probe) tp1 = mix_now_us();
+#if !defined(__vita__) && !defined(SND_TEST)
+        if (g_slow_ns) { uint64_t e = mix_now_us() * 1000 + g_slow_ns; while (mix_now_us() * 1000 < e) ; }      /* host emulation of the Vita's slow audio thread (R2_SND_SLOW_NS=9000 ~ 10 ms per 1024-frame block) */
+#endif
         float l, r; render_sample(&l, &r);
+        if (probe) { uint64_t tp2 = mix_now_us(); st_tp_arm += tp1 - tp0; st_tp_vox += tp2 - tp1; st_tp_n++; }
         int32_t il = (int32_t)(l * g_master), ir = (int32_t)(r * g_master);
         if (aregs[0x2800 / 4] & 0x8000) { il = ir = (il + ir) / 2; }
         il = (int32_t)(il * mv); ir = (int32_t)(ir * mv);
@@ -733,6 +908,29 @@ static void wall_sync_locked(void) {
  * stepped once per steady-state call (ctx[0x16] active flag), so extra calls run with the fade disabled. R2_STREAM_CATCHUP=0 disables (A/B). */
 static int g_sf_chunks, g_sf_on = 1; static unsigned long g_sf_ticks, g_sf_extra;
 static void sf_feed(SH4Ctx *c) { g_sf_chunks++; hle_orig(c, 0x8C062F60); }
+/* Music watchdog (always on, guest thread, ~once per 16 ticks): the guest's stream engine says a stream plays (state 3, not paused, no fade) but the AICA model does not have BOTH ring
+ * voices (sample address 0x18000 / 0x1E000, channels are allocated dynamically by the ARM driver) active. >= 0.5 s of that is a "hole" (music silent while the game thinks it plays):
+ * counted, the first details kept in g_hole_note (printed by the Vita front end through SndStats.stream_note). Also counts guest stream open/stop/pause/resume calls. */
+static uint32_t g_st_open, g_st_stop, g_st_pause, g_st_resume, g_st_holes, g_st_hole_ms_max, g_st_note_seq; static char g_hole_note[200];
+static void stream_watchdog(uint32_t ctx) {
+    static unsigned tick; static uint64_t bad0; static int inhole;
+    if ((++tick & 15) && !inhole) return;
+    uint32_t st = LD32(ctx), paused = LD32(ctx + 8), fade = LD32(ctx + 0x58); int okL = 0, okR = 0; int cl = -1, cr = -1;
+    for (int ch = 0; ch < 64; ch++) {
+        uint32_t r0 = chn_reg(ch, 0), base = ((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF);
+        if ((base == 0x18000 || base == 0x1E000) && ((r0 >> 7) & 3) != 2 && chn[ch].active) { if (base == 0x18000) { okL = 1; cl = ch; } else { okR = 1; cr = ch; } }
+    }
+    int bad = st == 3 && !paused && !fade && !(okL && okR);
+    uint64_t now = st_samples;
+    if (!bad) { inhole = 0; bad0 = 0; return; }
+    if (!bad0) { bad0 = now; return; }
+    if (!inhole && now - bad0 >= 22050) {
+        inhole = 1; g_st_holes++;
+        snprintf(g_hole_note, sizeof g_hole_note, "stream hole #%u: guest state 3 left %u but ring voices L=%s R=%s (latched L=%d R=%d); opens %u stops %u pauses %u resumes %u, t=%.1fs", g_st_holes, LD32(ctx + 0xC), okL ? "on" : "OFF", okR ? "on" : "OFF", cl >= 0, cr >= 0, g_st_open, g_st_stop, g_st_pause, g_st_resume, (double)now / 44100.0);
+        g_st_note_seq++; EV("STREAM_HOLE %s", g_hole_note);
+    }
+    if (inhole) { uint32_t ms = (uint32_t)((now - bad0) / 44); if (ms > g_st_hole_ms_max) g_st_hole_ms_max = ms; }
+}
 static void sf_disp(SH4Ctx *c) {
     const uint32_t ctx = 0x8C2D4968u; uint32_t pr = c->pr; int maxn = (g_sf_on && LD32(ctx) == 3) ? 8 : 1; uint32_t fade = 0;
     for (int i = 0; i < maxn; i++) {
@@ -743,7 +941,28 @@ static void sf_disp(SH4Ctx *c) {
         if (g_sf_chunks == n0 || LD32(ctx) != 3) break;
     }
     g_sf_ticks++; c->pr = pr;
+    stream_watchdog(ctx);
+    if (g_evlog && getenv("R2_SND_CMDDUMP")) {      /* every tick where the command block changed: entries whose op is not a 0x15/0x16 status poll, plus the 0x13400 sequence words */
+        static char last[1400]; char b[1400]; int n = 0;
+        for (uint32_t o = 0x13200; o < 0x13320; o += 16) { uint32_t w0 = ram_rd(o, 4), w1 = ram_rd(o + 4, 4); unsigned op = w0 & 0xFF; if (op && op != 0x15 && op != 0x16) n += snprintf(b + n, sizeof b - n, " [%x:%08x %08x]", o & 0xFFF, w0, w1); }
+        n += snprintf(b + n, sizeof b - n, " | 13400:"); for (uint32_t o = 0x13400; o < 0x13420; o += 4) n += snprintf(b + n, sizeof b - n, " %x", ram_rd(o, 4));
+        if (strcmp(b, last)) { strcpy(last, b); EV("CMDBLK%s", b); }
+    }
+    if (g_evlog) {      /* music timeline: log every stream state change and, four times a second of AICA time, the stream context and ring voices */
+        static uint32_t last0 = 99; static uint64_t lt; uint32_t s0 = LD32(ctx);
+        if (s0 != last0 || st_samples - lt >= 11025) {
+            lt = st_samples; last0 = s0;
+char rb[160]; int rn = 0; rb[0] = 0;       /* ring voices are allocated dynamically by the ARM driver: find them by sample address */
+            for (int ch = 0; ch < 64; ch++) { uint32_t base = (((chn_reg(ch, 0) & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)); if ((base == 0x18000 || base == 0x1E000) && ((chn_reg(ch, 0) >> 7) & 3) != 2 && (chn[ch].active || g_keyed[ch]))
+                rn += snprintf(rb + rn, sizeof rb - rn, " ch%d(%s a%d k%d eg%d att%.0f pos%u)", ch, base == 0x18000 ? "L" : "R", chn[ch].active, g_keyed[ch], chn[ch].eg, chn[ch].att, chn[ch].pos); }
+            EV("STREAMCTX state=%u paused=%u left=%u fade=%u rings:%s", s0, LD32(ctx + 8), LD32(ctx + 0xC), LD32(ctx + 0x58), rb);
+        }
+    }
 }
+static void sf_open(SH4Ctx *c) { g_st_open++; if (g_evlog) EV("GUEST stream-open sd=%08x state=%u", c->r[6], LD32(0x8C2D4968)); hle_orig(c, 0x8C06262C); }
+static void sf_stop(SH4Ctx *c) { g_st_stop++; if (g_evlog) EV("GUEST stream-stop state=%u", LD32(0x8C2D4968)); hle_orig(c, 0x8C0628A8); }
+static void sf_pause(SH4Ctx *c) { g_st_pause++; if (g_evlog) EV("GUEST stream-pause state=%u", LD32(0x8C2D4968)); hle_orig(c, 0x8C062960); }
+static void sf_resume(SH4Ctx *c) { g_st_resume++; if (g_evlog) EV("GUEST stream-resume state=%u", LD32(0x8C2D4968)); hle_orig(c, 0x8C0629B0); }
 /* guest sd command taps (R2_SND_EV=1 log, counters): sd cmd 0x11 key-on request 0x8C0F06BC (r4 = sd handle, byte at +1 = driver handle id) and cmd 0x12 stop 0x8C0F08E4.
  * Used to compare what the GAME asks for with what the AICA model plays (KEYON events): they must match 1:1. */
 static unsigned long st_gstart, st_gstop;
@@ -757,6 +976,7 @@ int snd_init(int out_rate) {
     { volatile const char *pad = g_vita_layout_pad; (void)pad[0]; }     /* keep the layout pad alive through --gc-sections */
 #endif
     lk_init(); build_tables();
+    { uint64_t c0 = mix_now_us(), c1 = c0; for (int j = 0; j < 200; j++) c1 = mix_now_us(); g_clock_cal_us = (double)(c1 - c0) / 200.0; }   /* cost of one clock read (subtracted from the probes) */
     if (out_rate != 44100 && out_rate != 48000) out_rate = 44100;
     g_out_rate = out_rate; g_inited = 1;
     return 0;
@@ -807,15 +1027,22 @@ void snd_mix(int16_t *out, int frames) {
             for (int j = 0; j < 4; j++) { float l, r; stage_next(&l, &r); g_rs_h[0][j] = l; g_rs_h[1][j] = r; }
             g_rs_pos = 0; g_rs_have = 1;
         }
+        /* same arithmetic, in the same order, as the former per-frame code (so the output is bit-identical): state in locals, input read straight from the stage buffer */
+        double pos = g_rs_pos; float h0[4] = { g_rs_h[0][0], g_rs_h[0][1], g_rs_h[0][2], g_rs_h[0][3] }, h1[4] = { g_rs_h[1][0], g_rs_h[1][1], g_rs_h[1][2], g_rs_h[1][3] };
         for (int k = 0; k < frames; k++) {
-            while (g_rs_pos >= 1.0) {
-                float l, r; stage_next(&l, &r);
-                for (int j = 0; j < 3; j++) { g_rs_h[0][j] = g_rs_h[0][j + 1]; g_rs_h[1][j] = g_rs_h[1][j + 1]; }
-                g_rs_h[0][3] = l; g_rs_h[1][3] = r; g_rs_pos -= 1.0;
+            while (pos >= 1.0) {
+                if (g_stage_i >= g_stage_n) stage_refill();
+                const int16_t *sp = &g_stage[2 * g_stage_i++];
+                h0[0] = h0[1]; h0[1] = h0[2]; h0[2] = h0[3]; h0[3] = (float)sp[0];
+                h1[0] = h1[1]; h1[1] = h1[2]; h1[2] = h1[3]; h1[3] = (float)sp[1];
+                pos -= 1.0;
             }
-            for (int c = 0; c < 2; c++) { float v = cubic(g_rs_h[c], (float)g_rs_pos); out[2 * k + c] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : v); }
-            g_rs_pos += ratio;
+            const float t = (float)pos;
+            float v = cubic(h0, t); out[2 * k] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : v);
+            v = cubic(h1, t); out[2 * k + 1] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : v);
+            pos += ratio;
         }
+        g_rs_pos = pos; for (int j = 0; j < 4; j++) { g_rs_h[0][j] = h0[j]; g_rs_h[1][j] = h1[j]; }
     }
     uint64_t dt = mix_now_us() - t0; st_mix_calls++; st_mix_us_tot += dt; if (dt > st_mix_us_max) st_mix_us_max = dt;
 }
@@ -825,6 +1052,15 @@ void snd_get_stats(SndStats *s) {
     s->arm_running = arm_run_flag; s->samples = st_samples; s->arm_instr = st_arm_instr; s->arm_idle_skips = st_idle; s->keyon = st_keyon; s->ringcmds = st_ringcmds;
     for (int i = 0; i < 64; i++) s->active_channels += chn[i].active;
     s->peak = st_peak; st_peak = 0; s->undef_instr = st_undef;
+    {   /* per-block (1024 output frames = 941.2 AICA samples) split, extrapolated from the probed samples; the clock-read cost (calibrated in snd_init) is subtracted per half */
+        double n = st_tp_n ? (double)st_tp_n : 1.0, cal = g_clock_cal_us, per = 1024.0 * 44100.0 / (g_out_rate ? g_out_rate : 44100);
+        double a = (double)st_tp_arm / n - cal, v = (double)st_tp_vox / n - cal; if (a < 0) a = 0; if (v < 0) v = 0;
+        s->arm_us_blk = st_tp_n ? (uint32_t)(a * per) : 0; s->vox_us_blk = st_tp_n ? (uint32_t)(v * per) : 0; s->tp_n = (uint32_t)st_tp_n; st_tp_arm = st_tp_vox = st_tp_n = 0; }
+#ifndef SND_TEST
+    s->stream_open = g_st_open; s->stream_stop = g_st_stop; s->stream_pause = g_st_pause; s->stream_resume = g_st_resume; s->stream_holes = g_st_holes; s->stream_hole_ms_max = g_st_hole_ms_max;
+    s->stream_note_seq = g_st_note_seq; memcpy(s->stream_note, g_hole_note, sizeof s->stream_note);
+#endif
+    s->keyon_ignored = (uint32_t)st_keyon_ignored;
     s->mix_calls = st_mix_calls; s->mix_us_avg = st_mix_calls ? (uint32_t)(st_mix_us_tot / st_mix_calls) : 0; s->mix_us_max = (uint32_t)st_mix_us_max;
     st_mix_calls = st_mix_us_tot = st_mix_us_max = 0;
     lk_unlock();
@@ -843,16 +1079,47 @@ static uint32_t sh4_aram_rd(uint32_t a, int sz) {
     if (!g_pull_mode) { lk_lock(); wall_sync_locked(); lk_unlock(); }
     return ram_rd(a & 0x1FFFFF, sz);
 }
-static uint64_t g_sh4wr[32], g_sh4wr_n;
+/* R2_SND_REC=<file> (host): record every guest ARAM / register write and G2 DMA with the AICA sample counter, for tests_snd/replay.c (old vs new engine, bit-exact comparison).
+ * Entry = { u64 t; u32 kind (0 aram wr, 1 reg wr, 2 dma to aram) | size << 8; u32 addr; u32 value (dma: length, followed by the bytes) }. */
+#if !defined(__vita__) && !defined(SND_TEST)
+static FILE *g_rec;
+static void rec_put(uint32_t kind, uint32_t sz, uint32_t a, uint32_t v, const void *blob) {
+    if (!g_rec) return;
+    uint64_t t = st_samples; uint32_t k = kind | (sz << 8);
+    fwrite(&t, 8, 1, g_rec); fwrite(&k, 4, 1, g_rec); fwrite(&a, 4, 1, g_rec); fwrite(&v, 4, 1, g_rec);
+    if (blob) fwrite(blob, 1, v, g_rec);
+}
+#define REC(k, sz, a, v, blob) rec_put((k), (sz), (a), (v), (blob))
+#else
+#define REC(k, sz, a, v, blob) do {} while (0)
+#endif
+static uint64_t g_sh4wr[32], g_sh4wr_n; static int g_blk_held, g_blk_lock = 1; static uint32_t g_blk_op[17]; static volatile uint64_t g_blk_s0; static uint64_t g_blk_n, g_blk_torn;
 static void sh4_aram_wr(uint32_t a, int sz, uint32_t v) {
+    REC(0, sz, a & 0x1FFFFF, v, 0);
     CALLER_NOTE(1, a & 0x1FFFFF);
     if (!g_pull_mode) { lk_lock(); wall_sync_locked(); lk_unlock(); }
     g_sh4wr[(a >> 16) & 31] += sz; g_sh4wr_n++;
     if (g_ringlog) { uint32_t o = a & 0x1FFFFF; int ri = (o >= 0x18000 && o < 0x1C000) ? 0 : (o >= 0x1E000 && o < 0x22000) ? 1 : -1;
         if (ri == 0) { static unsigned long lf; static uint32_t fs, fe, fn_; static uint64_t lt; if (hle_frame_count != lf) { if (fn_) fprintf(stderr, "[frm0] f=%lu t=%.3f stores=%u first=%05x last=%05x voice_pos_bytes=%u\n", lf, (double)lt / 44100.0, fn_, fs, fe, chn[53].pos * 2); lf = hle_frame_count; fn_ = 0; } if (!fn_) fs = o; fe = o; fn_++; lt = st_samples; }
         if (ri >= 0) { g_rw_n[ri]++; g_rw_bytes[ri] += sz; if (!g_rw_hi[ri] || o < g_rw_lo[ri]) g_rw_lo[ri] = o; if (o + sz > g_rw_hi[ri]) g_rw_hi[ri] = o + sz; } }
-    if ((a & 0x1FFFFF) == 0x13000 && sz == 4) { st_ringcmds += ((v - ram_rd(0x13000, 4)) & 0xFFF) >> 2; __sync_synchronize(); }   /* ring entries before the write pointer */
-    ram_wr(a & 0x1FFFFF, sz, v);
+    if (g_evlog) { uint32_t o = a & 0x1FFFFF;      /* tear detector: did the AICA run between the first and the last word of a 0x13200 command block write? */
+        if (o == 0x13200) { g_blk_s0 = st_samples; g_blk_n++; } else if (o == 0x1330C) { if (st_samples != g_blk_s0) { g_blk_torn++; char b[400]; int n = 0; for (int e = 0; e < 17; e++) { uint32_t cur = ram_rd(0x13200 + e * 16, 4); if (cur != g_blk_op[e]) n += snprintf(b + n, sizeof b - n, " e%d:wrote %08x now %08x arg %08x;", e, g_blk_op[e], cur, ram_rd(0x13204 + e * 16, 4)); }
+            EV("CMDBLK_TORN: AICA ran %llu samples inside block write #%llu; entries consumed before the block was complete:%s", (unsigned long long)(st_samples - g_blk_s0), (unsigned long long)g_blk_n, n ? b : " none"); } } if (o >= 0x13200 && o < 0x13310 && !(o & 15) && sz == 4) g_blk_op[(o - 0x13200) >> 4] = v; }
+    uint32_t o = a & 0x1FFFFF;
+    if (o == 0x13000 && sz == 4) { st_ringcmds += ((v - ram_rd(0x13000, 4)) & 0xFFF) >> 2; __sync_synchronize(); }   /* ring entries before the write pointer */
+    if (g_pull_mode && g_blk_lock) {
+        /* The sd transport writes the 0x110-byte command block 0x13200..0x1330F word by word (ascending, op word of each 16-byte entry first). The ARM driver polls those op words on the
+         * audio thread: without exclusion it consumed entries whose argument word was not stored yet (host: 1 torn block per 1000 at normal speed, 1 per 100 with a Vita-speed audio
+         * thread; on the Vita's weakly ordered cores stores can additionally become visible out of order). The guest holds the AICA lock across the block (first word 0x13200 ... last
+         * word 0x1330C): the audio thread simply waits < 50 us, and the unlock publishes all stores (barrier). Safety: any store outside the block releases a lock left held. */
+        if (g_blk_held && (o < 0x13200 || o > 0x1330F)) { g_blk_held = 0; lk_unlock(); }
+        if (o == 0x13200 && !g_blk_held) { lk_lock(); g_blk_held = 1; g_blk_s0 = st_samples; }
+        ram_wr(o, sz, v);
+        if (g_blk_held && o >= 0x1330C) { g_blk_held = 0; lk_unlock(); }
+        return;
+    }
+    ram_wr(o, sz, v);
+    if (o >= 0x13400 && o < 0x13440) __sync_synchronize();     /* sequence / write-index words: publish the ring data and block stores written before them */
 }
 static uint32_t sh4_reg_rd(uint32_t a, int sz) {
     CALLER_NOTE(2, a & 0x7FFF);
@@ -860,6 +1127,8 @@ static uint32_t sh4_reg_rd(uint32_t a, int sz) {
     return reg_read(a & 0x7FFF, sz, 0);
 }
 static void sh4_reg_wr(uint32_t a, int sz, uint32_t v) {
+    if (g_blk_held) { g_blk_held = 0; lk_unlock(); }       /* a command-block write was interrupted: never self-deadlock on the AICA lock */
+    REC(1, sz, a & 0x7FFF, v, 0);
     CALLER_NOTE(3, a & 0x7FFF);
     lk_lock(); if (!g_pull_mode) wall_sync_locked();
     reg_write(a & 0x7FFF, sz, v, 0);
@@ -867,11 +1136,13 @@ static void sh4_reg_wr(uint32_t a, int sz, uint32_t v) {
 }
 /* G2 AICA DMA (SB_ADST): sd normally uses CPU stores; implemented for completeness (UNTESTED - not seen in the first frames). */
 static void g2_watch(uint32_t a, int sz, uint32_t v) {
+    if (g_blk_held) { g_blk_held = 0; lk_unlock(); }
     (void)sz;
     if ((a & 0xFFFF) != 0x7818 || !(v & 1)) return;
     uint32_t aica = hle_reg_get(0xA05F7800u), sys = hle_reg_get(0xA05F7804u), len = hle_reg_get(0xA05F7808u) & 0x7FFFFFFFu, dir = hle_reg_get(0xA05F780Cu) & 1;
     uint32_t sp = sys & 0x1FFFFFFFu;
     if (sp >= 0x0C000000u && sp + len <= 0x0D000000u && (aica & 0x1FFFFFu) + len <= ARAM_SIZE) {
+        if (dir == 0) REC(2, 0, aica & 0x1FFFFF, len, &sh4_ram[sp & 0xFFFFFF]);
         lk_lock();
         if (dir == 0) memcpy(&aram[aica & 0x1FFFFF], &sh4_ram[sp & 0xFFFFFF], len); else memcpy(&sh4_ram[sp & 0xFFFFFF], &aram[aica & 0x1FFFFF], len);
         lk_unlock();
@@ -881,14 +1152,23 @@ static void g2_watch(uint32_t a, int sz, uint32_t v) {
     hle_asic_raise_later(1u << 15);
 }
 
+/* test/replay entry points (tests_snd/replay.c): the same code paths a guest write takes */
+void snd_test_sh4_aram_wr(uint32_t a, int sz, uint32_t v) { sh4_aram_wr(a, sz, v); }
+void snd_test_sh4_reg_wr(uint32_t a, int sz, uint32_t v) { sh4_reg_wr(a, sz, v); }
+void snd_test_dma_to_aram(uint32_t a, const void *p, uint32_t len) { if ((a & 0x1FFFFF) + len <= ARAM_SIZE) memcpy(&aram[a & 0x1FFFFF], p, len); }
+uint64_t snd_test_samples(void) { return st_samples; }
+void snd_test_set_pull(int on) { g_pull_mode = on; g_blk_lock = 0; /* single-threaded replay: no guest/audio thread exclusion needed (it would deadlock) */ }
 static void snd_atexit(void) {
+#if !defined(__vita__) && !defined(SND_TEST)
+    if (g_rec) { fclose(g_rec); g_rec = 0; }
+#endif
 #if !defined(__vita__)
     if (g_callerlog) for (int i = 0; i < g_cln; i++) fprintf(stderr, "[caller] fn=%08x pr=%08x %s %05x n=%llu\n", g_cl[i].fn, g_cl[i].pr, (const char *[]){"aram_rd", "aram_wr", "reg_rd", "reg_wr"}[g_cl[i].kind], g_cl[i].reg, (unsigned long long)g_cl[i].n);
 #endif
 #ifndef SND_TEST
     if (g_evlog) fprintf(stderr, "[ev] CATCHUP ticks=%lu extra_calls=%lu; guest start-cmds=%lu stop-cmds=%lu\n", g_sf_ticks, g_sf_extra, st_gstart, st_gstop);
 #endif
-    if (g_evlog) { SndStats ms; snd_get_stats(&ms); fprintf(stderr, "[ev] MIXCOST calls=%llu avg=%u us max=%u us per block of 1024 frames (budget 21333 us at 48 kHz); arm_instr=%llu keyon=%llu keyon_ignored=%llu\n", (unsigned long long)ms.mix_calls, ms.mix_us_avg, ms.mix_us_max, (unsigned long long)ms.arm_instr, (unsigned long long)ms.keyon, (unsigned long long)st_keyon_ignored); }
+    if (g_evlog) { SndStats ms; snd_get_stats(&ms); fprintf(stderr, "[ev] MIXCOST calls=%llu avg=%u us max=%u us per block of 1024 frames (budget 21333 us at 48 kHz); arm_instr=%llu keyon=%llu keyon_ignored=%llu cmdblk_writes=%llu cmdblk_torn=%llu\n", (unsigned long long)ms.mix_calls, ms.mix_us_avg, ms.mix_us_max, (unsigned long long)ms.arm_instr, (unsigned long long)ms.keyon, (unsigned long long)st_keyon_ignored, (unsigned long long)g_blk_n, (unsigned long long)g_blk_torn); }
     if (g_evlog) for (int ch = 0; ch < 64; ch++) if (chn[ch].active) { fprintf(stderr, "[ev] ACTIVE_AT_EXIT ch%d eg=%d att=%.0f pos=%u", ch, chn[ch].eg, chn[ch].att, chn[ch].pos); for (int r = 0; r < 0x50; r += 4) fprintf(stderr, " %02x:%08x", r, aregs[(ch * 0x80 + r) >> 2]); fputc(10, stderr); } snd_wav_close(); { const char *d = getenv("R2_SND_DUMP"); if (d && *d) { FILE *f = fopen(d, "wb"); if (f) { fwrite(aram, 1, ARAM_SIZE, f); fclose(f); } } } if (TRACE) { for (int i = 0; i < 32; i++) if (g_sh4wr[i]) fprintf(stderr, "[snd] sh4 wrote %llu bytes to aram %06x..\n", (unsigned long long)g_sh4wr[i], i << 16); SndStats s; snd_get_stats(&s); fprintf(stderr, "[snd] ringcmds=%llu samples=%llu arm_instr=%llu idle_skips=%llu keyon=%llu undef=%u active=%d\n", (unsigned long long)s.ringcmds, (unsigned long long)s.samples, (unsigned long long)s.arm_instr, (unsigned long long)s.arm_idle_skips, (unsigned long long)s.keyon, s.undef_instr, s.active_channels); } }
 
 #if !defined(__vita__)
@@ -920,6 +1200,8 @@ __attribute__((constructor)) static void snd_ctor(void) {
     { const char *cl = getenv("R2_SND_CALLER"); g_callerlog = cl && *cl && *cl != '0'; }
 #endif
     { const char *ko = getenv("R2_SND_KEYON_OLD"); g_keyon_old = ko && *ko == '1'; }
+    { const char *bl = getenv("R2_SND_BLKLOCK"); g_blk_lock = !(bl && *bl == '0'); }      /* =0: no command-block exclusion (A/B) */
+    { const char *sl = getenv("R2_SND_SLOW_NS"); g_slow_ns = sl ? (uint64_t)atoll(sl) : 0; }
     { const char *vd = getenv("R2_SND_VDUMP"); g_vdump_s = vd ? atoi(vd) : 0; }
     { const char *e = getenv("R2_SND_EV"); g_evlog = e && *e && *e != '0'; }
     const char *tr = getenv("R2_SND_TRACE"); g_trace = tr && *tr && *tr != '0';
@@ -936,7 +1218,10 @@ __attribute__((constructor)) static void snd_ctor(void) {
     start_pull_test();
 #endif
 #ifndef SND_TEST
-    { const char *e = getenv("R2_STREAM_CATCHUP"); g_sf_on = !(e && *e == '0'); hle_hook(0x8C0625B8, sf_disp); hle_hook(0x8C062F60, sf_feed); hle_hook(0x8C0F06BC, sf_cmd_start); hle_hook(0x8C0F08E4, sf_cmd_stop); }
+    { const char *e = getenv("R2_STREAM_CATCHUP"); g_sf_on = !(e && *e == '0'); hle_hook(0x8C0625B8, sf_disp); hle_hook(0x8C062F60, sf_feed); hle_hook(0x8C0F06BC, sf_cmd_start); hle_hook(0x8C0F08E4, sf_cmd_stop); hle_hook(0x8C06262C, sf_open); hle_hook(0x8C0628A8, sf_stop); hle_hook(0x8C062960, sf_pause); hle_hook(0x8C0629B0, sf_resume); }
+#endif
+#if !defined(__vita__) && !defined(SND_TEST)
+    { const char *rf = getenv("R2_SND_REC"); if (rf && *rf) { g_rec = fopen(rf, "wb"); if (g_rec) fwrite("SREC0001", 1, 8, g_rec); } }
 #endif
     atexit(snd_atexit);
 }

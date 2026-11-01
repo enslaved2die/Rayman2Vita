@@ -39,6 +39,11 @@ static inline uint64_t raw_ns(void) {
 #if defined(__vita__)
     return (uint64_t)sceKernelGetProcessTimeWide() * 1000ull;
 #else
+    /* R2_DET_CLOCK=1 (host A/B testing): the host clock is replaced by a counter that advances 997 ns per read, so the guest's timing-dependent logic (delta times, animation) is a pure
+     * function of the instruction stream: two runs of the same binary produce identical guest RAM, which lets optimisations be verified by comparing RAM dumps / frame hashes. */
+    static int det = -1; static uint64_t det_ns;
+    if (det < 0) { const char *e = getenv("R2_DET_CLOCK"); det = e && *e && *e != '0'; }
+    if (det) { det_ns += 997; return det_ns; }
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 #endif
 }
@@ -398,7 +403,9 @@ static void ta_fallback_scan(const uint8_t *p, uint32_t len) {
     }
 }
 /* ---- store queues (0xE0000000..0xE3FFFFFF) ---- */
-static uint32_t vram_min[2] = {~0u, ~0u}, vram_max[2]; static uint8_t sq_buf[64]; unsigned long vram_area_n[4], vram_cpu_n[4], dma_vram_n[4];
+extern uint8_t sh4_sq_buf[];
+#define sq_buf sh4_sq_buf    /* the SQ window itself is answered in runtime.c (sh4_io_read/write); this is the same buffer */
+static uint32_t vram_min[2] = {~0u, ~0u}, vram_max[2]; unsigned long vram_area_n[4], vram_cpu_n[4], dma_vram_n[4];
 static void (*sq_sink)(uint32_t phys, const uint8_t *data32);
 void hle_set_sq_sink(void (*fn)(uint32_t phys, const uint8_t *data32)) { sq_sink = fn; }
 static unsigned long sq_ram_n, sq_other_n;
@@ -543,6 +550,61 @@ static void h_pvr_write(SH4Ctx *c) {         /* FUN_8C0DB7E0(off,val): *(0xA05F8
 static void h_pvr_read(SH4Ctx *c) { R(0) = sh4_io_read(0xA05F8000u + c->r[4], 4); }
 
 /* syCache family: cache maintenance via P2-alias jumps into mid-function code (not liftable) - host memory is coherent, so no-op. */
+/* libc memmove / memset of the game (0x8C0685B4 / 0x8C0686B8; calls: ~220 + ~20 per frame, byte/halfword/word loops through LD/ST helpers). Plain-RAM ranges are done with the host libc (same result: the
+ * guest memmove copies forward in 1/2/4-byte units whose size divides |dst-src|, i.e. it IS memmove); anything else (VRAM, AICA, SQ, MMIO, wrap) runs the original. Returns dst in r0 like the original. */
+/* hooks replace guest functions whose entry (HLE_ENTER -> hle_trace_enter) also advances the deferred-ASIC-event countdown; do the same so interrupt delivery points do not move */
+#define HOOK_ENTER(c, a) do { if (hle_trace_on) hle_trace_enter((c), (a)); } while (0)
+static int ram_span(uint32_t a, uint32_t n) { return hle_is_ram(a) && n <= 0x01000000u && ((a & 0x00FFFFFFu) + n) <= 0x01000000u; }
+static void h_memmove_fast(SH4Ctx *c) {
+    uint32_t d = c->r[4], s = c->r[5], n = c->r[6];
+    { static int off = -1; if (off < 0) off = getenv("R2_NO_LIBC") != NULL; if (off) { hle_orig(c, 0x8C0685B4); return; } }
+    HOOK_ENTER(c, 0x8C0685B4);
+    { uint32_t sp = c->r[15]; ST32(sp - 4, c->r[13]); ST32(sp - 8, c->r[12]); ST32(sp - 12, c->r[11]); }   /* the original pushes r13, r12, r11 (dead stack words): keep guest RAM byte-identical */
+    if (getenv("R2_LOGMM") && ((d & 0xFFFFFF) < 0xBE00 && (d & 0xFFFFFF) + n > 0xBA00 || (s & 0xFFFFFF) < 0xBE00 && (s & 0xFFFFFF) + n > 0xBA00)) fprintf(stderr, "[mm] d=%08x s=%08x n=%u sp=%08x pr=%08x\n", d, s, n, c->r[15], c->pr);
+    if (0) fprintf(stderr, "[mm] d=%08x s=%08x n=%u\n", d, s, n);
+    if (d == s) { c->t = 1; c->r[0] = d; return; }
+    if (!n) { c->r[2] = 0; c->t = 0; c->r[0] = d; return; }
+    if (!ram_span(d, n) || !ram_span(s, n)) { hle_orig(c, 0x8C0685B4); return; }
+    memmove(hle_ptr(d), hle_ptr(s), n);
+    /* leave the registers exactly as the original loops do (r1-r7 and T are scratch by the SH ABI, but this is cheap and keeps guest state byte-identical, which is how the hook is verified) */
+    uint32_t g = d | s | n; const uint8_t *last;
+    c->r[2] = d < s ? 0 : 1; c->t = 1;
+    if (d < s) {                                              /* forward copy, element size from the common alignment */
+        if (g & 1) { c->r[7] = d + n; c->r[6] = 0; last = hle_ptr(s + n - 1); c->r[3] = (uint32_t)(int32_t)(int8_t)*last; }
+        else if (g & 3) { c->r[1] = 3; c->r[5] = s + n; c->r[7] = d + n; c->r[6] = 0; int16_t v; memcpy(&v, hle_ptr(s + n - 2), 2); c->r[3] = (uint32_t)(int32_t)v; }
+        else { c->r[1] = 3; c->r[5] = s + n; c->r[7] = d + n; c->r[6] = 0; uint32_t v; memcpy(&v, hle_ptr(s + n - 4), 4); c->r[3] = v; }
+    } else {                                                  /* backward copy */
+        if (g & 1) { c->r[7] = s; c->r[5] = d; c->r[6] = 0; c->r[3] = (uint32_t)(int32_t)(int8_t)*hle_ptr(s); }
+        else if (g & 3) { c->r[1] = 3; c->r[5] = s; c->r[7] = d; c->r[6] = 0; int16_t v; memcpy(&v, hle_ptr(s), 2); c->r[3] = (uint32_t)(int32_t)v; }
+        else { c->r[1] = 3; c->r[7] = s; c->r[5] = d; c->r[6] = 0; uint32_t v; memcpy(&v, hle_ptr(s), 4); c->r[3] = v; }
+    }
+    c->r[0] = d;
+}
+#ifdef R2_CHK_LIBC     /* debug: run the original body (on a copy of the context) and the fast path from the same RAM state and compare registers + memory */
+static void h_memmove(SH4Ctx *c) {
+    uint32_t d = c->r[4], s = c->r[5], n = c->r[6];
+    if (!n || d == s || !ram_span(d, n) || !ram_span(s, n) || n > 0x40000) { h_memmove_fast(c); return; }
+    uint32_t lo = (d < s ? d : s) & 0xFFFFFF, span = (d < s ? s - d : d - s) + n; if (lo < 16) { h_memmove_fast(c); return; }
+    uint8_t *save = malloc(span + 16), *res = malloc(span + 16); memcpy(save, sh4_ram + lo - 16, span + 16);
+    uint8_t stk0[0x400], stk1[0x400]; uint32_t spo = c->r[15] & 0xFFFFFF; memcpy(stk0, sh4_ram + spo - 0x400, 0x400);
+    SH4Ctx c2 = *c; hle_orig(&c2, 0x8C0685B4); memcpy(res, sh4_ram + lo - 16, span + 16); memcpy(stk1, sh4_ram + spo - 0x400, 0x400);
+    memcpy(sh4_ram + lo - 16, save, span + 16); memcpy(sh4_ram + spo - 0x400, stk0, 0x400); h_memmove_fast(c);
+    if (memcmp(stk1, sh4_ram + spo - 0x400, 0x400)) { fprintf(stderr, "[chk] STACK MISMATCH sp=%08x d=%08x s=%08x n=%u:", c->r[15], d, s, n); for (int k = 0; k < 0x400; k++) if (stk1[k] != sh4_ram[spo - 0x400 + k]) fprintf(stderr, " -%x(orig %02x fast %02x pre %02x)", 0x400 - k, stk1[k], sh4_ram[spo - 0x400 + k], stk0[k]); fprintf(stderr, "\n"); }
+    if (memcmp(res, sh4_ram + lo - 16, span + 16)) fprintf(stderr, "[chk] memory MISMATCH d=%08x s=%08x n=%u sp=%08x\n", d, s, n, c->r[15]);
+    for (int i = 0; i < 16; i++) if (c->r[i] != c2.r[i]) fprintf(stderr, "[chk] r%d fast=%08x orig=%08x (d=%08x s=%08x n=%u)\n", i, c->r[i], c2.r[i], d, s, n);
+    if (c->t != c2.t) fprintf(stderr, "[chk] T fast=%u orig=%u (d=%08x s=%08x n=%u)\n", c->t, c2.t, d, s, n);
+    free(save); free(res);
+}
+#else
+#define h_memmove h_memmove_fast
+#endif
+static void h_memset(SH4Ctx *c) {
+    uint32_t d = c->r[4], n = c->r[6];
+    HOOK_ENTER(c, 0x8C0686B8);
+    if (n && !ram_span(d, n)) { hle_orig(c, 0x8C0686B8); return; }
+    if (n) memset(hle_ptr(d), (int)(c->r[5] & 0xFF), n);
+    c->r[7] = n; c->r[3] = 0; c->t = 1; c->r[0] = d;           /* final scratch state of the original byte loop */
+}
 static void h_nop(SH4Ctx *c) { R(0) = 0; }
 /* gdFs/GD-ROM driver bring-up (0x8C0CF158 gdFsInit, 0x8C0CD916 init-wait server). Replaced: the real driver state machine needs a faithful
  * GD-ROM BIOS (cmd 0x18/0x28/0x11 TOC/session reads); game file access is redirected at the FileMng/gdFs entry points by hle/io.c instead. */
@@ -665,6 +727,14 @@ void hle_boot_init(SH4Ctx *c, const uint8_t *image, uint32_t len, const char *dc
     /* SDK hooks */
     hle_hook(0x8C0DB7E0, h_pvr_write); hle_hook(0x8C0DB7EA, h_pvr_read);
     if (hle_verbose > 0) hle_hook(0x8C06874C, h_sprintf_spy);      /* only a logging spy: no hook (and no extra stub call per sprintf) when quiet */
+#ifndef R2_NO_LIBC_HOOKS
+#ifndef R2_NO_MEMMOVE_HOOK
+    hle_hook(0x8C0685B4, h_memmove);
+#endif
+#ifndef R2_NO_MEMSET_HOOK
+    hle_hook(0x8C0686B8, h_memset);
+#endif
+#endif
     hle_hook(0x8C0CF830, h_nop); hle_hook(0x8C0CF89C, h_nop); hle_hook(0x8C0CFAFA, h_nop); hle_hook(0x8C0CFD4E, h_nop);
     hle_hook(0x8C0CFFE0, h_nop); hle_hook(0x8C0D1096, h_nop);
     hle_mmio_map(0xE0000000u, 0xE3FFFFFFu, sq_rd, sq_wr); hle_set_pref_handler(sq_flush_default);

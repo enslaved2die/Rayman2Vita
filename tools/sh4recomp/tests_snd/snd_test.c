@@ -163,9 +163,28 @@ static void t6(void) {
     CHECK(s.active_channels == 2, "explicit key-off + key-on restarts ch0 (active %d, expect 2)", s.active_channels);
 }
 
+/* ---- T7: the sd command block (0x13200..0x1330F) is written word by word by the guest while the audio thread runs the ARM7: the AICA must not advance inside a block write ---- */
+#include <pthread.h>
+#include <unistd.h>
+static void *t7_mix(void *arg) { static int16_t b[512 * 2]; (void)arg; snd_mix(b, 512); return 0; }
+static void t7(void) {
+    printf("T7 command-block write is atomic w.r.t. the audio thread\n");
+    snd_init(44100); snd_mix(0, 0);                                  /* pull mode on */
+    uint64_t s0 = snd_test_samples(); pthread_t th;
+    snd_test_sh4_aram_wr(0x13200, 4, 0x00050011);                    /* first word of the block: the guest now owns the AICA */
+    pthread_create(&th, 0, t7_mix, 0); usleep(80 * 1000);
+    CHECK(snd_test_samples() == s0, "audio thread waits while the guest is inside the block (advanced %llu samples)", (unsigned long long)(snd_test_samples() - s0));
+    for (uint32_t o = 0x13204; o <= 0x1330C; o += 4) snd_test_sh4_aram_wr(o, 4, 0x42);
+    pthread_join(th, 0);
+    CHECK(snd_test_samples() - s0 >= 512, "audio thread proceeds after the last word (advanced %llu samples)", (unsigned long long)(snd_test_samples() - s0));
+    uint32_t w0; memcpy(&w0, snd_test_aram() + 0x13200, 4); CHECK(w0 == 0x00050011, "block content stored (%08x)", w0);
+    snd_test_sh4_aram_wr(0x13200, 4, 0x00050011);                    /* an interrupted block (never finished) must not deadlock: any store elsewhere releases the lock */
+    snd_test_sh4_aram_wr(0x14000, 4, 1); snd_mix(0, 0);
+    uint64_t s1 = snd_test_samples(); static int16_t b[256 * 2]; snd_mix(b, 256); CHECK(snd_test_samples() - s1 >= 256, "interrupted block releases the AICA lock");
+}
 int main(void) {
     snd_init(44100);
-    t1(); t2(); t3(); t4(); t6();
+    t1(); t2(); t3(); t4(); t6(); t7();
     printf("%s (%d failure%s)\n", fails ? "FAILED" : "ALL PASSED", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
 }

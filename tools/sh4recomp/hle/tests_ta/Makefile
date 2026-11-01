@@ -26,7 +26,7 @@ test-stamp: test_stamp.c
 GLC_FLAGS = -O1 -std=gnu11 -Wall -Wno-unused-function -I../.. -I../../gen_fix -I.. -Ifakegl -DCPA_PLATFORM_VITA -frounding-math
 test-glcount: test_glcount.c ../vita_gl_render.c ../ta.c ../texmap.c
 	cc $(GLC_FLAGS) -c ../texmap.c -Dhle_ta_background=tm_bg -Dhle_ta_pvr_snapshot=tm_snap -Dhle_ta_fog_table=tm_fog -o texmap_glc.o
-	cc $(GLC_FLAGS) test_glcount.c ../ta.c texmap_glc.o -lm -o test_glcount
+	cc $(GLC_FLAGS) test_glcount.c ../ta.c ../perf.c texmap_glc.o -lm -o test_glcount
 	./test_glcount $(FRAMEDIR)/frame.bin $(FRAMEDIR)/vram.bin $(FRAMEDIR)/pvrregs.bin $(FRAMEDIR)/pvrfog.bin 6
 clean:
 	rm -f test_ta test_ta_real test_tex test_glpath test_stamp test_glcount texmap_glc.o

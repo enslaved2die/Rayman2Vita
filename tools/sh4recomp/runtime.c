@@ -12,12 +12,21 @@ void (*sh4_fault_handler)(const char *, uint32_t, uint32_t) = default_fault;
 /* ---- slow-path I/O: unresolved imports are stubs that count and read 0 ---- */
 uint32_t (*sh4_io_read_hook)(uint32_t addr, int size) = 0;
 void (*sh4_io_write_hook)(uint32_t addr, int size, uint32_t v) = 0;
+/* Store queues (0xE0000000..0xE3FFFFFF): the lifted code pushes every TA vertex through 8 word stores into this window (~5000+ stores per frame). They used to go through the generic
+ * hook -> boot.c map-table scan -> sq_wr(memcpy); the buffer lives here now and the window is answered first. boot.c's sq_flush_default reads the same buffer (pref @Rn). */
+uint8_t sh4_sq_buf[64 + 8];                          /* +8: an unaligned access at offset 63 stays inside the array */
 uint32_t sh4_io_read(uint32_t a, int size) {
+    if (SH4_LIKELY((a & 0xFC000000u) == 0xE0000000u)) { uint32_t v = 0; memcpy(&v, sh4_sq_buf + (a & 0x3F), (size_t)size); return v; }
     sh4_stat_unmapped++;
     if (sh4_io_read_hook) return sh4_io_read_hook(a, size);
     sh4_fault_handler("unmapped read", a, size); return 0;
 }
 void sh4_io_write(uint32_t a, int size, uint32_t v) {
+    if (SH4_LIKELY((a & 0xFC000000u) == 0xE0000000u)) {
+        uint8_t *d = sh4_sq_buf + (a & 0x3F);
+        if (size == 4) memcpy(d, &v, 4); else if (size == 2) memcpy(d, &v, 2); else *d = (uint8_t)v;
+        return;
+    }
     sh4_stat_unmapped++;
     if (sh4_io_write_hook) { sh4_io_write_hook(a, size, v); return; }
     sh4_fault_handler("unmapped write", a, v);

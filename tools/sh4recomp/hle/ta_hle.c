@@ -10,6 +10,7 @@
  */
 #include "hle_priv.h"
 #include "ta.h"
+#include "perf.h"
 #include "texmap.h"
 #if defined(__vita__)
 #include "vita_gl_render.h"
@@ -72,10 +73,19 @@ static void note_list_ends(void) {
 }
 static void sq_sink(uint32_t phys, const uint8_t d[32]) {
     if (hle_verbose >= 2 && phys >= 0x10000000u && phys < 0x10800000u) { uint32_t w0; memcpy(&w0, d, 4); hle_log("[ta] sq flush phys=%08x w0=%08x", phys, w0); }
+#if R2_PERF
+    if ((g_perf.ta_sq_n++ & 31) == 0) { uint64_t t = r2_now_us(); ta_ext_write32(&tactx, phys, d); note_list_ends(); g_perf.t_ta_sq_probe += r2_now_us() - t; g_perf.ta_sq_probes++; return; }
+#endif
     ta_ext_write32(&tactx, phys, d); note_list_ends(); }
 static void dma_sink(uint32_t dst, const uint8_t *src, uint32_t len) {
     if (hle_verbose >= 2) hle_log("[ta] dma dst=%08x len=%u first=%08x", dst, len, len >= 4 ? *(const uint32_t *)src : 0);
-    if (dst >= 0x10000000u && dst < 0x10800000u) { ta_write(&tactx, src, len); note_list_ends(); return; }
+    if (dst >= 0x10000000u && dst < 0x10800000u) {
+#if R2_PERF
+        uint64_t t = r2_now_us(); ta_write(&tactx, src, len); note_list_ends(); g_perf.t_ta_dma += r2_now_us() - t; return;
+#else
+        ta_write(&tactx, src, len); note_list_ends(); return;
+#endif
+    }
     for (uint32_t o = 0; o + 32 <= len; o += 32) ta_ext_write32(&tactx, dst + o, src + o);
 }
 

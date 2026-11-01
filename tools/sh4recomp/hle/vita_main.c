@@ -22,6 +22,9 @@
 #include "vita_gl_render.h"
 #include "texmap.h"
 #include "snd.h"
+#include "perf.h"
+#include <psp2/power.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/audioout.h>
 #include <psp2/io/fcntl.h>
 
@@ -95,6 +98,7 @@ static void vita_input_callback(SH4Ctx *c) {
     vita_update_input();
 }
 
+static void perf_sink(const char *line) { vita_log("%s", line); }
 static uint64_t acc_render, acc_swap, acc_ta, acc_ta_n;
 #ifdef R2_VITA_PROFILE
 /* make -f Makefile.vita PROFILE=1: hot-spot split via the linker (-Wl,--wrap): time spent in the GL submit and in the swap (vsync wait) per frame. */
@@ -117,7 +121,7 @@ static void vita_frame_end(SH4Ctx *c) {
     acc_build += now - t_begin; if (t_last_end) acc_period += now - t_last_end; t_last_end = now;
     if (++acc_n == 300) {
         struct mallinfo mi = mallinfo();
-        vita_log("[vita] frames %lu: avg period %.2f ms (%.1f fps), begin->end %.2f ms, gl_render_frame %.2f ms, gl_swap %.2f ms, TA SQ parse %.2f ms (%llu writes/frame, timer overhead included), heap in use %d KB (arena %d KB), io lookups %lu (%lu misses, answered from the in-memory index)",
+        vita_log("[vita] frames %lu: avg period %.2f ms (%.1f fps), begin->end %.2f ms (kmBeginScene .. kmRender return = scene build + TA parse + GL render + swap; the game logic between frames is period - this; see the [perf] block for the split), [PROFILE=1 builds only:] gl_render_frame %.2f ms, gl_swap %.2f ms, TA SQ parse %.2f ms (%llu writes/frame), heap in use %d KB (arena %d KB), io lookups %lu (%lu misses, answered from the in-memory index)",
                 hle_frame_count, acc_period / 299000.0, 299000000.0 / (acc_period ? acc_period : 1), acc_build / 300000.0,
                 acc_render / 300000.0, acc_swap / 300000.0, acc_ta / 300000.0, (unsigned long long)(acc_ta_n / 300), mi.uordblks >> 10, mi.arena >> 10, hle_io_lookups, hle_io_misses);
         acc_n = 0; acc_build = acc_period = acc_render = acc_swap = acc_ta = acc_ta_n = 0;
@@ -147,8 +151,34 @@ static int dir_exists(const char *path) {
 #endif
 
 static int audio_thread(SceSize args, void *argp);
+
+/* Clocks: raise (never lower) the CPU / bus / GPU / GPU-crossbar clocks to the highest values an unprivileged app may request (444 / 222 / 222 / 166 MHz). "Never lower" matters: users with a
+ * clock plugin at 500 MHz keep it. -DR2_SET_CLOCKS=0 skips this. */
+#ifndef R2_SET_CLOCKS
+#define R2_SET_CLOCKS 1
+#endif
+static void vita_set_clocks(void) {
+#if R2_SET_CLOCKS
+    int a0 = scePowerGetArmClockFrequency(), b0 = scePowerGetBusClockFrequency(), g0 = scePowerGetGpuClockFrequency(), x0 = scePowerGetGpuXbarClockFrequency();
+    if (a0 < 444) scePowerSetArmClockFrequency(444);
+    if (b0 < 222) scePowerSetBusClockFrequency(222);
+    if (g0 < 222) scePowerSetGpuClockFrequency(222);
+    if (x0 < 166) scePowerSetGpuXbarClockFrequency(166);
+    vita_log("[vita] clocks before: arm %d bus %d gpu %d xbar %d MHz; after: arm %d bus %d gpu %d xbar %d MHz", a0, b0, g0, x0,
+             scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(), scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency());
+#endif
+}
+/* Core placement (Vita apps get 3 user cores): game thread, audio thread and (vitaGL / GXM callbacks, system) kept apart. Override with -DR2_GAME_CPU=0x...; 0 = scheduler's choice. */
+#ifndef R2_GAME_CPU
+#define R2_GAME_CPU SCE_KERNEL_CPU_MASK_USER_1
+#endif
+#ifndef R2_AUDIO_CPU
+#define R2_AUDIO_CPU SCE_KERNEL_CPU_MASK_USER_2
+#endif
 static int game_main(void) {
     hle_verbose = R2_VITA_VERBOSE;
+    r2_perf_sink = perf_sink;
+    vita_set_clocks();
 
     /* 1. Set controller sampling mode */
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
@@ -213,7 +243,7 @@ static int game_main(void) {
     }
 
     snd_init(48000);   /* the MAIN port only accepts 48 kHz (Vita3K rejects 44.1 kHz with INVALID_SAMPLE_FREQ); snd.c resamples */
-    { SceUID at = sceKernelCreateThread("rayman2_audio", audio_thread, 0x10000100 - 20, 64 * 1024, 0, 0, NULL);
+    { SceUID at = sceKernelCreateThread("rayman2_audio", audio_thread, 0x10000100 - 20, 64 * 1024, 0, R2_AUDIO_CPU, NULL);
       if (at >= 0) sceKernelStartThread(at, 0, NULL); else vita_log("[vita] audio thread create failed 0x%08x", at); }
 
     /* 5. Hook input update into VBlank and frame boundary callbacks */
@@ -237,11 +267,12 @@ static int audio_thread(SceSize args, void *argp) {
     int port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, 1024, 48000, SCE_AUDIO_OUT_MODE_STEREO);
     if (port < 0) { vita_log("[vita] audio: sceAudioOutOpenPort failed 0x%08x", port); return 0; }
     static int16_t buf[1024 * 2];
-    unsigned long blocks = 0; int peak = 0, gpeak = 0;
+    unsigned long blocks = 0; int peak = 0, gpeak = 0; uint32_t aud_win_max = 0;
     uint64_t last = sceKernelGetProcessTimeWide();
     vita_log("[vita] audio thread running (port %d)", port);
     for (;;) {
-        snd_mix(buf, 1024);
+        { uint64_t tm0 = sceKernelGetProcessTimeWide(); snd_mix(buf, 1024); uint32_t d = (uint32_t)(sceKernelGetProcessTimeWide() - tm0);
+          g_perf.aud_us_tot += d; g_perf.aud_blocks++; if (d > aud_win_max) aud_win_max = d; }
         for (int i = 0; i < 2048; i++) { int v = buf[i] < 0 ? -buf[i] : buf[i]; if (v > peak) peak = v; }
         sceAudioOutOutput(port, buf);
         blocks++;
@@ -249,8 +280,11 @@ static int audio_thread(SceSize args, void *argp) {
         if (now - last >= 5000000) {
             SndStats st; snd_get_stats(&st);
             if (peak > gpeak) gpeak = peak;
-            vita_log("[vita] audio: frame %lu, %lu blocks, peak %d (global %d), arm_running %d, ringcmds %llu, keyon %llu, active ch %d, undef %u, mix avg %u max %u us/block (budget 21333)",
-                     hle_frame_count, blocks, peak, gpeak, st.arm_running, (unsigned long long)st.ringcmds, (unsigned long long)st.keyon, st.active_channels, st.undef_instr, st.mix_us_avg, st.mix_us_max);
+            g_perf.aud_arm_us = st.arm_us_blk; g_perf.aud_vox_us = st.vox_us_blk; g_perf.aud_avg_us = st.mix_us_avg; g_perf.aud_max_us = aud_win_max; aud_win_max = 0;
+            vita_log("[vita] audio: frame %lu, %lu blocks, peak %d (global %d), arm_running %d, ringcmds %llu, keyon %llu, active ch %d, undef %u, mix avg %u max %u us/block (budget 21333), est. split per block: arm7 %u us, voices %u us, rest(limit+resample+lock) %u us (probes %u), stream open/stop/pause/resume %u/%u/%u/%u, holes %u (longest %u ms), keyon_ignored %u",
+                     hle_frame_count, blocks, peak, gpeak, st.arm_running, (unsigned long long)st.ringcmds, (unsigned long long)st.keyon, st.active_channels, st.undef_instr, st.mix_us_avg, st.mix_us_max, st.arm_us_blk, st.vox_us_blk, st.mix_us_avg > st.arm_us_blk + st.vox_us_blk ? st.mix_us_avg - st.arm_us_blk - st.vox_us_blk : 0, st.tp_n,
+                     st.stream_open, st.stream_stop, st.stream_pause, st.stream_resume, st.stream_holes, st.stream_hole_ms_max, st.keyon_ignored);
+            { static uint32_t last_note_seq; if (st.stream_note_seq != last_note_seq) { last_note_seq = st.stream_note_seq; vita_log("[vita] audio stream hole: %s", st.stream_note); } }
             peak = 0; last = now;
         }
     }
@@ -270,7 +304,7 @@ int main(int argc, char **argv) {
 #ifdef R2_NO_GAME_THREAD   /* diagnostic: run on the main thread */
     return game_thread(0, NULL);
 #endif
-    SceUID th = sceKernelCreateThread("rayman2_game", game_thread, 0x10000100, GAME_STACK_SIZE, 0, 0, NULL);
+    SceUID th = sceKernelCreateThread("rayman2_game", game_thread, 0x10000100, GAME_STACK_SIZE, 0, R2_GAME_CPU, NULL);
     if (th < 0) {
         vita_log("[vita] sceKernelCreateThread(%d KB stack) failed: 0x%08x", GAME_STACK_SIZE >> 10, th);
         return game_main();
