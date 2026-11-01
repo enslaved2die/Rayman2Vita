@@ -58,7 +58,15 @@ typedef struct {
     uint32_t peak;                 /* peak |sample| since last call */
     uint32_t undef_instr;          /* undefined ARM instructions executed (should stay 0) */
     uint64_t mix_calls;            /* snd_mix() calls since the previous snd_get_stats() */
+    uint32_t arm_us_blk, vox_us_blk; /* estimated us per 1024-frame block spent in timers+ARM7 interpreter / in the 64-voice generator (probe: every 64th sample timed; the rest, mix_us_avg - both, is limiter, staging, resampler, locks) */
+    uint32_t tp_n;                   /* number of probed samples behind those two estimates */
     uint32_t mix_us_avg, mix_us_max; /* wall time of one snd_mix() call (microseconds) since the previous snd_get_stats(): audio-thread cost */
+    /* music watchdog (guest stream engine vs AICA ring voices), cumulative: see stream_watchdog() in snd.c */
+    uint32_t stream_open, stream_stop, stream_pause, stream_resume;   /* guest calls of the stream engine 0x8C06262C / 0x8C0628A8 / 0x8C062960 / 0x8C0629B0 */
+    uint32_t stream_holes, stream_hole_ms_max;   /* >= 0.5 s intervals where the guest streams (state 3, not paused, no fade) but a ring voice is not playing; longest, ms */
+    uint32_t stream_note_seq;                    /* incremented when stream_note holds a new hole description (print it once per change) */
+    uint32_t keyon_ignored;                      /* KYONB-latch decisions: key-ons of finished, still latched channels that were (correctly) not restarted */
+    char     stream_note[200];
 } SndStats;
 void snd_get_stats(SndStats *s);
 
@@ -69,6 +77,11 @@ void      snd_test_advance(int frames, int16_t *out);   /* advance + mix with NU
 void      snd_test_regwrite(uint32_t byte_off, uint32_t v);   /* guest-style 32-bit register write (triggers key-on etc.) */
 void      snd_test_set_nostrm(int v);          /* disable the native music stream source (A/B) */
 void      snd_test_strm_stats(uint64_t *maps, uint64_t *stream_samples, uint64_t *ring_samples, uint64_t *silent_samples);
+void      snd_test_sh4_aram_wr(uint32_t a, int sz, uint32_t v);   /* replay: a guest ARAM store / register store / G2 DMA, exactly as the SH-4 side issues it */
+void      snd_test_sh4_reg_wr(uint32_t a, int sz, uint32_t v);
+void      snd_test_dma_to_aram(uint32_t a, const void *p, uint32_t len);
+uint64_t  snd_test_samples(void);
+void      snd_test_set_pull(int on);
 void      snd_test_arm_reset(int run);         /* 1 = release ARM (as the guest clearing ARMRST), 0 = hold */
 
 #ifdef __cplusplus

@@ -24,7 +24,20 @@ HLE_DIR         := $(RECOMP_DIR)/hle
 # -ffunction-sections/--gc-sections drops unused generated functions; -fno-strict-aliasing is needed by the guest-memory casts.
 # OPT: -O3 + -fno-math-errno (sqrtf -> single vsqrt.f32 instead of the errno-setting newlib wrapper). Deliberately NOT -funsafe-math-optimizations/-ffast-math: they allow
 # reassociation, reciprocal-division and NEON float vectorisation (NEON ignores FPSCR RMode and always flushes), which would change the bit-exact SH-4 FPU semantics.
-OPT             ?= -O3 -fno-math-errno -fomit-frame-pointer
+# OPT_HOT: flags for everything that is not cold. OPT_COLD=cold (default) marks guest functions that never ran in the profiled host scenes (re_analysis/dc/hot_funcs.txt, ~60% of the 5705
+# lifted functions) with GCC's cold attribute (optimised for size, placed in .text.unlikely) via hle/coldmark.py; OPT_COLD=none compiles everything with OPT_HOT; OPT_COLD=<attribute text>
+# passes that attribute instead. Whole-program variants: OPT_HOT="-Os ..." / "-O2 ...". Text sizes of the variants: re_analysis/dc/notes_perf_cpu2.md.
+OPT_HOT         ?= -O3 -fno-math-errno -fomit-frame-pointer
+OPT_COLD        ?= cold
+OPT             ?= $(OPT_HOT)
+HOT_LIST        ?= re_analysis/dc/hot_funcs.txt
+ifeq ($(OPT_COLD),none)
+COLD_FILTER     := cat
+else ifeq ($(OPT_COLD),cold)
+COLD_FILTER     := python3 $(HLE_DIR)/coldmark.py $(HOT_LIST)
+else
+COLD_FILTER     := python3 $(HLE_DIR)/coldmark.py $(HOT_LIST) '$(OPT_COLD)'
+endif
 CFLAGS          := $(OPT) -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
                    -fno-strict-aliasing -ffunction-sections -fdata-sections \
                    $(EXTRA_CFLAGS) \
@@ -55,6 +68,7 @@ LIBS            := -lvitaGL \
                    -lSceKernelThreadMgr_stub \
                    -lSceIofilemgr_stub \
                    -lSceAudio_stub \
+                   -lScePower_stub \
                    -lmathneon \
                    -lstdc++ \
                    -lm
@@ -71,6 +85,7 @@ HLE_SRCS        := $(HLE_DIR)/boot.c \
                    $(HLE_DIR)/dbg.c \
                    $(HLE_DIR)/io.c \
                    $(HLE_DIR)/pad.c \
+                   $(HLE_DIR)/perf.c \
                    $(HLE_DIR)/ta.c \
                    $(HLE_DIR)/ta_hle.c \
                    $(SND_SRC) \
@@ -115,8 +130,8 @@ $(BUILD_DIR)/rename.sed: $(HLE_DIR)/mkstubs.py $(HGEN)/recomp_decls.h | $(BUILD_
 $(BUILD_DIR)/hook_stubs.c: $(BUILD_DIR)/rename.sed
 	@true
 
-$(BUILD_DIR)/recomp_%.o: $(HGEN)/recomp_%.c $(RECOMP_DIR)/runtime.h $(HGEN)/recomp_decls.h $(HLE_DIR)/enter.h $(BUILD_DIR)/rename.sed | $(BUILD_DIR)
-	sed -E -f $(BUILD_DIR)/rename.sed $< | $(CC) $(CFLAGS) -include $(HLE_DIR)/enter.h -x c - -c -o $@
+$(BUILD_DIR)/recomp_%.o: $(HGEN)/recomp_%.c $(RECOMP_DIR)/runtime.h $(HGEN)/recomp_decls.h $(HLE_DIR)/enter.h $(BUILD_DIR)/rename.sed $(HOT_LIST) $(HLE_DIR)/coldmark.py | $(BUILD_DIR)
+	sed -E -f $(BUILD_DIR)/rename.sed $< | $(COLD_FILTER) | $(CC) $(CFLAGS) -include $(HLE_DIR)/enter.h -x c - -c -o $@
 
 $(BUILD_DIR)/recomp_functab.o: $(HGEN)/recomp_functab.c $(RECOMP_DIR)/runtime.h $(HGEN)/recomp_decls.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@

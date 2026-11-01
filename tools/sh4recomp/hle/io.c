@@ -352,6 +352,7 @@ void hle_io_h_open(SH4Ctx *c) {
     put32(slot + O_CACHEBUF, (slot & 0xFFFFFFE0u) + 0x20);
     if (!gd) hle_log("[io] open: could not create gd handle for %s (real code logs FileMng.c error 9 here)", host);
     put32(slot + O_POS, 0);
+    { static int ev = -1; if (ev < 0) { const char *e = getenv("R2_SND_EV"); ev = e && *e && *e != '0'; } if (ev) fprintf(stderr, "[ev] IO open %s -> %s size=%u\n", name, host, size); }   /* R2_SND_EV: file names next to the stream/sd events */
     if (hle_verbose) hle_log("[io] open %s%s%s -> %s (%u bytes) slot=0x%08x gd=0x%08x", dir ? dir : "", dir ? " + " : "", name, host, size, slot, gd);
     R(0) = 0;
 }

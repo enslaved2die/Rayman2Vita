@@ -22,6 +22,7 @@
 #include "hle.h"
 #include "ta.h"
 #include "texmap.h"
+#include "perf.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -30,9 +31,28 @@
 #include <stdarg.h>
 #include <math.h>
 
+/* R2_INTERNAL_SCALE (percent, build constant): render at a lower internal resolution; the display unit upscales the framebuffer to the 960x544 screen.  Only the sizes the Vita
+ * display engine scales in hardware are valid: 100 (960x544), 75 (720x408), 67 (640x368), 50 (480x272).  Cuts fill-rate (translucent overdraw, fog pass) at the cost of sharpness;
+ * everything below is derived from SCREEN_W / SCREEN_H.  Needs Vita measurement (perf.log "overdraw" and "swap" lines show whether the GPU is the limit). */
+#ifndef R2_INTERNAL_SCALE
+#define R2_INTERNAL_SCALE 100
+#endif
+#if R2_INTERNAL_SCALE == 100
 #define SCREEN_W 960
 #define SCREEN_H 544
-#define VIEW_W 725                      /* 544 * 4 / 3 */
+#elif R2_INTERNAL_SCALE == 75
+#define SCREEN_W 720
+#define SCREEN_H 408
+#elif R2_INTERNAL_SCALE == 67
+#define SCREEN_W 640
+#define SCREEN_H 368
+#elif R2_INTERNAL_SCALE == 50
+#define SCREEN_W 480
+#define SCREEN_H 272
+#else
+#error "R2_INTERNAL_SCALE must be 100, 75, 67 or 50"
+#endif
+#define VIEW_W (SCREEN_H * 4 / 3)       /* 4:3 pillarbox width (725 at 544) */
 #define VIEW_X ((SCREEN_W - VIEW_W) / 2)
 /* 16:9: when the game runs its own 16:9 mode (hle_ta_wide_active(); forced on by default in ta_hle.c, R2_WIDE / hle_ta_wide_set() toggle) the 640x480 screen-space output is
  * horizontally squeezed by 1/k (k = 4/3) by the engine itself (wider FOV, widened culling, squeezed HUD), so the whole 640x480 vertex space is mapped onto the full
@@ -139,6 +159,9 @@ static int decode_and_upload_texture(TexCacheEntry *e, uint32_t tcw, uint32_t ts
     int fmt = (int)((tcw >> 27) & 7);
     if (!(fmt == 5 || fmt == 6)) env.pal = NULL;
 
+#if R2_PERF
+    uint64_t t_dec0 = r2_now_us();
+#endif
     ta_tex_decode(vram, 8u << 20, tcw, tsp, &env, 0, (int)((tsp >> 19) & 1), s_decode_buf);
 
     e->dec_frame = s_frame_no;
@@ -150,6 +173,9 @@ static int decode_and_upload_texture(TexCacheEntry *e, uint32_t tcw, uint32_t ts
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, s_decode_buf);
     vita_gl_perf.tex_uploads++;
     if (ta_tex_levels(tcw, tsp) > 1) glGenerateMipmap(GL_TEXTURE_2D);   /* the PVR mip levels are box-filtered versions of level 0 in the source files */
+#if R2_PERF
+    g_perf.t_texdec += r2_now_us() - t_dec0; g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)w * h * 4;
+#endif
     e->minf = e->magf = e->wrap_s = e->wrap_t = 0;    /* (re)apply filter / wrap for the TSP the caller draws with */
     return 1;
 }
@@ -412,7 +438,35 @@ static void draw_shadow_volumes(const TaFrame *frame, float cut, const TaClipVer
     glColorPointer(4, GL_FLOAT, sizeof(TaClipVertex), &scene_cv[0].r);
 }
 
+#if R2_PERF
+/* sum of triangle areas of a GL_TRIANGLES vertex run, in units of the 640x480 screen (vertices are already in 640x480 pixel space) */
+static float perf_area(const TaGlVertex *v, uint32_t n)
+{
+    float a = 0.0f;
+    for (uint32_t i = 0; i + 2 < n; i += 3) {
+        float ar = (v[i + 1].x - v[i].x) * (v[i + 2].y - v[i].y) - (v[i + 2].x - v[i].x) * (v[i + 1].y - v[i].y);
+        a += ar < 0 ? -ar : ar;
+    }
+    return a * (0.5f / (640.0f * 480.0f));
+}
+static uint64_t s_t_swap_end; static int s_t_swap_end_prev_valid;
+#endif
+static void vita_gl_render_frame_impl(const TaFrame *frame_in);
 void vita_gl_render_frame(const TaFrame *frame_in)
+{
+#if R2_PERF
+    uint64_t t0 = r2_now_us();
+    if (s_t_swap_end) g_perf.t_guest += t0 - s_t_swap_end;
+    uint32_t d0 = vita_gl_perf.draws, f0 = vita_gl_perf.fog_draws, sc0 = vita_gl_perf.state_calls, ss0 = vita_gl_perf.state_skipped, tb0 = vita_gl_perf.tex_binds, ba0 = vita_gl_perf.batches; uint64_t v0 = vita_gl_perf.verts;
+#endif
+    vita_gl_render_frame_impl(frame_in);
+#if R2_PERF
+    g_perf.t_render += r2_now_us() - t0;
+    g_perf.draws += vita_gl_perf.draws - d0; g_perf.fog_draws += vita_gl_perf.fog_draws - f0; g_perf.state_calls += vita_gl_perf.state_calls - sc0; g_perf.state_skipped += vita_gl_perf.state_skipped - ss0;
+    g_perf.tex_binds += vita_gl_perf.tex_binds - tb0; g_perf.batches += vita_gl_perf.batches - ba0; g_perf.verts += vita_gl_perf.verts - v0;
+#endif
+}
+static void vita_gl_render_frame_impl(const TaFrame *frame_in)
 {
     const TaFrame *frame = frame_in;
     if (!frame) return;
@@ -434,6 +488,9 @@ void vita_gl_render_frame(const TaFrame *frame_in)
     if (s_frame_no <= 12) gl_logf("[vita] render_frame call #%d strips=%u verts=%u hle_frame_count=%lu", s_frame_no, (unsigned)frame->nstrips, (unsigned)frame->nverts, (unsigned long)hle_frame_count);
     static TaGl gl;                                   /* persistent: vertex / batch arrays keep their capacity from frame to frame */
     TaBuildOpts opts = { 1, 1, -2.0f, -2.0f, 642.0f, 482.0f, 0 };   /* software cull + clip to the screen (+2 px) */
+#if R2_PERF
+    uint64_t t_b0 = r2_now_us();
+#endif
     if (ta_build_gl_reuse(frame, &gl, &opts) != 0) return;
     static int s_dbg_once; if (!s_dbg_once) { s_dbg_once = 1; gl_logf("[vita] vita_gl_render build marker: " __DATE__ " " __TIME__ " sort+nozwrite-trans v5 perf-gl"); }
     if (gl.nverts == 0 || gl.nbatches == 0) return;
@@ -446,6 +503,9 @@ void vita_gl_render_frame(const TaFrame *frame_in)
     }
     float cut = ta_gl_depth_cut(&gl);
     ta_gl_make_clip(gl.verts, gl.nverts, cut, s_cv);
+#if R2_PERF
+    g_perf.t_build += r2_now_us() - t_b0; g_perf.strips += frame->nstrips; g_perf.tris += gl.nverts / 3;
+#endif
     static uint32_t fog_table[128]; static uint32_t s_fog_epoch_seen;
     if (hle_pvr_fog_epoch() != s_fog_epoch_seen || s_frame_no == 1) { hle_ta_fog_table(fog_table); s_fog_epoch_seen = hle_pvr_fog_epoch(); }   /* fog table only re-read when a fog register changed */
     const uint32_t fog_den = PVR_REG(0x005F80B8u), fog_ram = PVR_REG(0x005F80B0u);
@@ -602,6 +662,9 @@ void vita_gl_render_frame(const TaFrame *frame_in)
             }
             glDrawArrays(GL_TRIANGLES, batch->first, batch->count);
             vita_gl_perf.draws++; vita_gl_perf.verts += batch->count;
+#if R2_PERF
+            g_perf.area[list_id == TA_L_TRANS ? 2 : list_id == TA_L_PUNCH ? 1 : 0] += perf_area(&gl.verts[batch->first], batch->count);
+#endif
             if (pre_fogged) gc_color_ptr(&s_cv[0].r);
             /* Table fog (TSP fog control 0) on opaque polygons: a second untextured pass in FOG_COL_RAM with the per-vertex fog alpha, blended over the
              * lit/textured result and depth-tested GEQUAL (same vertices -> same depth, so exactly the visible pixels).  Translucent/punch-through are not fogged [ASSUMED approximation]. */
@@ -622,6 +685,9 @@ void vita_gl_render_frame(const TaFrame *frame_in)
                     gc_color_ptr(&s_fv[0].r);
                     glDrawArrays(GL_TRIANGLES, batch->first, batch->count);
                     vita_gl_perf.fog_draws++; vita_gl_perf.verts += batch->count;
+#if R2_PERF
+                    g_perf.area[3] += perf_area(&gl.verts[batch->first], batch->count);
+#endif
                     gc_color_ptr(&s_cv[0].r);
                     gc_blend(0);
                 }
@@ -648,7 +714,20 @@ void vita_gl_render_frame(const TaFrame *frame_in)
 
 void vita_gl_swap(void)
 {
+#if R2_PERF
+    uint64_t t0 = r2_now_us();
     vglSwapBuffers(GL_FALSE);
+    uint64_t t1 = r2_now_us();
+    g_perf.t_swap += t1 - t0;
+    if (s_t_swap_end_prev_valid) {
+        uint32_t per = (uint32_t)(t1 - s_t_swap_end); g_perf.t_period += per; if (per > g_perf.max_period_us) g_perf.max_period_us = per;
+        if (per > 16700) g_perf.over17++; if (per > 33400) g_perf.over34++; if (per > 50000) g_perf.over50++;
+    }
+    s_t_swap_end_prev_valid = 1; s_t_swap_end = t1; g_perf.frames++;
+    if (g_perf.frames >= R2_PERF_FRAMES) r2_perf_report(hle_frame_count);
+#else
+    vglSwapBuffers(GL_FALSE);
+#endif
     if (s_shot_after_swap) { s_shot_after_swap = 0; dump_shot_ppm(); }
 }
 

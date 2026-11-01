@@ -1,0 +1,985 @@
+/* snd.c - Dreamcast AICA sound system: ARM7 interpreter + AICA register file/sample generator. See snd.h and re_analysis/dc/notes_sound.md.
+ *
+ * The recompiled sd library talks to wave RAM / AICA registers through MMIO, exactly as on hardware. Guest hooks: only the stream catch-up tick (see "guest stream catch-up ticks") and two log-only taps.
+ * ARM-side behaviour that is NOT modelled: DSP (reverb/effects), LFO, filter, key-rate-scaling, MIDI in/out, SCSP "stereo ADPCM", RTC,
+ * AICA->SH4 interrupts (MCIPD), exact bus-wait timing of the ARM7 (it runs at a fixed ARM_CYCLES_PER_INSN cycles/instruction).
+ */
+#include "hle.h"
+/* sd library entry points called by the game's ACP sound engine (documentation + makes them `run_game --spy 8c0xxxxx`-able, because
+ * hle/mkstubs.py scans this file for literals): sdLibInit 0x8C0F0A48, sdDrvInit 0x8C0F0948, 0x8C0EFB60 0x8C0EFBBC 0x8C0EFC44 0x8C0EFCB0 0x8C0EFF7C
+ * 0x8C0F0044 0x8C0F0428 0x8C0F0478 0x8C0F04FC 0x8C0F05F4 0x8C0F066C 0x8C0F06BC 0x8C0F0750 0x8C0F07D0 0x8C0F0878 0x8C0F08E4, game sound init
+ * 0x8C098776. None of them is hooked: they run as recompiled guest code against the emulated AICA below. */
+#include "snd.h"
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+#include <time.h>
+
+#if defined(__vita__)
+/* vita-elf-create needs 3060 bytes of free space after the text segment before the 64 KiB-aligned data segment; a text segment ending a few hundred
+ * bytes short of the boundary aborts the link ("Cannot allocate 3060 bytes for SCE data at end of segment 0; segment 1 overlaps"). Hit by an unlucky
+ * code size in build_vita_v3; this 4 KiB of rodata moves the end of the segment. Remove only if the layout is otherwise guaranteed. */
+__attribute__((used)) static const char g_vita_layout_pad[4096] = "layout pad";
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
+typedef SceUID snd_lock_t;
+static snd_lock_t g_lk = -1;
+static void lk_init(void) { if (g_lk < 0) g_lk = sceKernelCreateMutex("snd", 0, 0, NULL); }
+static inline void lk_lock(void) { sceKernelLockMutex(g_lk, 1, NULL); }
+static inline void lk_unlock(void) { sceKernelUnlockMutex(g_lk, 1); }
+#else
+#include <pthread.h>
+static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
+static void lk_init(void) {}
+static inline void lk_lock(void) { pthread_mutex_lock(&g_lk); }
+static inline void lk_unlock(void) { pthread_mutex_unlock(&g_lk); }
+#endif
+
+#define TRACE (g_trace)
+static int g_trace;
+static int g_evlog;                                     /* R2_SND_EV=1: per-voice key-on/off/end/loop event log */
+static uint64_t st_samples_fwd(void);
+#define EV(...) do { if (g_evlog) { fprintf(stderr, "[ev] t=%.4f ", (double)st_samples_fwd() / 44100.0); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+static int g_vdump_s;                                   /* R2_SND_VDUMP=<s>: dump every active voice every <s> seconds of AICA time (stuck/orphan voice diagnosis) */
+static int g_ringlog;                                   /* R2_SND_RING=1: log music stream ring refills vs. voice wraps */
+static uint64_t g_rw_bytes[2], g_rw_n[2], g_rw_wraps[2]; static uint32_t g_rw_lo[2], g_rw_hi[2];
+static uint64_t st_samples_fwd(void);
+
+/* ============================================================================================================================ state */
+#define ARAM_SIZE 0x200000u
+#define AREG_WORDS 0x2000u            /* 0x0000..0x7FFF bytes */
+#define ARM_CYCLES_PER_SAMPLE 512     /* 22.5792 MHz / 44100 */
+#define ARM_CYCLES_PER_INSN 2
+
+static uint8_t  aram[ARAM_SIZE];
+static uint32_t aregs[AREG_WORDS];
+
+/* ---------------------------------------------------------------------------------------------------------------- AICA channels */
+typedef struct {
+    int      active;
+    int      eg;                 /* 0 attack, 1 decay1, 2 decay2, 3 release */
+    float    att;                /* 0 (loud) .. 1023 (silent), 10-bit attenuation */
+    uint32_t pos, frac;          /* sample index, 16-bit fraction */
+    int32_t  s0, s1;             /* samples at pos and pos+1 (interpolation) */
+    int32_t  ad_pred, ad_step;   /* ADPCM decoder state (state valid for decoding index ad_pos) */
+    uint32_t ad_pos;
+    int32_t  lsa_pred, lsa_step; int lsa_saved;
+    int      lp_flag;
+    uint64_t t0;                 /* st_samples at key-on (voice dump) */
+} Chan;
+static Chan chn[64];
+static uint8_t g_keyed[64];       /* latched KYONB per channel (see keyonex) */
+static uint8_t g_dirty[64];       /* channel registers written since the last key-on (diagnostic) */
+static uint64_t st_restart_stale;
+
+/* ---------------------------------------------------------------------------------------------------------------- ARM7 */
+typedef struct {
+    uint32_t r[16], cpsr, spsr[6], b13[6], b14[6], fiq8[5], usr8[5];
+} Arm;
+static Arm A;
+static int      arm_run_flag;
+static int64_t  arm_budget;
+static int      idle_ok;
+static uint64_t st_arm_instr, st_idle, st_samples, st_keyon, st_ringcmds; static uint32_t st_undef, st_peak;
+
+/* interrupts / timers */
+static uint32_t scipd, fiq_pend, intreq_level;
+static uint32_t tim_cnt[3], tim_pre[3], tim_acc[3];
+
+static float g_master = 1.0f;
+static int   g_out_rate = 44100;
+static int   g_inited;
+
+/* ============================================================================================================================ tables */
+static float g_att_gain[1024];     /* attenuation (0.09375 dB steps) -> linear */
+static float g_tl_gain[256];       /* TL: 0.375 dB steps */
+static float g_dl_gain[16];        /* DISDL */
+static float g_pan_gain[16];       /* DIPAN low 4 bits: 3 dB steps, 15 = mute */
+static float g_att_step[32], g_dec_step[32];   /* per-sample attenuation delta by rate */
+static int   g_tables_done;
+
+static void build_tables(void) {
+    if (g_tables_done) return;
+    for (int i = 0; i < 1024; i++) g_att_gain[i] = powf(10.0f, -(float)i * 0.09375f / 20.0f);
+    g_att_gain[1023] = 0.0f;
+    for (int i = 0; i < 256; i++) g_tl_gain[i] = powf(10.0f, -(float)i * 0.375f / 20.0f);
+    for (int i = 0; i < 16; i++) g_dl_gain[i] = i == 0 ? 0.0f : powf(10.0f, -(float)(15 - i) * 3.0f / 20.0f);
+    for (int i = 0; i < 16; i++) g_pan_gain[i] = i == 15 ? 0.0f : powf(10.0f, -(float)i * 3.0f / 20.0f);
+    /* EG time for the full 0..96 dB range as a function of rate (AICA documentation, 2 table steps per rate, 4 steps per halving) */
+    for (int r = 0; r < 32; r++) {
+        if (r == 0) { g_att_step[r] = 0.0f; g_dec_step[r] = 0.0f; continue; }
+        double idx = (double)(r * 2);
+        double ta = 8100.0 * pow(2.0, -(idx - 2.0) / 4.0), td = 118200.0 * pow(2.0, -(idx - 2.0) / 4.0);   /* ms */
+        g_att_step[r] = (r == 31) ? 1024.0f : (float)(1023.0 / (ta * 44.1));
+        g_dec_step[r] = (float)(1023.0 / (td * 44.1));
+    }
+    g_tables_done = 1;
+}
+
+/* ============================================================================================================================ memory */
+static inline uint32_t ram_rd(uint32_t a, int sz) { a &= ARAM_SIZE - 1; uint32_t v = 0; if (a + sz > ARAM_SIZE) return 0; memcpy(&v, &aram[a], sz); return v; }
+static inline void     ram_wr(uint32_t a, int sz, uint32_t v) { a &= ARAM_SIZE - 1; if (a + sz > ARAM_SIZE) return; memcpy(&aram[a], &v, sz); }
+
+static void update_fiq_level(void);
+static void keyonex(void);
+static uint32_t reg_read(uint32_t off, int sz, int from_arm);
+static void reg_write(uint32_t off, int sz, uint32_t v, int from_arm);
+
+static inline void scipd_set(uint32_t bits) {
+    scipd |= bits;
+    uint32_t en = aregs[0x289C / 4] & bits & 0x7FF;
+    if (en) { fiq_pend |= en; update_fiq_level(); }
+}
+static void update_fiq_level(void) {
+    uint32_t p = fiq_pend;
+    if (!p) return;
+    int b = 31 - __builtin_clz(p);                       /* highest pending source decides the level (most recent/most urgent) */
+    uint32_t l0 = aregs[0x28A8 / 4], l1 = aregs[0x28AC / 4], l2 = aregs[0x28B0 / 4];
+    intreq_level = ((l0 >> b) & 1) | (((l1 >> b) & 1) << 1) | (((l2 >> b) & 1) << 2);
+}
+
+/* --- channel monitor (0x280C MSLC select, 0x2810 read: LP | SGC | EG13, 0x2814 read: CA) --- */
+static uint32_t mon_read(uint32_t off) {
+    unsigned ch = (aregs[0x280C / 4] >> 8) & 0x3F;
+    const Chan *c = &chn[ch];
+    if (off == 0x2810) {
+        uint32_t eg13 = c->active ? (uint32_t)(c->att * 8.0f) : 0x1FFF;
+        if (eg13 > 0x1FFF) eg13 = 0x1FFF;
+        uint32_t sgc = c->active ? (uint32_t)c->eg : 3;
+        return (c->lp_flag ? 0x8000u : 0) | (sgc << 13) | eg13;
+    }
+    return (c->pos << 0) & 0xFFFF;                       /* CA: current sample address (low bits) */
+}
+
+static uint32_t reg_read(uint32_t off, int sz, int from_arm) {
+    off &= 0x7FFF;
+    uint32_t w = aregs[off >> 2];
+    switch (off & ~3u) {
+    case 0x2810: case 0x2814: w = mon_read(off & ~3u); break;
+    case 0x2D00: w = from_arm ? intreq_level : w; break;
+    case 0x2890: w = (tim_pre[0] << 8) | tim_cnt[0]; break;
+    case 0x2894: w = (tim_pre[1] << 8) | tim_cnt[1]; break;
+    case 0x2898: w = (tim_pre[2] << 8) | tim_cnt[2]; break;
+    case 0x28A0: w = scipd; break;
+    case 0x2808: w = 0x100; break;                       /* MIDI in: empty */
+    default: break;
+    }
+    if ((off & ~3u) < 0x2000 && (off & 0x7F) == 0) w &= ~0x8000u;    /* KYONEX reads 0 */
+    int sh = (off & 3) * 8;
+    w >>= sh;
+    return sz == 1 ? (w & 0xFF) : sz == 2 ? (w & 0xFFFF) : w;
+}
+
+static void arm_reset(void);
+static void reg_write(uint32_t off, int sz, uint32_t v, int from_arm) {
+    off &= 0x7FFF;
+    uint32_t wo = off & ~3u, cur = aregs[wo >> 2], nw;
+    if (sz == 4) nw = v;
+    else { int sh = (off & 3) * 8; uint32_t m = (sz == 1 ? 0xFFu : 0xFFFFu) << sh; nw = (cur & ~m) | ((v << sh) & m); }
+    if (TRACE && !(wo < 0x2000 && (wo & 0x7C) > 0x30) && wo != 0x2D04 && wo != 0x28A4 && wo != 0x2890) {
+        static unsigned n; if (n++ < 4000) fprintf(stderr, "[aica] %s wr %05x <- %08x (sz %d)\n", from_arm ? "arm" : "sh4", wo, nw, sz);
+    }
+    switch (wo) {
+    case 0x2890: case 0x2894: case 0x2898: { int t = (wo - 0x2890) >> 2; tim_cnt[t] = nw & 0xFF; tim_pre[t] = (nw >> 8) & 7; tim_acc[t] = 0; aregs[wo >> 2] = nw; return; }
+    case 0x289C: aregs[wo >> 2] = nw; { uint32_t en = scipd & nw & 0x7FF; if (en) { fiq_pend |= en; update_fiq_level(); } } return;
+    case 0x28A0: aregs[wo >> 2] = nw; if (nw & 0x20) scipd_set(0x20); return;          /* only bit 5 (CPU interrupt) is writable */
+    case 0x28A4: scipd &= ~nw; return;                                                  /* SCIRE: clear pending */
+    case 0x28BC: aregs[0x28B8 / 4] &= ~nw; return;                                      /* MCIRE */
+    case 0x2D04: if (nw & 1) { /* INTCLEAR: ack the interrupt being serviced */
+            if (fiq_pend) { int b = 31 - __builtin_clz(fiq_pend); fiq_pend &= ~(1u << b); update_fiq_level(); }
+        } return;
+    case 0x2D00: aregs[wo >> 2] = nw; if (!from_arm && (nw & 1)) scipd_set(0x20); return;   /* SH4 -> ARM interrupt (CPU int, SCIPD bit 5) */
+    case 0x2C00: {
+        uint32_t old = cur & 1; aregs[wo >> 2] = nw;
+        if (old != (nw & 1)) { if (TRACE) fprintf(stderr, "[aica] ARMRST %u -> %u (sh4 pc-less write)\n", old, nw & 1); if (nw & 1) arm_run_flag = 0; else arm_reset(); }
+        return; }
+    case 0x2810: case 0x2814: return;
+    default: break;
+    }
+    aregs[wo >> 2] = nw;
+    if (wo < 0x2000 && (wo & 0x7C) != 0) g_dirty[wo >> 7] = 1;
+    if (wo < 0x2000 && (wo & 0x7F) == 0) { if ((cur ^ nw) & ~0x8000u) g_dirty[wo >> 7] = 1; }
+    if (wo < 0x2000 && (wo & 0x7F) == 0 && (nw & 0x8000)) keyonex();
+}
+
+/* ============================================================================================================================ AICA channels */
+static int16_t chan_sample(const Chan *c, uint32_t idx, uint32_t base, int pcms) {
+    (void)c;
+    switch (pcms) {
+    case 0: return (int16_t)ram_rd(base + idx * 2, 2);
+    case 1: return (int16_t)((int8_t)ram_rd(base + idx, 1) << 8);
+    default: return 0;
+    }
+}
+/* Yamaha ADPCM (as used by AICA): low nibble first */
+static const int8_t  yam_diff[16] = {1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15};
+static const int32_t yam_scale[8] = {230, 230, 230, 230, 307, 409, 512, 614};
+static inline int32_t adpcm_next(Chan *c, uint32_t base, uint32_t lsa) {
+    if (c->ad_pos == lsa && !c->lsa_saved) { c->lsa_pred = c->ad_pred; c->lsa_step = c->ad_step; c->lsa_saved = 1; }
+    uint32_t byte = ram_rd(base + (c->ad_pos >> 1), 1);
+    uint32_t nib = (c->ad_pos & 1) ? (byte >> 4) : (byte & 15);
+    c->ad_pos++;
+    int32_t p = c->ad_pred + (yam_diff[nib] * c->ad_step) / 8;
+    if (p > 32767) p = 32767; else if (p < -32768) p = -32768;
+    c->ad_pred = p;
+    int32_t st = (c->ad_step * yam_scale[nib & 7]) >> 8;
+    c->ad_step = st < 127 ? 127 : st > 24576 ? 24576 : st;
+    return p;
+}
+
+static inline uint32_t chn_reg(int ch, int r) { return aregs[(ch * 0x80 + r) >> 2]; }
+
+static void chan_start(int ch) {
+    Chan *c = &chn[ch];
+    memset(c, 0, sizeof *c);
+    c->active = 1; c->eg = 0; c->att = 1023.0f; c->t0 = st_samples;
+    uint32_t r10 = chn_reg(ch, 0x10);
+    if ((r10 & 31) == 31) { c->att = 0.0f; c->eg = 1; }
+    c->ad_pred = 0; c->ad_step = 127;
+    uint32_t r0 = chn_reg(ch, 0), base = (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) & (ARAM_SIZE - 1), lsa = chn_reg(ch, 8) & 0xFFFF;
+    int pcms = (r0 >> 7) & 3;
+    if (pcms >= 2) { c->ad_pos = 0; c->s0 = adpcm_next(c, base, lsa); c->s1 = adpcm_next(c, base, lsa); }
+    else { c->s0 = chan_sample(c, 0, base, pcms); c->s1 = chan_sample(c, 1, base, pcms); }
+    st_keyon++;
+    EV("KEYON ch%d pcms=%d sa=%06x lsa=%u lea=%u loop=%d rr=%u d2r=%u tl=%u dl=%u fns=%u oct=%d pan=%u", ch, pcms, base, lsa, chn_reg(ch, 0xC) & 0xFFFF, (r0 >> 9) & 1, chn_reg(ch, 0x14) & 31, (r10 >> 11) & 31, (chn_reg(ch, 0x28) >> 8) & 255, (chn_reg(ch, 0x24) >> 8) & 15, chn_reg(ch, 0x18) & 0x3FF, ((int)((chn_reg(ch, 0x18) >> 11) & 15) ^ 8) - 8, chn_reg(ch, 0x24) & 31);
+    if (TRACE && pcms >= 2) {      /* decode-quality probe: statistics of the first samples (a correct ADPCM decode is ~zero-mean, not saturated) */
+        Chan t; memset(&t, 0, sizeof t); t.ad_step = 127; uint32_t n = chn_reg(ch, 0xC) & 0xFFFF; if (n > 8192) n = 8192;
+        double sum = 0, sq = 0; int sat = 0;
+        for (uint32_t k = 0; k < n; k++) { int32_t v = adpcm_next(&t, base, 0xFFFFFFFFu); sum += v; sq += (double)v * v; if (v >= 32767 || v <= -32768) sat++; }
+        if (n) { static unsigned pn; if (pn++ < 400) fprintf(stderr, "[aica] PROBE sa=%06x n=%u mean=%.0f rms=%.0f sat=%d\n", base, n, sum / n, sqrt(sq / n), sat); }
+    }
+    if (TRACE) {
+        static unsigned n; if (n++ < 300) fprintf(stderr, "[aica] KEYON ch%d pcms=%d sa=%06x lsa=%u lea=%u loop=%d AR=%u D1R=%u D2R=%u RR=%u DL=%u fns=%u oct=%d tl=%u disdl=%u dipan=%u\n", ch, pcms, base, lsa, chn_reg(ch, 0xC) & 0xFFFF,
+                (r0 >> 9) & 1, r10 & 31, (r10 >> 6) & 31, (r10 >> 11) & 31, chn_reg(ch, 0x14) & 31, (chn_reg(ch, 0x14) >> 5) & 31, chn_reg(ch, 0x18) & 0x3FF,
+                ((int)((chn_reg(ch, 0x18) >> 11) & 15) ^ 8) - 8, (chn_reg(ch, 0x28) >> 8) & 255, (chn_reg(ch, 0x24) >> 8) & 15, chn_reg(ch, 0x24) & 31);
+    }
+}
+/* KYONEX: latch each channel's KYONB. Key-on happens on a KYONB 0 -> 1 transition of the latched state, key-off on 1 -> 0 (Sega driver: a voice is keyed off explicitly
+ * before its channel is reused). A channel that is still latched ON but finished (sample end / EG at max) is NOT restarted by a later KYONEX for another voice: the previous
+ * code restarted every inactive channel with KYONB=1 on every KYONEX ("a finished SFX plays again whenever another sound starts"). Ignored restarts are counted/logged. */
+static uint64_t st_keyon_ignored; static int g_keyon_old;                 /* R2_SND_KEYON_OLD=1: old rule (restart every finished latched channel), A/B only */
+static void keyonex(void) {
+    for (int ch = 0; ch < 64; ch++) {
+        uint32_t r0 = chn_reg(ch, 0);
+        int on = (r0 >> 14) & 1;
+        Chan *c = &chn[ch];
+        if (on) {
+            if (!g_keyed[ch] || (g_keyon_old && (!c->active || c->eg == 3))) { g_keyed[ch] = 1; g_dirty[ch] = 0; chan_start(ch); }
+            else if (!c->active || c->eg == 3) { st_keyon_ignored++; EV("KEYON_IGNORED ch%d (latched on, active=%d eg=%d)", ch, c->active, c->eg); }
+        } else {
+            g_keyed[ch] = 0;
+            if (c->active && c->eg != 3) { c->eg = 3; EV("KEYOFF ch%d pos=%u att=%.0f rr=%u", ch, c->pos, c->att, chn_reg(ch, 0x14) & 31); }
+        }
+    }
+    for (int ch = 0; ch < 64; ch++) aregs[(ch * 0x80) >> 2] &= ~0x8000u;
+}
+
+/* render one output sample of all channels -> l, r (float, 16-bit scale) */
+static inline void render_sample(float *outl, float *outr) {
+    float l = 0, r = 0;
+    for (int ch = 0; ch < 64; ch++) {
+        Chan *c = &chn[ch];
+        if (!c->active) continue;
+        const uint32_t *rg = &aregs[(ch * 0x80) >> 2];
+        uint32_t r0 = rg[0], r10 = rg[0x10 >> 2], r14 = rg[0x14 >> 2], r18 = rg[0x18 >> 2];
+        /* envelope */
+        switch (c->eg) {
+        case 0: { unsigned ar = r10 & 31; c->att -= g_att_step[ar]; if (c->att <= 0.0f) { c->att = 0.0f; c->eg = 1; } break; }
+        case 1: { unsigned d1 = (r10 >> 6) & 31; float dl = (float)(((r14 >> 5) & 31) << 5);
+                  c->att += g_dec_step[d1]; if (c->att >= dl) { c->att = dl; c->eg = 2; } break; }
+        case 2: { unsigned d2 = (r10 >> 11) & 31; c->att += g_dec_step[d2]; if (c->att > 1023.0f) c->att = 1023.0f; break; }
+        default: { unsigned rr = r14 & 31; c->att += g_dec_step[rr]; if (c->att >= 1023.0f) { c->att = 1023.0f; c->active = 0; EV("REL_END ch%d", ch); } break; }
+        }
+        if (!c->active) continue;
+        /* sample */
+        int pcms = (r0 >> 7) & 3;
+        uint32_t base = (((r0 & 0x7F) << 16) | (rg[1] & 0xFFFF)) & (ARAM_SIZE - 1);
+        uint32_t lsa = rg[2] & 0xFFFF, lea = rg[3] & 0xFFFF; int loop = (r0 >> 9) & 1;
+        if (!(r0 & 0x400)) {            /* SSCTL=0: normal sample source */
+            float f = (float)c->frac * (1.0f / 65536.0f);
+            float smp = (float)c->s0 + ((float)c->s1 - (float)c->s0) * f;
+            int dsel = (int)((rg[0x24 >> 2] >> 8) & 15), pan = (int)(rg[0x24 >> 2] & 31), tl = (int)((rg[0x28 >> 2] >> 8) & 255);
+            float g = g_att_gain[(int)c->att > 1023 ? 1023 : (int)c->att] * g_tl_gain[tl] * g_dl_gain[dsel];
+            float gl = g, gr = g;
+            if (pan & 0x10) gr *= g_pan_gain[pan & 15]; else gl *= g_pan_gain[pan & 15];   /* KOS AICA_PAN(): left = 0x1F, right = 0x0F */
+            l += smp * gl; r += smp * gr;
+        }
+        /* advance position */
+        int oct = (int)((r18 >> 11) & 15); if (oct > 7) oct -= 16;
+        uint32_t inc = (1024 + (r18 & 0x3FF)) * 64u;      /* 16.16 fixed point, 1024 = 1.0 */
+        inc = oct >= 0 ? inc << oct : inc >> (-oct);
+        uint32_t fr = c->frac + inc;
+        uint32_t adv = fr >> 16; c->frac = fr & 0xFFFF;
+        while (adv--) {
+            c->pos++;
+            if (lea && c->pos >= lea) {
+                if (loop) {
+                    c->lp_flag = 1; EV("LOOPWRAP ch%d sa=%06x lsa=%u lea=%u eg=%d att=%.0f", ch, base, lsa, lea, c->eg, c->att);
+                    if (g_ringlog && (base == 0x18000 || base == 0x1E000)) {
+                        int ri = base == 0x1E000; g_rw_wraps[ri]++;
+                        fprintf(stderr, "[ring%d] t=%.3fs wrap#%llu lea=%u sh4_stores=%llu bytes=%llu range=%05x..%05x\n", ri, (double)st_samples_fwd() / 44100.0, (unsigned long long)g_rw_wraps[ri], lea, (unsigned long long)g_rw_n[ri], (unsigned long long)g_rw_bytes[ri], g_rw_lo[ri], g_rw_hi[ri]);
+                        g_rw_n[ri] = g_rw_bytes[ri] = 0; g_rw_lo[ri] = 0xFFFFFF; g_rw_hi[ri] = 0;
+                    }
+                    c->pos = lsa;
+                    if (pcms >= 2) { c->ad_pos = lsa; if (pcms != 3) { c->ad_pred = c->lsa_saved ? c->lsa_pred : 0; c->ad_step = c->lsa_saved ? c->lsa_step : 127; } /* pcms 3 = ADPCM long-stream: decoder state continues across the loop (ring-buffer streams) */ c->s0 = adpcm_next(c, base, lsa); c->s1 = adpcm_next(c, base, lsa); continue; }
+                } else { c->active = 0; EV("SAMPLE_END ch%d sa=%06x lea=%u eg=%d", ch, base, lea, c->eg); break; }
+            }
+            c->s0 = c->s1;
+            uint32_t nx = c->pos + 1;
+            if (lea && nx >= lea) nx = loop ? lsa : c->pos;
+            if (pcms >= 2) { if (nx == c->pos + 1) c->s1 = adpcm_next(c, base, lsa); else c->s1 = c->s0; }
+            else c->s1 = chan_sample(c, nx, base, pcms);
+        }
+    }
+    *outl = l; *outr = r;
+}
+
+/* ============================================================================================================================ ARM7 */
+#define FN 0x80000000u
+#define FZ 0x40000000u
+#define FC 0x20000000u
+#define FV 0x10000000u
+
+static int mode_idx(uint32_t m) { switch (m & 0x1F) { case 0x11: return 1; case 0x12: return 2; case 0x13: return 3; case 0x17: return 4; case 0x1B: return 5; default: return 0; } }
+static void set_mode(uint32_t nm) {
+    int o = mode_idx(A.cpsr), n = mode_idx(nm);
+    if (o == n) return;
+    A.b13[o] = A.r[13]; A.b14[o] = A.r[14];
+    if (o == 1) { for (int i = 0; i < 5; i++) { A.fiq8[i] = A.r[8 + i]; A.r[8 + i] = A.usr8[i]; } }
+    else if (n == 1) { for (int i = 0; i < 5; i++) { A.usr8[i] = A.r[8 + i]; A.r[8 + i] = A.fiq8[i]; } }
+    A.r[13] = A.b13[n]; A.r[14] = A.b14[n];
+}
+static void cpsr_write(uint32_t v, uint32_t mask) {
+    if ((A.cpsr & 0x1F) == 0x10) mask &= 0xF0000000u;        /* user mode: flags only */
+    uint32_t nw = (A.cpsr & ~mask) | (v & mask);
+    if (mask & 0xFF) set_mode(nw & 0x1F);
+    A.cpsr = nw;
+}
+static void exception(uint32_t newmode, uint32_t vec, uint32_t lr, uint32_t fiq_mask) {
+    uint32_t old = A.cpsr;
+    set_mode(newmode);
+    A.spsr[mode_idx(newmode)] = old;
+    A.cpsr = (old & 0xFFFFFFE0u & ~0x20u) | newmode | 0x80 | fiq_mask;
+    A.r[14] = lr; A.r[15] = vec;
+}
+
+static uint32_t mrd(uint32_t a, int sz) {
+    if (a < 0x800000u) return ram_rd(a, sz);
+    if (a >= 0x800000u && a < 0x808000u) return reg_read(a - 0x800000u, sz, 1);
+    return 0;
+}
+static void mwr(uint32_t a, int sz, uint32_t v) {
+    if (a < 0x800000u) { ram_wr(a, sz, v); return; }
+    if (a >= 0x800000u && a < 0x808000u) reg_write(a - 0x800000u, sz, v, 1);
+}
+static inline uint32_t ror32(uint32_t x, unsigned n) { n &= 31; return n ? (x >> n) | (x << (32 - n)) : x; }
+
+/* operand 2; returns value, carry in *co */
+static uint32_t shifter(uint32_t i, uint32_t pc, int *co) {
+    int c = (A.cpsr & FC) != 0;
+    if (i & 0x02000000u) {
+        uint32_t imm = i & 0xFF; unsigned rot = ((i >> 8) & 15) * 2;
+        uint32_t v = ror32(imm, rot);
+        if (rot) c = (v >> 31) & 1;
+        *co = c; return v;
+    }
+    int rm = i & 15; uint32_t v = (rm == 15) ? pc + 8 : A.r[rm];
+    unsigned amt; int type = (i >> 5) & 3;
+    if (i & 0x10) {
+        if (rm == 15) v = pc + 12;
+        int rs = (i >> 8) & 15; amt = ((rs == 15) ? pc + 12 : A.r[rs]) & 0xFF;
+        if (amt == 0) { *co = c; return v; }
+        switch (type) {
+        case 0: if (amt < 32) { c = (v >> (32 - amt)) & 1; v <<= amt; } else if (amt == 32) { c = v & 1; v = 0; } else { c = 0; v = 0; } break;
+        case 1: if (amt < 32) { c = (v >> (amt - 1)) & 1; v >>= amt; } else if (amt == 32) { c = v >> 31; v = 0; } else { c = 0; v = 0; } break;
+        case 2: if (amt < 32) { c = ((int32_t)v >> (amt - 1)) & 1; v = (uint32_t)((int32_t)v >> amt); } else { c = v >> 31; v = (uint32_t)((int32_t)v >> 31); } break;
+        default: amt &= 31; if (amt == 0) { c = v >> 31; } else { v = ror32(v, amt); c = v >> 31; } break;
+        }
+    } else {
+        amt = (i >> 7) & 31;
+        switch (type) {
+        case 0: if (amt) { c = (v >> (32 - amt)) & 1; v <<= amt; } break;
+        case 1: if (amt == 0) { c = v >> 31; v = 0; } else { c = (v >> (amt - 1)) & 1; v >>= amt; } break;
+        case 2: if (amt == 0) { c = v >> 31; v = (uint32_t)((int32_t)v >> 31); } else { c = ((int32_t)v >> (amt - 1)) & 1; v = (uint32_t)((int32_t)v >> amt); } break;
+        default: if (amt == 0) { uint32_t nc = v & 1; v = (v >> 1) | ((A.cpsr & FC) ? 0x80000000u : 0); c = nc; } else { v = ror32(v, amt); c = v >> 31; } break;
+        }
+    }
+    *co = c; return v;
+}
+
+static inline int cond_ok(uint32_t cc) {
+    uint32_t f = A.cpsr;
+    int n = !!(f & FN), z = !!(f & FZ), c = !!(f & FC), v = !!(f & FV);
+    switch (cc) {
+    case 0: return z; case 1: return !z; case 2: return c; case 3: return !c; case 4: return n; case 5: return !n; case 6: return v; case 7: return !v;
+    case 8: return c && !z; case 9: return !c || z; case 10: return n == v; case 11: return n != v; case 12: return !z && n == v; case 13: return z || n != v;
+    case 14: return 1; default: return 0;
+    }
+}
+static inline void setnz(uint32_t r) { A.cpsr = (A.cpsr & ~(FN | FZ)) | (r & FN) | (r == 0 ? FZ : 0); }
+
+static void branch_restore(void) {          /* "S" form write to PC: CPSR <- SPSR */
+    int mi = mode_idx(A.cpsr);
+    if (mi == 0) return;
+    uint32_t sp = A.spsr[mi];
+    set_mode(sp & 0x1F);
+    A.cpsr = sp;
+}
+
+static int arm_step(void) {      /* returns cycles used */
+    uint32_t pc = A.r[15] & ~3u, i = mrd(pc, 4);
+    A.r[15] = pc + 4;
+    st_arm_instr++;
+    uint32_t cc = i >> 28;
+    if (!cond_ok(cc)) return ARM_CYCLES_PER_INSN;
+    int cyc = ARM_CYCLES_PER_INSN;
+    uint32_t op1 = (i >> 25) & 7;
+    if (op1 == 0 && (i & 0x90) == 0x90) {          /* multiplies / swap / halfword */
+        if ((i & 0x60) == 0) {
+            if ((i & 0x0FC000F0u) == 0x00000090u) {            /* MUL/MLA */
+                int rd = (i >> 16) & 15, rn = (i >> 12) & 15, rs = (i >> 8) & 15, rm = i & 15;
+                uint32_t r = A.r[rm] * A.r[rs]; if (i & 0x200000u) r += A.r[rn];
+                A.r[rd] = r; if (i & 0x100000u) setnz(r);
+                return cyc + 2;
+            }
+            if ((i & 0x0F8000F0u) == 0x00800090u) {            /* long multiply */
+                int rdhi = (i >> 16) & 15, rdlo = (i >> 12) & 15, rs = (i >> 8) & 15, rm = i & 15;
+                uint64_t r;
+                if (i & 0x400000u) r = (uint64_t)((int64_t)(int32_t)A.r[rm] * (int64_t)(int32_t)A.r[rs]);
+                else r = (uint64_t)A.r[rm] * (uint64_t)A.r[rs];
+                if (i & 0x200000u) r += ((uint64_t)A.r[rdhi] << 32) | A.r[rdlo];
+                A.r[rdlo] = (uint32_t)r; A.r[rdhi] = (uint32_t)(r >> 32);
+                if (i & 0x100000u) A.cpsr = (A.cpsr & ~(FN | FZ)) | ((r >> 63) ? FN : 0) | (r == 0 ? FZ : 0);
+                return cyc + 3;
+            }
+            if ((i & 0x0FB00FF0u) == 0x01000090u) {            /* SWP */
+                int rn = (i >> 16) & 15, rd = (i >> 12) & 15, rm = i & 15; uint32_t a = A.r[rn];
+                if (i & 0x400000u) { uint32_t t = mrd(a, 1); mwr(a, 1, A.r[rm]); A.r[rd] = t; }
+                else { uint32_t t = ror32(mrd(a & ~3u, 4), (a & 3) * 8); mwr(a & ~3u, 4, A.r[rm]); A.r[rd] = t; }
+                return cyc + 2;
+            }
+            goto undef;
+        }
+        /* halfword / signed byte transfer */
+        int rn = (i >> 16) & 15, rd = (i >> 12) & 15, L = (i >> 20) & 1, P = (i >> 24) & 1, U = (i >> 23) & 1, W = (i >> 21) & 1;
+        uint32_t off = (i & 0x400000u) ? (((i >> 4) & 0xF0) | (i & 15)) : A.r[i & 15];
+        uint32_t base = (rn == 15) ? pc + 8 : A.r[rn], addr = P ? (U ? base + off : base - off) : base;
+        uint32_t nb = U ? base + off : base - off;
+        if (!P || W) A.r[rn] = nb;
+        if (L) {
+            uint32_t v;
+            switch ((i >> 5) & 3) {
+            case 1: v = mrd(addr & ~1u, 2); if (addr & 1) v = ror32(v, 8); break;
+            case 2: v = (uint32_t)(int32_t)(int8_t)mrd(addr, 1); break;
+            default: v = (uint32_t)(int32_t)(int16_t)mrd(addr & ~1u, 2); break;
+            }
+            if (rd == 15) A.r[15] = v & ~3u; else A.r[rd] = v;
+        } else mwr(addr & ~1u, 2, (rd == 15) ? pc + 12 : A.r[rd]);
+        return cyc + 1;
+    }
+    if (op1 <= 1) {                                  /* data processing / PSR transfer */
+        uint32_t opc = (i >> 21) & 15; int S = (i >> 20) & 1;
+        if (!S && opc >= 8 && opc <= 11) {          /* MRS / MSR */
+            if ((i & 0x0FBF0FFFu) == 0x010F0000u) { int rd = (i >> 12) & 15; uint32_t v = (i & 0x400000u) ? A.spsr[mode_idx(A.cpsr)] : A.cpsr; A.r[rd] = v; return cyc; }
+            if ((i & 0x0DB0F000u) == 0x0120F000u) {
+                uint32_t mask = 0; if (i & 0x10000u) mask |= 0xFF; if (i & 0x20000u) mask |= 0xFF00; if (i & 0x40000u) mask |= 0xFF0000; if (i & 0x80000u) mask |= 0xFF000000u;
+                uint32_t v; int dummy; if (i & 0x02000000u) v = shifter(i, pc, &dummy); else v = A.r[i & 15];
+                if (i & 0x400000u) { int mi = mode_idx(A.cpsr); if (mi) A.spsr[mi] = (A.spsr[mi] & ~mask) | (v & mask); }
+                else cpsr_write(v, mask);
+                return cyc;
+            }
+            goto undef;
+        }
+        int rn = (i >> 16) & 15, rd = (i >> 12) & 15, co;
+        uint32_t a = (rn == 15) ? ((i & 0x02000000u) == 0 && (i & 0x10) ? pc + 12 : pc + 8) : A.r[rn];
+        uint32_t b = shifter(i, pc, &co), res = 0; int logic = 0, wr = 1;
+        uint64_t t; int cf = !!(A.cpsr & FC);
+        uint32_t C = 0, V = 0;
+        switch (opc) {
+        case 0: res = a & b; logic = 1; break;
+        case 1: res = a ^ b; logic = 1; break;
+        case 2: t = (uint64_t)a - b; res = (uint32_t)t; C = a >= b; V = ((a ^ b) & (a ^ res)) >> 31; break;
+        case 3: t = (uint64_t)b - a; res = (uint32_t)t; C = b >= a; V = ((b ^ a) & (b ^ res)) >> 31; break;
+        case 4: t = (uint64_t)a + b; res = (uint32_t)t; C = (uint32_t)(t >> 32); V = (~(a ^ b) & (a ^ res)) >> 31; break;
+        case 5: t = (uint64_t)a + b + cf; res = (uint32_t)t; C = (uint32_t)(t >> 32); V = (~(a ^ b) & (a ^ res)) >> 31; break;
+        case 6: t = (uint64_t)a - b - (!cf); res = (uint32_t)t; C = (uint64_t)a >= (uint64_t)b + (!cf); V = ((a ^ b) & (a ^ res)) >> 31; break;
+        case 7: t = (uint64_t)b - a - (!cf); res = (uint32_t)t; C = (uint64_t)b >= (uint64_t)a + (!cf); V = ((b ^ a) & (b ^ res)) >> 31; break;
+        case 8: res = a & b; logic = 1; wr = 0; break;
+        case 9: res = a ^ b; logic = 1; wr = 0; break;
+        case 10: t = (uint64_t)a - b; res = (uint32_t)t; C = a >= b; V = ((a ^ b) & (a ^ res)) >> 31; wr = 0; break;
+        case 11: t = (uint64_t)a + b; res = (uint32_t)t; C = (uint32_t)(t >> 32); V = (~(a ^ b) & (a ^ res)) >> 31; wr = 0; break;
+        case 12: res = a | b; logic = 1; break;
+        case 13: res = b; logic = 1; break;
+        case 14: res = a & ~b; logic = 1; break;
+        default: res = ~b; logic = 1; break;
+        }
+        if (wr) { if (rd == 15) A.r[15] = res & ~3u; else A.r[rd] = res; }
+        if (S) {
+            if (rd == 15 && wr) branch_restore();
+            else {
+                setnz(res);
+                if (logic) A.cpsr = (A.cpsr & ~FC) | (co ? FC : 0);
+                else A.cpsr = (A.cpsr & ~(FC | FV)) | (C ? FC : 0) | (V ? FV : 0);
+            }
+        }
+        return cyc;
+    }
+    if (op1 == 2 || op1 == 3) {                      /* single data transfer */
+        if (op1 == 3 && (i & 0x10)) goto undef;
+        int rn = (i >> 16) & 15, rd = (i >> 12) & 15, L = (i >> 20) & 1, P = (i >> 24) & 1, U = (i >> 23) & 1, B = (i >> 22) & 1, W = (i >> 21) & 1;
+        uint32_t off;
+        if (op1 == 2) off = i & 0xFFF;
+        else { int co; uint32_t j = i & ~0x10u; off = shifter(j & ~0x02000000u, pc, &co); }
+        uint32_t base = (rn == 15) ? pc + 8 : A.r[rn];
+        uint32_t nb = U ? base + off : base - off, addr = P ? nb : base;
+        if (!P || W) A.r[rn] = nb;
+        if (L) {
+            uint32_t v = B ? mrd(addr, 1) : ror32(mrd(addr & ~3u, 4), (addr & 3) * 8);
+            if (rd == 15) A.r[15] = v & ~3u; else A.r[rd] = v;
+            cyc += 1;
+        } else {
+            uint32_t v = (rd == 15) ? pc + 12 : A.r[rd];
+            if (B) mwr(addr, 1, v & 0xFF); else mwr(addr & ~3u, 4, v);
+        }
+        return cyc;
+    }
+    if (op1 == 4) {                                  /* block data transfer */
+        int rn = (i >> 16) & 15, L = (i >> 20) & 1, P = (i >> 24) & 1, U = (i >> 23) & 1, S = (i >> 22) & 1, W = (i >> 21) & 1;
+        uint32_t list = i & 0xFFFF; int n = __builtin_popcount(list);
+        uint32_t base = A.r[rn], start, nb;
+        if (n == 0) return cyc;
+        if (U) { start = P ? base + 4 : base; nb = base + 4 * n; } else { start = P ? base - 4 * n : base - 4 * n + 4; nb = base - 4 * n; }
+        uint32_t m0 = A.cpsr; int usrbank = S && !(L && (list & 0x8000));
+        if (usrbank) { set_mode(0x10); A.cpsr = (A.cpsr & ~0x1Fu) | 0x10; }
+        if (W && !usrbank) A.r[rn] = nb;
+        uint32_t a = start & ~3u;
+        for (int k = 0; k < 16; k++) if (list & (1u << k)) {
+            if (L) { uint32_t v = mrd(a, 4); if (k == 15) { A.r[15] = v & ~3u; } else A.r[k] = v; }
+            else mwr(a, 4, (k == 15) ? pc + 12 : A.r[k]);
+            a += 4;
+        }
+        if (usrbank) { set_mode(m0 & 0x1F); A.cpsr = m0; if (W) A.r[rn] = nb; }
+        else if (L && (list & 0x8000) && S) branch_restore();
+        return cyc + n;
+    }
+    if (op1 == 5) {                                  /* B / BL */
+        int32_t off = (int32_t)(i << 8) >> 6;
+        if (i & 0x01000000u) A.r[14] = pc + 4;
+        A.r[15] = pc + 8 + off;
+        return cyc + 1;
+    }
+    if (op1 == 7 && (i & 0x01000000u)) { exception(0x13, 0x08, pc + 4, 0); return cyc; }      /* SWI */
+undef:
+    st_undef++;
+    if (TRACE && st_undef < 20) fprintf(stderr, "[arm] UNDEFINED instr %08x at %06x\n", i, pc);
+    exception(0x1B, 0x04, pc + 4, 0);
+    return cyc;
+}
+
+static void arm_reset(void) {
+    memset(g_keyed, 0, sizeof g_keyed);
+    memset(&A, 0, sizeof A);
+    A.cpsr = 0xD3;                                  /* SVC, I,F masked */
+    A.r[15] = 0;
+    arm_run_flag = 1; arm_budget = 0;
+    scipd = 0; fiq_pend = 0; intreq_level = 0;
+    memset(tim_cnt, 0, sizeof tim_cnt); memset(tim_pre, 0, sizeof tim_pre); memset(tim_acc, 0, sizeof tim_acc);
+    /* idle-loop fast path is only valid for the Sega MANATEE driver main loop (checked by code words) */
+    idle_ok = (ram_rd(0x194, 4) == 0xeb000200u && ram_rd(0x198, 4) == 0xe5df908eu && ram_rd(0x1b8, 4) == 0xe5df906cu);
+    if (TRACE) fprintf(stderr, "[aica] ARM released from reset; driver code at 0: %08x %08x ... idle_ok=%d SCIEB-image@38=%08x\n", ram_rd(0, 4), ram_rd(0x100, 4), idle_ok, ram_rd(0x38, 4));
+}
+
+static inline void arm_cycles(int64_t cycles) {
+    arm_budget += cycles;
+    while (arm_budget > 0) {
+        if (fiq_pend && !(A.cpsr & 0x40)) { exception(0x11, 0x1C, (A.r[15] & ~3u) + 4, 0x40); }
+        if (idle_ok && A.r[15] == 0x194 && ram_rd(0x22c, 1) == 0 && ram_rd(0x22e, 1) == 0 && !(fiq_pend && !(A.cpsr & 0x40))
+            && ram_rd(0x13000, 4) == ram_rd(ram_rd(0x1808, 4), 4)) { st_idle++; arm_budget = 0; break; }
+        arm_budget -= arm_step();
+    }
+}
+
+/* ============================================================================================================================ timers / main step */
+static inline void timers_tick(void) {
+    for (int t = 0; t < 3; t++) {
+        if (++tim_acc[t] >= (1u << tim_pre[t])) {
+            tim_acc[t] = 0;
+            if (++tim_cnt[t] > 0xFF) { tim_cnt[t] = 0; scipd_set(1u << (6 + t)); }
+        }
+    }
+}
+
+static FILE *g_wav; static uint32_t g_wav_bytes;
+static void wav_header(FILE *f, uint32_t bytes) {
+    uint8_t h[44]; memcpy(h, "RIFF", 4); uint32_t v = 36 + bytes; memcpy(h + 4, &v, 4); memcpy(h + 8, "WAVEfmt ", 8);
+    v = 16; memcpy(h + 16, &v, 4); uint16_t s = 1; memcpy(h + 20, &s, 2); s = 2; memcpy(h + 22, &s, 2);
+    v = 44100; memcpy(h + 24, &v, 4); v = 44100 * 4; memcpy(h + 28, &v, 4); s = 4; memcpy(h + 32, &s, 2); s = 16; memcpy(h + 34, &s, 2);
+    memcpy(h + 36, "data", 4); memcpy(h + 40, &bytes, 4);
+    fwrite(h, 1, 44, f);
+}
+int snd_wav_open(const char *path) {
+    lk_lock();
+    if (g_wav) { fclose(g_wav); g_wav = 0; }
+    g_wav = fopen(path, "wb"); g_wav_bytes = 0;
+    if (g_wav) wav_header(g_wav, 0);
+    lk_unlock();
+    return g_wav ? 0 : -1;
+}
+void snd_wav_close(void) {
+    lk_lock();
+    if (g_wav) { fflush(g_wav); fseek(g_wav, 0, SEEK_SET); wav_header(g_wav, g_wav_bytes); fclose(g_wav); g_wav = 0; }
+    lk_unlock();
+}
+
+/* Headroom: 64 voices are summed unscaled (as the AICA mixer does) so loud scenes exceed 16 bits. Instead of the hard clip (harsh distortion,
+ * measured 243..374 clipped samples per 46 s menu/demo run) values above a knee at 0.70 FS are folded smoothly into the remaining headroom (tanh).
+ * Below the knee the signal is bit-identical to the plain sum. ASSUMED: the real DAC saturates; this only changes the shape of the overload. */
+static inline int32_t soft_limit(int32_t x) {
+    const float knee = 22937.0f, room = 32767.0f - 22937.0f;
+    float a = (float)(x < 0 ? -x : x);
+    if (a <= knee) return x;
+    float y = knee + room * tanhf((a - knee) / room);
+    int32_t o = (int32_t)y; if (o > 32767) o = 32767;
+    return x < 0 ? -o : o;
+}
+static uint64_t st_samples_fwd(void) { return st_samples; }
+/* advance the emulated machine by n AICA sample periods; out (may be NULL) gets stereo int16 at 44.1 kHz. Caller holds the lock. */
+static void advance_locked(int n, int16_t *out) {
+    float mv = (aregs[0x2800 / 4] & 15) == 0 ? 0.0f : powf(2.0f, ((float)(aregs[0x2800 / 4] & 15) - 15.0f) * 0.5f);   /* MVOL: 15 = 0 dB, 3 dB/step (approximation) */
+    for (int k = 0; k < n; k++) {
+        timers_tick();
+        if (arm_run_flag) arm_cycles(ARM_CYCLES_PER_SAMPLE);
+        float l, r; render_sample(&l, &r);
+        int32_t il = (int32_t)(l * g_master), ir = (int32_t)(r * g_master);
+        if (aregs[0x2800 / 4] & 0x8000) { il = ir = (il + ir) / 2; }
+        il = (int32_t)(il * mv); ir = (int32_t)(ir * mv);
+        il = soft_limit(il); ir = soft_limit(ir);
+        uint32_t pk = (uint32_t)(il < 0 ? -il : il); if (pk > st_peak) st_peak = pk;
+        pk = (uint32_t)(ir < 0 ? -ir : ir); if (pk > st_peak) st_peak = pk;
+        if (out) { out[2 * k] = (int16_t)il; out[2 * k + 1] = (int16_t)ir; }
+        if (g_wav) { int16_t p[2] = {(int16_t)il, (int16_t)ir}; fwrite(p, 2, 2, g_wav); g_wav_bytes += 4; }
+        st_samples++;
+        if (g_vdump_s && (st_samples % ((uint64_t)g_vdump_s * 44100)) == 0) {
+            fprintf(stderr, "[vdump] t=%.1fs keyon=%llu ignored_keyon=%llu\n", (double)st_samples / 44100.0, (unsigned long long)st_keyon, (unsigned long long)st_keyon_ignored);
+            for (int ch = 0; ch < 64; ch++) { const Chan *c = &chn[ch]; if (!c->active) continue; uint32_t r0 = chn_reg(ch, 0), r18 = chn_reg(ch, 0x18), r24 = chn_reg(ch, 0x24);
+                fprintf(stderr, "[vdump]  ch%02d age=%.2fs latched=%d eg=%d att=%.0f pcms=%u loop=%u sa=%06x pos=%u/%u tl=%u dl=%u pan=%u fns=%u oct=%d rr=%u%s\n", ch, (double)(st_samples - c->t0) / 44100.0, g_keyed[ch], c->eg, c->att, (r0 >> 7) & 3, (r0 >> 9) & 1,
+                    (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)), c->pos, chn_reg(ch, 0xC) & 0xFFFF, (chn_reg(ch, 0x28) >> 8) & 255, (r24 >> 8) & 15, r24 & 31, r18 & 0x3FF, ((int)((r18 >> 11) & 15) ^ 8) - 8, chn_reg(ch, 0x14) & 31,
+                    (!g_keyed[ch] && c->eg == 3 && (double)(st_samples - c->t0) / 44100.0 > 8.0) ? " **KEYED OFF BUT NOT FINISHED**" : ((r0 >> 9) & 1) && c->eg != 3 && (double)(st_samples - c->t0) / 44100.0 > 8.0 && !((r0 & 0x7F) == 1 && ((chn_reg(ch, 4) & 0xFFFF) == 0x8000 || (chn_reg(ch, 4) & 0xFFFF) == 0xE000)) ? " **LONG-LOOPING**" : ""); }
+        }
+        if (g_evlog && (st_samples % 2205) == 0) {
+            fprintf(stderr, "[vol] t=%.2f mvol=%x mono=%d dsp[", (double)st_samples / 44100.0, aregs[0x2800 / 4] & 15, (aregs[0x2800 / 4] >> 15) & 1);
+            for (int e = 0; e < 18; e++) { uint32_t w = aregs[(0x2000 + e * 4) / 4]; if (w & 0xF000) fprintf(stderr, "%d:%x/%x ", e, (w >> 12) & 15, (w >> 8) & 31); }
+            fprintf(stderr, "]");
+            for (int ch = 0; ch < 64; ch++) if (chn[ch].active) { uint32_t r20 = chn_reg(ch, 0x20), r24 = chn_reg(ch, 0x24), r28 = chn_reg(ch, 0x28), r0 = chn_reg(ch, 0);
+                fprintf(stderr, " c%d(%x sa%x tl%u dl%u pn%x att%.0f eg%d imx%x isel%x)", ch, (r0 >> 7) & 3, (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) >> 8, (r28 >> 8) & 255, (r24 >> 8) & 15, r24 & 31, chn[ch].att, chn[ch].eg, r20 & 15, (r20 >> 4) & 15); }
+            fputc(10, stderr);
+        }
+        if (TRACE && (st_samples % 88200) == 0) {
+            fprintf(stderr, "[chan] t=%llus:", (unsigned long long)(st_samples / 44100));
+            for (int ch = 0; ch < 64; ch++) if (chn[ch].active) { const Chan *c = &chn[ch]; uint32_t r0 = chn_reg(ch, 0);
+                fprintf(stderr, " [ch%d sa=%x pcms=%u pos=%u/%u lp=%u eg=%d att=%.0f s0=%d fns=%u oct=%u tl=%u]", ch, (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)), (r0 >> 7) & 3, c->pos, chn_reg(ch, 0xC) & 0xFFFF, (r0 >> 9) & 1, c->eg, c->att, c->s0, chn_reg(ch, 0x18) & 0x3FF, (chn_reg(ch, 0x18) >> 11) & 15, (chn_reg(ch, 0x28) >> 8) & 255); }
+            fputc('\n', stderr);
+        }
+    }
+}
+
+#if !defined(__vita__)
+/* R2_SND_CALLER=1: histogram of (last entered guest function, access kind, ARAM/reg region) for every guest access to the AICA (host debugging) */
+extern uint32_t hle_ring[256][2]; extern uint32_t hle_ring_pos;
+static int g_callerlog; static struct { uint32_t fn, pr, kind, reg; uint64_t n; } g_cl[512]; static int g_cln;
+static void caller_note(uint32_t kind, uint32_t off) {
+    uint32_t fn = hle_ring[(hle_ring_pos - 1) & 255][0], pr = hle_ring[(hle_ring_pos - 1) & 255][1], reg = kind >= 2 ? off & 0xF000 : off >= 0x30000 ? 0x30000 : (off >> 12) << 12;
+    for (int i = 0; i < g_cln; i++) if (g_cl[i].fn == fn && g_cl[i].kind == kind && g_cl[i].reg == reg) { g_cl[i].n++; return; }
+    if (g_cln < 512) { g_cl[g_cln].fn = fn; g_cl[g_cln].pr = pr; g_cl[g_cln].kind = kind; g_cl[g_cln].reg = reg; g_cl[g_cln].n = 1; g_cln++; }
+}
+#define CALLER_NOTE(k, o) do { if (g_callerlog) caller_note((k), (o)); } while (0)
+#else
+#define CALLER_NOTE(k, o) do {} while (0)
+#endif
+
+/* TWO MODES.
+ * PULL MODE (an audio thread calls snd_mix: the Vita, or the host harness R2_SND_PULL): the emulated AICA/ARM7 is a REAL-TIME machine. snd_mix() advances it
+ * by exactly the number of 44.1 kHz samples the output block needs, so tempo/pitch of everything the machine plays (sequenced music, one-shot SFX, stream
+ * rings) is independent of how fast the guest runs. The guest thread never advances it and never takes a lock for the (hot) ARAM word accesses: sd talks to
+ * the ARM driver ONLY through ARAM (command ring at 0xB000, pointers at 0x13000/0x13004, status blocks, stream rings; PROVEN with R2_SND_CALLER=1: in 25 s the
+ * guest made 3 AICA register reads and 3 writes in total and ~1.1 M ARAM word stores), so plain 32-bit stores/loads + one memory barrier on the ring write
+ * pointer are enough; only the rare register writes (key-on etc.) and G2 DMA take the lock.
+ * (The older design slaved the sample clock to the guest clock: with the guest in slow motion that played the whole game in slow motion, see notes_sound.md 7/8.)
+ * LEGACY MODE (no consumer: plain host run): the machine is advanced from guest accesses to the guest-visible clock (hle_time_us) so the guest sees a live ARM;
+ * output goes to the WAV only. */
+static uint64_t g_last_adv_us;
+static volatile int g_pull_mode;
+static void wall_sync_locked(void) {
+    uint64_t now = hle_time_us();                 /* guest thread only: hle_time_us is not thread safe */
+    if (!g_last_adv_us) { g_last_adv_us = now; return; }
+    if (now <= g_last_adv_us) return;
+    uint64_t dt = now - g_last_adv_us;
+    uint64_t n = dt * 44100ull / 1000000ull;
+    if (n < 32) return;
+    if (n > 44100) n = 44100;                      /* up to 1 s of catch-up per call (was 200 ms: a long guest frame lost AICA time) */
+    g_last_adv_us = now;
+    if (!arm_run_flag && !st_keyon) return;       /* nothing to run before the driver exists */
+    while (n) { int c = n > 512 ? 512 : (int)n; n -= (uint64_t)c; advance_locked(c, NULL); }
+}
+
+#ifndef SND_TEST
+/* ============================================================================================================================ guest stream catch-up ticks
+ * The game's single stream engine (music AND voice-over; ctx 0x8C2D4968, see re_analysis/dc/notes_stream_hle.md) refills the two AICA rings with at most ONE 4096-byte chunk
+ * (1024 stereo frames, 46 ms of 22.05 kHz audio) per sound tick (dispatcher 0x8C0625B8 -> steady-state tick 0x8C062452 -> chunk feed 0x8C062F60), ~2 ticks per guest frame.
+ * Real time needs >= 21.5 chunks/s, so a guest below ~10 fps can not keep the rings fed however the AICA is clocked (stale 0.37 s laps replay: "music repeating/timing off").
+ * Fix (host-measured, notes_stream_hle.md section 7.1): call the original dispatcher up to 8 times per tick while the previous call actually fed a chunk and the stream is in
+ * steady state (ctx[0] == 3). The guest's own room test (0x8C0E2D50) bounds each call, so unplayed ring data is never overwritten; io.c reads complete synchronously. The fade is
+ * stepped once per steady-state call (ctx[0x16] active flag), so extra calls run with the fade disabled. R2_STREAM_CATCHUP=0 disables (A/B). */
+static int g_sf_chunks, g_sf_on = 1; static unsigned long g_sf_ticks, g_sf_extra;
+static void sf_feed(SH4Ctx *c) { g_sf_chunks++; hle_orig(c, 0x8C062F60); }
+static void sf_disp(SH4Ctx *c) {
+    const uint32_t ctx = 0x8C2D4968u; uint32_t pr = c->pr; int maxn = (g_sf_on && LD32(ctx) == 3) ? 8 : 1; uint32_t fade = 0;
+    for (int i = 0; i < maxn; i++) {
+        int n0 = g_sf_chunks; c->pr = pr;
+        if (i) { fade = LD32(ctx + 0x58); ST32(ctx + 0x58, 0); }
+        hle_orig(c, 0x8C0625B8);
+        if (i) { ST32(ctx + 0x58, fade); g_sf_extra++; }
+        if (g_sf_chunks == n0 || LD32(ctx) != 3) break;
+    }
+    g_sf_ticks++; c->pr = pr;
+    if (g_evlog) {      /* music timeline: log every stream state change and, once a second of AICA time, the stream context and ring voices */
+        static uint32_t last0 = 99; static uint64_t lt; uint32_t s0 = LD32(ctx);
+        if (s0 != last0 || st_samples - lt >= 44100) {
+            lt = st_samples; last0 = s0;
+            if (getenv("R2_SND_CMDDUMP") && 1) { char b[1400]; int n = 0; for (uint32_t o = 0x13200; o < 0x13320; o += 16) { uint32_t w[4]; for (int k = 0; k < 4; k++) w[k] = ram_rd(o + 4 * k, 4); if (w[0] | w[1] | w[2] | w[3]) n += snprintf(b + n, sizeof b - n, " [%x:%08x %08x %08x %08x]", o & 0xFFF, w[0], w[1], w[2], w[3]); }
+                n += snprintf(b + n, sizeof b - n, " | 13400:"); for (uint32_t o = 0x13400; o < 0x13420; o += 4) n += snprintf(b + n, sizeof b - n, " %x", ram_rd(o, 4)); EV("CMDBLK%s", b); }
+            EV("STREAMCTX state=%u paused=%u left=%u fade=%u | ch50 a%d k%d eg%d | ch51 a%d k%d eg%d | ch53 a%d k%d eg%d pos=%u | ch54 a%d k%d eg%d pos=%u", s0, LD32(ctx + 8), LD32(ctx + 0xC), LD32(ctx + 0x58),
+               chn[50].active, g_keyed[50], chn[50].eg, chn[51].active, g_keyed[51], chn[51].eg, chn[53].active, g_keyed[53], chn[53].eg, chn[53].pos, chn[54].active, g_keyed[54], chn[54].eg, chn[54].pos);
+        }
+    }
+}
+static void sf_open(SH4Ctx *c) { if (g_evlog) EV("GUEST stream-open sd=%08x state=%u", c->r[6], LD32(0x8C2D4968)); hle_orig(c, 0x8C06262C); }
+static void sf_stop(SH4Ctx *c) { if (g_evlog) EV("GUEST stream-stop state=%u", LD32(0x8C2D4968)); hle_orig(c, 0x8C0628A8); }
+static void sf_pause(SH4Ctx *c) { if (g_evlog) EV("GUEST stream-pause state=%u", LD32(0x8C2D4968)); hle_orig(c, 0x8C062960); }
+static void sf_resume(SH4Ctx *c) { if (g_evlog) EV("GUEST stream-resume state=%u", LD32(0x8C2D4968)); hle_orig(c, 0x8C0629B0); }
+/* guest sd command taps (R2_SND_EV=1 log, counters): sd cmd 0x11 key-on request 0x8C0F06BC (r4 = sd handle, byte at +1 = driver handle id) and cmd 0x12 stop 0x8C0F08E4.
+ * Used to compare what the GAME asks for with what the AICA model plays (KEYON events): they must match 1:1. */
+static unsigned long st_gstart, st_gstop;
+static void sf_cmd_start(SH4Ctx *c) { st_gstart++; if (g_evlog) EV("GUEST start-cmd #%lu handle=%u args r5=%u r6=%u r7=%d", st_gstart, (unsigned)(LD8(c->r[4] + 1)), c->r[5] & 0xFF, c->r[6] & 0xFF, (int)c->r[7]); hle_orig(c, 0x8C0F06BC); }
+static void sf_cmd_stop(SH4Ctx *c) { st_gstop++; if (g_evlog) EV("GUEST stop-cmd #%lu handle=%u", st_gstop, (unsigned)(LD8(c->r[4] + 1))); hle_orig(c, 0x8C0F08E4); }
+#endif
+
+/* ============================================================================================================================ public API */
+int snd_init(int out_rate) {
+#if defined(__vita__)
+    { volatile const char *pad = g_vita_layout_pad; (void)pad[0]; }     /* keep the layout pad alive through --gc-sections */
+#endif
+    lk_init(); build_tables();
+    if (out_rate != 44100 && out_rate != 48000) out_rate = 44100;
+    g_out_rate = out_rate; g_inited = 1;
+    return 0;
+}
+void snd_shutdown(void) { snd_wav_close(); }
+void snd_set_master_volume(float v) { g_master = v; }
+
+static inline float cubic(const float *h, float t) {           /* Catmull-Rom between h[1] and h[2] */
+    return h[1] + 0.5f * t * (h[2] - h[0] + t * (2.0f * h[0] - 5.0f * h[1] + 4.0f * h[2] - h[3] + t * (3.0f * (h[1] - h[2]) + h[3] - h[0])));
+}
+#define MIX_CHUNK 256                                           /* AICA samples generated per lock hold (~5.8 ms) */
+static uint64_t mix_now_us(void) {
+#if defined(__vita__)
+    return sceKernelGetProcessTimeWide();
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
+#endif
+}
+static uint64_t st_mix_calls, st_mix_us_tot, st_mix_us_max;
+static int16_t g_stage[MIX_CHUNK * 2]; static int g_stage_i, g_stage_n;      /* AICA samples generated but not yet consumed by the resampler */
+static double g_rs_pos; static float g_rs_h[2][4]; static int g_rs_have;   /* h[c][0..3] = samples at -1,0,+1,+2 around the read position */
+static void stage_refill(void) {
+    lk_lock();
+    __sync_synchronize();                                       /* see the guest's ARAM stores (ring entries before the write pointer) */
+    advance_locked(MIX_CHUNK, g_stage);
+    lk_unlock();
+    g_stage_i = 0; g_stage_n = MIX_CHUNK;
+}
+static inline void stage_next(float *l, float *r) {
+    if (g_stage_i >= g_stage_n) stage_refill();
+    *l = g_stage[2 * g_stage_i]; *r = g_stage[2 * g_stage_i + 1]; g_stage_i++;
+}
+/* Audio thread: returns the next `frames` frames at the rate given to snd_init(), advancing the machine in real (audio) time. */
+void snd_mix(int16_t *out, int frames) {
+    if (!g_inited) snd_init(44100);
+    g_pull_mode = 1;
+    uint64_t t0 = mix_now_us();
+    if (g_out_rate == 44100) {
+        int done = 0;
+        while (done < frames) {
+            if (g_stage_i >= g_stage_n) stage_refill();
+            int n = g_stage_n - g_stage_i; if (n > frames - done) n = frames - done;
+            memcpy(out + 2 * done, g_stage + 2 * g_stage_i, (size_t)n * 4); g_stage_i += n; done += n;
+        }
+    } else {
+        const double ratio = 44100.0 / (double)g_out_rate;
+        if (!g_rs_have) {                                       /* prime the 4-tap history; read position starts between h[1] and h[2] */
+            for (int j = 0; j < 4; j++) { float l, r; stage_next(&l, &r); g_rs_h[0][j] = l; g_rs_h[1][j] = r; }
+            g_rs_pos = 0; g_rs_have = 1;
+        }
+        for (int k = 0; k < frames; k++) {
+            while (g_rs_pos >= 1.0) {
+                float l, r; stage_next(&l, &r);
+                for (int j = 0; j < 3; j++) { g_rs_h[0][j] = g_rs_h[0][j + 1]; g_rs_h[1][j] = g_rs_h[1][j + 1]; }
+                g_rs_h[0][3] = l; g_rs_h[1][3] = r; g_rs_pos -= 1.0;
+            }
+            for (int c = 0; c < 2; c++) { float v = cubic(g_rs_h[c], (float)g_rs_pos); out[2 * k + c] = (int16_t)(v > 32767.f ? 32767 : v < -32768.f ? -32768 : v); }
+            g_rs_pos += ratio;
+        }
+    }
+    uint64_t dt = mix_now_us() - t0; st_mix_calls++; st_mix_us_tot += dt; if (dt > st_mix_us_max) st_mix_us_max = dt;
+}
+void snd_get_stats(SndStats *s) {
+    lk_lock();
+    memset(s, 0, sizeof *s);
+    s->arm_running = arm_run_flag; s->samples = st_samples; s->arm_instr = st_arm_instr; s->arm_idle_skips = st_idle; s->keyon = st_keyon; s->ringcmds = st_ringcmds;
+    for (int i = 0; i < 64; i++) s->active_channels += chn[i].active;
+    s->peak = st_peak; st_peak = 0; s->undef_instr = st_undef;
+    s->mix_calls = st_mix_calls; s->mix_us_avg = st_mix_calls ? (uint32_t)(st_mix_us_tot / st_mix_calls) : 0; s->mix_us_max = (uint32_t)st_mix_us_max;
+    st_mix_calls = st_mix_us_tot = st_mix_us_max = 0;
+    lk_unlock();
+}
+uint8_t *snd_test_aram(void) { return aram; }
+uint32_t *snd_test_regs(void) { return aregs; }
+void snd_test_advance(int frames, int16_t *out) { build_tables(); while (frames > 0) { int c = frames > 512 ? 512 : frames; advance_locked(c, out); if (out) out += 2 * c; frames -= c; } }
+void snd_test_regwrite(uint32_t off, uint32_t v) { reg_write(off, 4, v, 0); }
+void snd_test_arm_reset(int run) { if (run) arm_reset(); else arm_run_flag = 0; }
+
+/* ============================================================================================================================ SH-4 guest MMIO */
+
+/* ARAM word accesses are lock-free (see PULL MODE above). Legacy mode takes the lock and syncs to the guest clock. */
+static uint32_t sh4_aram_rd(uint32_t a, int sz) {
+    CALLER_NOTE(0, a & 0x1FFFFF);
+    if (!g_pull_mode) { lk_lock(); wall_sync_locked(); lk_unlock(); }
+    return ram_rd(a & 0x1FFFFF, sz);
+}
+/* R2_SND_REC=<file> (host): record every guest ARAM / register write and G2 DMA with the AICA sample counter, for tests_snd/replay.c (old vs new engine, bit-exact comparison).
+ * Entry = { u64 t; u32 kind (0 aram wr, 1 reg wr, 2 dma to aram) | size << 8; u32 addr; u32 value (dma: length, followed by the bytes) }. */
+#if !defined(__vita__) && !defined(SND_TEST)
+static FILE *g_rec;
+static void rec_put(uint32_t kind, uint32_t sz, uint32_t a, uint32_t v, const void *blob) {
+    if (!g_rec) return;
+    uint64_t t = st_samples; uint32_t k = kind | (sz << 8);
+    fwrite(&t, 8, 1, g_rec); fwrite(&k, 4, 1, g_rec); fwrite(&a, 4, 1, g_rec); fwrite(&v, 4, 1, g_rec);
+    if (blob) fwrite(blob, 1, v, g_rec);
+}
+#define REC(k, sz, a, v, blob) rec_put((k), (sz), (a), (v), (blob))
+#else
+#define REC(k, sz, a, v, blob) do {} while (0)
+#endif
+static uint64_t g_sh4wr[32], g_sh4wr_n;
+static void sh4_aram_wr(uint32_t a, int sz, uint32_t v) {
+    REC(0, sz, a & 0x1FFFFF, v, 0);
+    CALLER_NOTE(1, a & 0x1FFFFF);
+    if (!g_pull_mode) { lk_lock(); wall_sync_locked(); lk_unlock(); }
+    g_sh4wr[(a >> 16) & 31] += sz; g_sh4wr_n++;
+    if (g_ringlog) { uint32_t o = a & 0x1FFFFF; int ri = (o >= 0x18000 && o < 0x1C000) ? 0 : (o >= 0x1E000 && o < 0x22000) ? 1 : -1;
+        if (ri == 0) { static unsigned long lf; static uint32_t fs, fe, fn_; static uint64_t lt; if (hle_frame_count != lf) { if (fn_) fprintf(stderr, "[frm0] f=%lu t=%.3f stores=%u first=%05x last=%05x voice_pos_bytes=%u\n", lf, (double)lt / 44100.0, fn_, fs, fe, chn[53].pos * 2); lf = hle_frame_count; fn_ = 0; } if (!fn_) fs = o; fe = o; fn_++; lt = st_samples; }
+        if (ri >= 0) { g_rw_n[ri]++; g_rw_bytes[ri] += sz; if (!g_rw_hi[ri] || o < g_rw_lo[ri]) g_rw_lo[ri] = o; if (o + sz > g_rw_hi[ri]) g_rw_hi[ri] = o + sz; } }
+    if ((a & 0x1FFFFF) == 0x13000 && sz == 4) { st_ringcmds += ((v - ram_rd(0x13000, 4)) & 0xFFF) >> 2; __sync_synchronize(); }   /* ring entries before the write pointer */
+    ram_wr(a & 0x1FFFFF, sz, v);
+}
+static uint32_t sh4_reg_rd(uint32_t a, int sz) {
+    CALLER_NOTE(2, a & 0x7FFF);
+    if (!g_pull_mode) { lk_lock(); wall_sync_locked(); lk_unlock(); }
+    return reg_read(a & 0x7FFF, sz, 0);
+}
+static void sh4_reg_wr(uint32_t a, int sz, uint32_t v) {
+    REC(1, sz, a & 0x7FFF, v, 0);
+    CALLER_NOTE(3, a & 0x7FFF);
+    lk_lock(); if (!g_pull_mode) wall_sync_locked();
+    reg_write(a & 0x7FFF, sz, v, 0);
+    lk_unlock();
+}
+/* G2 AICA DMA (SB_ADST): sd normally uses CPU stores; implemented for completeness (UNTESTED - not seen in the first frames). */
+static void g2_watch(uint32_t a, int sz, uint32_t v) {
+    (void)sz;
+    if ((a & 0xFFFF) != 0x7818 || !(v & 1)) return;
+    uint32_t aica = hle_reg_get(0xA05F7800u), sys = hle_reg_get(0xA05F7804u), len = hle_reg_get(0xA05F7808u) & 0x7FFFFFFFu, dir = hle_reg_get(0xA05F780Cu) & 1;
+    uint32_t sp = sys & 0x1FFFFFFFu;
+    if (sp >= 0x0C000000u && sp + len <= 0x0D000000u && (aica & 0x1FFFFFu) + len <= ARAM_SIZE) {
+        if (dir == 0) REC(2, 0, aica & 0x1FFFFF, len, &sh4_ram[sp & 0xFFFFFF]);
+        lk_lock();
+        if (dir == 0) memcpy(&aram[aica & 0x1FFFFF], &sh4_ram[sp & 0xFFFFFF], len); else memcpy(&sh4_ram[sp & 0xFFFFFF], &aram[aica & 0x1FFFFF], len);
+        lk_unlock();
+        if (TRACE) fprintf(stderr, "[aica] G2 DMA %s aica=%06x sys=%08x len=%u\n", dir ? "AICA->RAM" : "RAM->AICA", aica, sys, len);
+    } else fprintf(stderr, "[aica] G2 DMA ignored aica=%08x sys=%08x len=%u\n", aica, sys, len);
+    hle_reg_set(0xA05F7818u, 0);
+    hle_asic_raise_later(1u << 15);
+}
+
+/* test/replay entry points (tests_snd/replay.c): the same code paths a guest write takes */
+void snd_test_sh4_aram_wr(uint32_t a, int sz, uint32_t v) { sh4_aram_wr(a, sz, v); }
+void snd_test_sh4_reg_wr(uint32_t a, int sz, uint32_t v) { sh4_reg_wr(a, sz, v); }
+void snd_test_dma_to_aram(uint32_t a, const void *p, uint32_t len) { if ((a & 0x1FFFFF) + len <= ARAM_SIZE) memcpy(&aram[a & 0x1FFFFF], p, len); }
+uint64_t snd_test_samples(void) { return st_samples; }
+void snd_test_set_pull(int on) { g_pull_mode = on; }
+static void snd_atexit(void) {
+#if !defined(__vita__) && !defined(SND_TEST)
+    if (g_rec) { fclose(g_rec); g_rec = 0; }
+#endif
+#if !defined(__vita__)
+    if (g_callerlog) for (int i = 0; i < g_cln; i++) fprintf(stderr, "[caller] fn=%08x pr=%08x %s %05x n=%llu\n", g_cl[i].fn, g_cl[i].pr, (const char *[]){"aram_rd", "aram_wr", "reg_rd", "reg_wr"}[g_cl[i].kind], g_cl[i].reg, (unsigned long long)g_cl[i].n);
+#endif
+#ifndef SND_TEST
+    if (g_evlog) fprintf(stderr, "[ev] CATCHUP ticks=%lu extra_calls=%lu; guest start-cmds=%lu stop-cmds=%lu\n", g_sf_ticks, g_sf_extra, st_gstart, st_gstop);
+#endif
+    if (g_evlog) { SndStats ms; snd_get_stats(&ms); fprintf(stderr, "[ev] MIXCOST calls=%llu avg=%u us max=%u us per block of 1024 frames (budget 21333 us at 48 kHz); arm_instr=%llu keyon=%llu keyon_ignored=%llu\n", (unsigned long long)ms.mix_calls, ms.mix_us_avg, ms.mix_us_max, (unsigned long long)ms.arm_instr, (unsigned long long)ms.keyon, (unsigned long long)st_keyon_ignored); }
+    if (g_evlog) for (int ch = 0; ch < 64; ch++) if (chn[ch].active) { fprintf(stderr, "[ev] ACTIVE_AT_EXIT ch%d eg=%d att=%.0f pos=%u", ch, chn[ch].eg, chn[ch].att, chn[ch].pos); for (int r = 0; r < 0x50; r += 4) fprintf(stderr, " %02x:%08x", r, aregs[(ch * 0x80 + r) >> 2]); fputc(10, stderr); } snd_wav_close(); { const char *d = getenv("R2_SND_DUMP"); if (d && *d) { FILE *f = fopen(d, "wb"); if (f) { fwrite(aram, 1, ARAM_SIZE, f); fclose(f); } } } if (TRACE) { for (int i = 0; i < 32; i++) if (g_sh4wr[i]) fprintf(stderr, "[snd] sh4 wrote %llu bytes to aram %06x..\n", (unsigned long long)g_sh4wr[i], i << 16); SndStats s; snd_get_stats(&s); fprintf(stderr, "[snd] ringcmds=%llu samples=%llu arm_instr=%llu idle_skips=%llu keyon=%llu undef=%u active=%d\n", (unsigned long long)s.ringcmds, (unsigned long long)s.samples, (unsigned long long)s.arm_instr, (unsigned long long)s.arm_idle_skips, (unsigned long long)s.keyon, s.undef_instr, s.active_channels); } }
+
+#if !defined(__vita__)
+/* R2_SND_PULL=<wav>: host test of the Vita consumption path. A real-time thread pulls snd_mix(1024) at 44.1 kHz (as the sceAudioOut thread would) and writes
+ * what the player would hear to <wav>; the producer WAV (R2_SND_WAV) is the gapless stream. */
+static FILE *g_pull_wav;
+static void *pull_thread(void *arg) {
+    (void)arg; static int16_t buf[1024 * 2]; unsigned long long blocks = 0; uint64_t wr = 0;
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        snd_mix(buf, 1024); fwrite(buf, 4, 1024, g_pull_wav); wr += 1024; blocks++;
+        if ((blocks & 63) == 0) { fflush(g_pull_wav); rewind(g_pull_wav); uint32_t sz = (uint32_t)(wr * 4); uint8_t h[44] = {'R','I','F','F',0,0,0,0,'W','A','V','E','f','m','t',' ',16,0,0,0,1,0,2,0,0x44,0xAC,0,0,0x10,0xB1,2,0,4,0,16,0,'d','a','t','a'};
+            uint32_t rs = sz + 36; memcpy(h + 4, &rs, 4); memcpy(h + 40, &sz, 4); fwrite(h, 1, 44, g_pull_wav); fseek(g_pull_wav, 0, SEEK_END); }
+        { struct timespec n2; clock_gettime(CLOCK_MONOTONIC, &n2); int64_t el = (int64_t)(n2.tv_sec - t0.tv_sec) * 1000000000ll + (n2.tv_nsec - t0.tv_nsec); int64_t due = (int64_t)(blocks * 1024ull * 1000000000ull / 44100ull); if (due > el) { struct timespec ts = {(time_t)((due - el) / 1000000000ll), (long)((due - el) % 1000000000ll)}; nanosleep(&ts, 0); } }
+    }
+    return 0;
+}
+static void start_pull_test(void) {
+    const char *pw = getenv("R2_SND_PULL"); if (!pw || !*pw || !strcmp(pw, "0")) return;
+    g_pull_wav = fopen(pw, "wb"); if (!g_pull_wav) return;
+    uint8_t h[44] = {0}; fwrite(h, 1, 44, g_pull_wav);
+    pthread_t th; pthread_create(&th, 0, pull_thread, 0); pthread_detach(th);
+}
+#endif
+__attribute__((constructor)) static void snd_ctor(void) {
+    lk_init(); build_tables(); aregs[0x2C00 / 4] = 1;
+    { const char *rl = getenv("R2_SND_RING"); g_ringlog = rl && *rl && *rl != '0'; g_rw_lo[0] = g_rw_lo[1] = 0xFFFFFF; }
+#if !defined(__vita__)
+    { const char *cl = getenv("R2_SND_CALLER"); g_callerlog = cl && *cl && *cl != '0'; }
+#endif
+    { const char *ko = getenv("R2_SND_KEYON_OLD"); g_keyon_old = ko && *ko == '1'; }
+    { const char *vd = getenv("R2_SND_VDUMP"); g_vdump_s = vd ? atoi(vd) : 0; }
+    { const char *e = getenv("R2_SND_EV"); g_evlog = e && *e && *e != '0'; }
+    const char *tr = getenv("R2_SND_TRACE"); g_trace = tr && *tr && *tr != '0';
+    static const uint32_t pfx[3] = {0x00000000u, 0x80000000u, 0xA0000000u};
+    for (int k = 0; k < 3; k++) {
+        hle_mmio_map(pfx[k] | 0x00800000u, pfx[k] | 0x009FFFFFu, sh4_aram_rd, sh4_aram_wr);
+        hle_mmio_map(pfx[k] | 0x00700000u, pfx[k] | 0x00707FFFu, sh4_reg_rd, sh4_reg_wr);
+    }
+    hle_mmio_watch(0xA05F7800u, 0xA05F78FFu, g2_watch); hle_mmio_watch(0x005F7800u, 0x005F78FFu, g2_watch);
+#if !defined(__vita__)
+    const char *w = getenv("R2_SND_WAV");
+    if (!w) w = "build_hle/audio.wav";
+    if (strcmp(w, "0")) snd_wav_open(w);
+    start_pull_test();
+#endif
+#ifndef SND_TEST
+    { const char *e = getenv("R2_STREAM_CATCHUP"); g_sf_on = !(e && *e == '0'); hle_hook(0x8C0625B8, sf_disp); hle_hook(0x8C062F60, sf_feed); hle_hook(0x8C0F06BC, sf_cmd_start); hle_hook(0x8C0F08E4, sf_cmd_stop); hle_hook(0x8C06262C, sf_open); hle_hook(0x8C0628A8, sf_stop); hle_hook(0x8C062960, sf_pause); hle_hook(0x8C0629B0, sf_resume); }
+#endif
+#if !defined(__vita__) && !defined(SND_TEST)
+    { const char *rf = getenv("R2_SND_REC"); if (rf && *rf) { g_rec = fopen(rf, "wb"); if (g_rec) fwrite("SREC0001", 1, 8, g_rec); } }
+#endif
+    atexit(snd_atexit);
+}
