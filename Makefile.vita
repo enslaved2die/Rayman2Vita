@@ -161,7 +161,7 @@ HLE_SRCS        := $(HLE_DIR)/boot.c \
                    $(HLE_DIR)/texmap.c \
                    $(HLE_DIR)/vita_gl_render.c \
                    $(HLE_DIR)/vita_main.c \
-                   $(HLE_DIR)/vmu.c
+                   $(if $(filter 0,$(USE_VMU)),,$(HLE_DIR)/vmu.c)
 HLE_OBJS        := $(patsubst $(HLE_DIR)/%.c,$(BUILD_DIR)/hle_%.o,$(HLE_SRCS))
 
 COMMON_OBJS     := $(BUILD_DIR)/recomp_functab.o \

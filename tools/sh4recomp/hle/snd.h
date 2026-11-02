@@ -67,7 +67,7 @@ typedef struct {
     uint32_t stream_holes, stream_hole_ms_max;   /* >= 0.5 s intervals where the guest streams (state 3, not paused, no fade) but a ring voice is not playing; longest, ms */
     uint32_t stream_note_seq;                    /* incremented when stream_note holds a new hole description (print it once per change) */
     uint32_t keyon_ignored;                      /* KYONB-latch decisions: key-ons of finished, still latched channels that were (correctly) not restarted */
-    char     stream_note[200];
+    char     stream_note[480];
 } SndStats;
 void snd_get_stats(SndStats *s);
 

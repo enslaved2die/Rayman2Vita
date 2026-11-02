@@ -55,5 +55,8 @@ void hle_io_h_gd_abort(SH4Ctx *c);     /* 0x8C0CECB6 int Abort(gd)              
 void hle_io_h_gd_close(SH4Ctx *c);     /* 0x8C0CE6D8 void Close(gd) */
 /* optional: make DirMng init (0x8C0427C0) a no-op. OFF by default: it changes the guest malloc sequence (see report). */
 void hle_io_h_dirmng_init_noop(SH4Ctx *c);
+/* Audio stream trace: resolve a guest FileMng slot to its backing path and cursor. */
+void hle_io_debug_slot(uint32_t slot);
+void hle_io_debug_slot_trace(uint32_t slot);
 
 #endif

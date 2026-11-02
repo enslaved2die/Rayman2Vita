@@ -286,6 +286,42 @@ static GdEnt *gd_lookup(uint32_t h) {
     if (!LD16(h + G_VALID)) return 0;                     /* same validity test as the real getters */
     return &g_gd[i];
 }
+void hle_io_debug_slot(uint32_t slot) {
+    if (!slot || !hle_is_ram(slot) || !hle_is_ram(slot + O_SIZE)) {
+        hle_log("[snd-stream-file] invalid FileMng slot=%08x", slot); return;
+    }
+    uint32_t gd = LD32(slot + O_GD);
+    GdEnt *g = gd_lookup(gd);
+    if (!g || g->reg < 0 || g->reg >= g_nreg) {
+        hle_log("[snd-stream-file] slot=%08x gd=%08x invalid size=%u pos=%u",
+                slot, gd, LD32(slot + O_SIZE), LD32(slot + O_POS));
+        return;
+    }
+    hle_log("[snd-stream-file] slot=%08x gd=%08x path=%s base_sector=%u size=%u pos=%u",
+            slot, gd, g_reg[g->reg].path, g->base,
+            LD32(slot + O_SIZE), LD32(slot + O_POS));
+}
+
+void hle_io_debug_slot_trace(uint32_t slot) {
+    if (!slot || !hle_is_ram(slot) || !hle_is_ram(slot + O_SIZE)) {
+        hle_log("[prison-trace] file-slot invalid=%08x", slot); return;
+    }
+    uint32_t gd = LD32(slot + O_GD);
+    GdEnt *g = gd_lookup(gd);
+    if (!g || g->reg < 0 || g->reg >= g_nreg) {
+        hle_log("[prison-trace] file-slot=%08x gd=%08x unresolved size=%u pos=%u",
+                slot, gd, LD32(slot + O_SIZE), LD32(slot + O_POS)); return;
+    }
+    const char *member = "(unresolved)";
+    for (int i = 1; i < g_nidx; i++) {
+        INode *n = &g_idx[i];
+        if (n->dcz < 0 || n->dcz_lba != g->base) continue;
+        char container[1024]; idx_hostpath(n->dcz, container, sizeof container);
+        if (!strcasecmp(container, g_reg[g->reg].path)) { member = n->name; break; }
+    }
+    hle_log("[prison-trace] file-slot=%08x path=%s base_sector=%u member=%s size=%u pos=%u",
+            slot, g_reg[g->reg].path, g->base, member, LD32(slot + O_SIZE), LD32(slot + O_POS));
+}
 /* fad = disc fad (lba + 150); nsect = range length. Returns fake gd handle address or 0. */
 static uint32_t gd_open_range(uint32_t fad, int32_t nsect) {
     if (fad < FAD_BIAS) return 0;
@@ -357,6 +393,17 @@ void hle_io_h_open(SH4Ctx *c) {
     if (!base) size = reg_size(host);                     /* plain file: authoritative size from the index; DCZ member: size from its header */
     int id = reg_find(host, size);
     uint32_t gd = id < 0 ? 0 : gd_open_range((((uint32_t)(id + 1) << LBA_SHIFT) + base) + FAD_BIAS, (int32_t)((size + 2047) >> 11));
+    if (name && (!strcasecmp(name, "JailMus.wav") || !strcasecmp(name, "FO25.wav"))) {
+        char chain[512] = ""; size_t used = 0;
+        for (unsigned off = 0; off <= 0x200 && used + 24 < sizeof chain; off += 4) {
+            uint32_t a = R(15) + off;
+            if (!hle_is_ram(a) || !hle_is_ram(a + 3)) break;
+            uint32_t v = LD32(a);
+            if (v >= 0x8c010000u && v < 0x8c100000u)
+                used += (size_t)snprintf(chain + used, sizeof chain - used, " %03x:%08x", off, v);
+        }
+        hle_log("[music-open-caller] name=%s wrapper_pr=%08x stack=%s", name, c->pr, chain);
+    }
     put32(slot + O_GD, gd);
     put32(slot + O_SIZE, size);
     put32(slot + O_CACHELEN, SECTOR);

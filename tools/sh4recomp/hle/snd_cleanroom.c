@@ -24,6 +24,7 @@
 
 #include "hle.h"
 #include "hle_priv.h"
+#include "io.h"
 #include "snd.h"
 #include "../../include/snd_vita.h"
 
@@ -80,6 +81,13 @@ static uint64_t     s_stat_pan_updates = 0;
 static uint64_t     s_stat_status_polls = 0;
 static uint64_t     s_stat_stream_ticks = 0;
 static uint64_t     s_stat_stream_feeds = 0;
+static uint32_t     s_dbg_open = 0, s_dbg_chunk = 0, s_dbg_chunk_fed = 0, s_dbg_room = 0, s_dbg_getpos = 0, s_dbg_create = 0, s_dbg_close = 0;
+static uint32_t     s_dbg_last_len = 0, s_dbg_last_src = 0, s_dbg_last_fmt = 0;
+static uint32_t     s_dbg_close_pr = 0;
+static uint32_t     s_dbg_getpos_last = 0;
+static uint32_t     s_dbg_stream_id = 0;
+static uint32_t     s_dbg_stream_bytes = 0;
+static uint32_t     s_dbg_stream_chunk_idx = 0;
 
 /* Weak fallbacks for cleanroom API if compiled in standalone mode */
 #if !defined(__vita__)
@@ -404,20 +412,88 @@ static void hle_sdGetPos(SH4Ctx *c) {
  * ---------------------------------------------------------------------------- */
 #define STREAM_CTX_ADDR 0x8C2D4968u
 
+/* Extra Prison investigation trace; disabled unless explicitly enabled. */
+static int hle_prison_trace_enabled(void) {
+    const char *value = getenv("R2_PRISON_TRACE");
+    return value && value[0] && value[0] != '0';
+}
+
+static void hle_prison_dump_resource(uint32_t resource) {
+    /* Validate the whole descriptor before reading any words; descriptor is
+     * guest supplied and calls to the dispatcher are frequent. */
+    if (!resource || !hle_is_ram(resource) ||
+        (uint64_t)(resource & 0x00FFFFFFu) + 0x50u > SH4_RAM_SIZE) {
+        LOG_INFO("prison_resource ptr=%08x invalid_span=0x50", resource);
+        return;
+    }
+    LOG_INFO("prison_resource ptr=%08x words_00_4c=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+             resource,
+             LD32(resource + 0x00), LD32(resource + 0x04), LD32(resource + 0x08), LD32(resource + 0x0C),
+             LD32(resource + 0x10), LD32(resource + 0x14), LD32(resource + 0x18), LD32(resource + 0x1C),
+             LD32(resource + 0x20), LD32(resource + 0x24), LD32(resource + 0x28), LD32(resource + 0x2C),
+             LD32(resource + 0x30), LD32(resource + 0x34), LD32(resource + 0x38), LD32(resource + 0x3C),
+             LD32(resource + 0x40), LD32(resource + 0x44), LD32(resource + 0x48), LD32(resource + 0x4C));
+}
+
+static void hle_prison_dispatch(SH4Ctx *c) {
+    if (hle_prison_trace_enabled()) {
+        LOG_INFO("prison_dispatch f_8c060704 r4=%08x r5=%08x r6=%08x r7=%08x pr=%08x",
+                 c->r[4], c->r[5], c->r[6], c->r[7], c->pr);
+        hle_prison_dump_resource(c->r[4]);
+    }
+    hle_orig(c, 0x8C060704);
+}
+
+/* Game-level stream request (0x8C060D44). Log the sound definition and event
+ * before the original dispatcher chooses/opens a stream. */
+static void hle_game_stream_request(SH4Ctx *c) {
+    LOG_INFO("game_stream_request r4=%08x r5=%08x r6=%08x r7=%08x pr=%08x",
+             c->r[4], c->r[5], c->r[6], c->r[7], c->pr);
+    hle_orig(c, 0x8C060D44);
+}
+
+static uint32_t hle_stream_word(uint32_t base, uint32_t off) {
+    uint32_t addr = base + off;
+    return hle_is_ram(addr) ? LD32(addr) : 0xFFFFFFFFu;
+}
+
 /* Stream Open (0x8C06262C): initializes stream state and opens audio container */
 static void hle_stream_open(SH4Ctx *c) {
+    uint32_t caller_pr = c->pr;
+    uint32_t resource = c->r[4];
+    s_dbg_open++;
+    s_dbg_stream_id++;
+    s_dbg_stream_bytes = 0;
+    s_dbg_stream_chunk_idx = 0;
     if (LD32(STREAM_CTX_ADDR) != 0) {
         LOG_WARN("stream_open (0x8C06262C): stream busy (state=%u), resetting", LD32(STREAM_CTX_ADDR));
         SND_Vita_ClearStream();
         SND_Vita_StopMusic();
         ST32(STREAM_CTX_ADDR, 0);
     }
-    hle_orig(c, 0x8C06262C);
     SND_Vita_ClearStream();
+    if (hle_prison_trace_enabled()) {
+        /* Guest f_8c096eea tests resource+0x28 before calling this opener;
+         * guest f_8c06262c stores incoming r6/r7 as stream end_cb/end_arg. */
+        LOG_INFO("prison_stream_open caller=%08x r4=%08x r5=%08x r6=%08x r7=%08x resource_gate_28=%08x",
+                 caller_pr, c->r[4], c->r[5], c->r[6], c->r[7], hle_stream_word(resource, 0x28));
+    }
+    hle_orig(c, 0x8C06262C);
     uint8_t vol_byte = LD8(STREAM_CTX_ADDR + 0x54);
     float vol = (vol_byte <= 100) ? ((float)vol_byte / 100.0f) : 1.0f;
     SND_Vita_SetBGMVolume(vol);
-    LOG_INFO("stream_open (0x8C06262C): initial BGM volume: %.2f", vol);
+    if (hle_prison_trace_enabled()) {
+        LOG_INFO("prison_stream_state end_cb=%08x end_arg=%08x remaining=%u eof_pos=%u fmt=%u channels=%u",
+                 LD32(STREAM_CTX_ADDR + 0x6C), LD32(STREAM_CTX_ADDR + 0x70),
+                 LD32(STREAM_CTX_ADDR + 0x0C), LD32(STREAM_CTX_ADDR + 0x14),
+                 LD32(STREAM_CTX_ADDR + 0x1C), LD32(STREAM_CTX_ADDR + 0x18));
+        hle_io_debug_slot_trace(LD32(STREAM_CTX_ADDR + 0x28));
+    } else {
+        LOG_INFO("stream_open (0x8C06262C): volume=%.2f remaining=%u eof_pos=%u fmt=%u channels=%u",
+                 vol, LD32(STREAM_CTX_ADDR + 0x0C), LD32(STREAM_CTX_ADDR + 0x14),
+                 LD32(STREAM_CTX_ADDR + 0x1C), LD32(STREAM_CTX_ADDR + 0x18));
+        hle_io_debug_slot(LD32(STREAM_CTX_ADDR + 0x28));
+    }
 }
 
 /* Stream Stop (0x8C0628A8): stops streaming BGM and invokes end callback */
@@ -467,6 +543,15 @@ static void hle_sdStreamTransferChunk(SH4Ctx *c) {
     uint32_t byte_len = desc_ptr ? LD32(desc_ptr + 12) : 0;
 
     uint32_t fmt = LD32(STREAM_CTX_ADDR + 0x1C);
+    s_dbg_chunk++; s_dbg_last_len = byte_len; s_dbg_last_src = src_addr; s_dbg_last_fmt = fmt;
+    s_dbg_stream_chunk_idx++;
+    s_dbg_stream_bytes += byte_len;
+    if (s_dbg_stream_chunk_idx <= 16 || (s_dbg_stream_chunk_idx % 32) == 0) {
+        LOG_INFO("stream_chunk id=%u n=%u fmt=%u ch=%u bytes=%u total=%u src=%08x state=%u remaining=%u eof=%u",
+                 s_dbg_stream_id, s_dbg_stream_chunk_idx, fmt, ch, byte_len,
+                 s_dbg_stream_bytes, src_addr, LD32(STREAM_CTX_ADDR),
+                 LD32(STREAM_CTX_ADDR + 0x0C), LD32(STREAM_CTX_ADDR + 0x14));
+    }
     uint32_t sample_rate = 22050;
     uint32_t sound_def = LD32(STREAM_CTX_ADDR + 0x24);
     if (sound_def) {
@@ -477,6 +562,7 @@ static void hle_sdStreamTransferChunk(SH4Ctx *c) {
     }
 
     if (src_addr && byte_len > 0 && byte_len <= 8192) {
+        s_dbg_chunk_fed++;
         SND_Vita_FeedStreamChunk((int)ch, (const uint8_t *)hle_ptr(src_addr), byte_len, (int)fmt, sample_rate);
         uint32_t channels = LD32(STREAM_CTX_ADDR + 0x18);
         if (channels == 1 && ch == 0) {
@@ -493,8 +579,15 @@ static void hle_sdStreamTransferChunk(SH4Ctx *c) {
     c->r[0] = 0;
 }
 
+/* sdStreamCommand (0x8C0E2FEC): cleanroom has no AICA command transport; accept the
+ * guest's per-channel stream command so it can proceed to the chunk transfer hook. */
+static void hle_sdStreamCommand(SH4Ctx *c) {
+    c->r[0] = 0;
+}
+
 /* sdStreamCreate (0x8C0E2E84): allocates and initializes a stream handle */
 static void hle_sdStreamCreate(SH4Ctx *c) {
+    s_dbg_create++;
     uint32_t out_handle_ptr = c->r[4];
     hle_orig(c, 0x8C0E2E84);
     if (out_handle_ptr) {
@@ -513,18 +606,25 @@ static void hle_sdStreamCreate(SH4Ctx *c) {
 
 /* sdStreamClose (0x8C0E2C70): closes stream and frees handle */
 static void hle_sdStreamClose(SH4Ctx *c) {
+    s_dbg_close++;
+    s_dbg_close_pr = c->pr;
+    LOG_INFO("sdStreamClose: id=%u bytes=%u caller=%08x state=%u threshold=%u remaining=%u consumed=%u queued=%u handle=%08x",
+             s_dbg_stream_id, s_dbg_stream_bytes, c->pr, LD32(STREAM_CTX_ADDR), LD32(STREAM_CTX_ADDR + 0x14),
+             LD32(STREAM_CTX_ADDR + 0x0C), SND_Vita_GetStreamConsumedFrames(),
+             SND_Vita_GetStreamQueuedFrames(), c->r[4]);
     uint32_t handle = c->r[4];
     if (handle) {
         ST32(handle + 4, 0);
         ST32(handle + 0x14, 0);
         ST32(handle + 0x18, 0);
     }
-    SND_Vita_ClearStream();
+    /* Closing the guest stream handle must not discard audio already queued for playback. */
     c->r[0] = 0;
 }
 
 /* sdStreamCheckRoom (0x8C0E2D50): checks available space in stream ring buffer */
 static void hle_sdStreamCheckRoom(SH4Ctx *c) {
+    s_dbg_room++;
     uint32_t out_room_ptr = c->r[7];
 
     if (out_room_ptr) {
@@ -541,6 +641,7 @@ static void hle_sdStreamCheckRoom(SH4Ctx *c) {
 
 /* sdStreamGetPos (0x8C0E2CC0): returns playback position for stream EOF detection */
 static void hle_sdStreamGetPos(SH4Ctx *c) {
+    s_dbg_getpos++;
     uint32_t out_pos_ptr = c->r[6];
 
     if (out_pos_ptr) {
@@ -548,11 +649,19 @@ static void hle_sdStreamGetPos(SH4Ctx *c) {
         uint32_t consumed = SND_Vita_GetStreamConsumedFrames();
         uint32_t queued = SND_Vita_GetStreamQueuedFrames();
 
-        uint32_t pos = consumed;
+        /* ctx[5] is zero for the normal looping music streams. Do not expose the
+         * Vita frame counter as an EOF position when the guest has no end threshold. */
+        uint32_t pos = 0;
         if (threshold > 0) {
+            pos = consumed;
             if (consumed >= threshold || (queued == 0 && LD32(STREAM_CTX_ADDR) == 5)) {
                 pos = threshold + 1;
             }
+        }
+        if (s_dbg_getpos <= 12 || (s_dbg_getpos % 64) == 0 || pos > threshold) {
+            LOG_INFO("sdStreamGetPos #%u: state=%u pos=%u threshold=%u consumed=%u queued=%u remaining=%u out=%08x",
+                     s_dbg_getpos, LD32(STREAM_CTX_ADDR), pos, threshold, consumed,
+                     queued, LD32(STREAM_CTX_ADDR + 0x0C), out_pos_ptr);
         }
         ST32(out_pos_ptr, pos);
     }
@@ -567,8 +676,8 @@ static void hle_stream_tick(SH4Ctx *c) {
 
     for (int i = 0; i < 8; i++) {
         uint32_t st = LD32(STREAM_CTX_ADDR);
-        if (st == 0) {
-            break;
+        if (st == 0 && i > 0) {
+            break;   /* idle: run the game's own tick once (it drives state 0 -> open), but never catch up */
         }
         uint32_t prev_q = SND_Vita_GetStreamQueuedFrames();
         if (st == 3 && prev_q >= 8192) {
@@ -625,6 +734,8 @@ __attribute__((constructor)) static void snd_cleanroom_register_hooks(void) {
     hle_hook(0x8C0F05F4, hle_sdGetPos);
 
     /* 5. Audio Streaming Hooks */
+    hle_hook(0x8C060D44, hle_game_stream_request);
+    if (hle_prison_trace_enabled()) hle_hook(0x8C060704, hle_prison_dispatch);
     hle_hook(0x8C06262C, hle_stream_open);
     hle_hook(0x8C0628A8, hle_stream_stop);
     hle_hook(0x8C062960, hle_stream_pause);
@@ -633,6 +744,7 @@ __attribute__((constructor)) static void snd_cleanroom_register_hooks(void) {
     hle_hook(0x8C0625B8, hle_stream_tick);
     hle_hook(0x8C062F60, hle_stream_feed);
     hle_hook(0x8C0E3404, hle_sdStreamTransferChunk);
+    hle_hook(0x8C0E2FEC, hle_sdStreamCommand);
     hle_hook(0x8C0E2D50, hle_sdStreamCheckRoom);
     hle_hook(0x8C0E2CC0, hle_sdStreamGetPos);
     hle_hook(0x8C0E2E84, hle_sdStreamCreate);
@@ -685,12 +797,21 @@ void snd_get_stats(SndStats *s) {
     s->stream_stop   = 0;
     s->stream_pause  = 0;
     s->stream_resume = 0;
+    static uint32_t s_note_seq = 0;
+    s->stream_note_seq = ++s_note_seq;   /* new note every call so the 5 s audio log always prints it */
     snprintf(s->stream_note, sizeof(s->stream_note),
-             "cleanroom: starts=%llu stops=%llu polls=%llu ticks=%llu",
+             "cleanroom: starts=%llu stops=%llu polls=%llu ticks=%llu stream_feeds=%llu queued=%u consumed=%u free=%u ctx_state=%u open=%u create=%u close=%u close_pr=%08x room=%u getpos=%u chunk=%u fed=%u last_len=%u last_src=%08x last_fmt=%u ctx_fmt=%u ctx_rate_def=%08x",
              (unsigned long long)s_stat_starts,
              (unsigned long long)s_stat_stops,
              (unsigned long long)s_stat_status_polls,
-             (unsigned long long)s_stat_stream_ticks);
+             (unsigned long long)s_stat_stream_ticks,
+             (unsigned long long)s_stat_stream_feeds,
+             (unsigned)SND_Vita_GetStreamQueuedFrames(),
+             (unsigned)SND_Vita_GetStreamConsumedFrames(),
+             (unsigned)SND_Vita_GetStreamFreeFrames(),
+             (unsigned)LD32(STREAM_CTX_ADDR),
+             s_dbg_open, s_dbg_create, s_dbg_close, s_dbg_close_pr, s_dbg_room, s_dbg_getpos, s_dbg_chunk, s_dbg_chunk_fed,
+             s_dbg_last_len, s_dbg_last_src, s_dbg_last_fmt, (unsigned)LD32(STREAM_CTX_ADDR + 0x1C), (unsigned)LD32(STREAM_CTX_ADDR + 0x24));
 }
 
 int snd_wav_open(const char *path) { (void)path; return 0; }
@@ -712,3 +833,40 @@ void snd_test_dma_to_aram(uint32_t a, const void *p, uint32_t len) { (void)a; (v
 uint64_t snd_test_samples(void) { return 0; }
 void snd_test_set_pull(int on) { (void)on; }
 void snd_test_arm_reset(int run) { (void)run; }
+
+#if !defined(__vita__)
+/* Host test: R2_SND_PULL=<wav> starts a real-time thread that pulls snd_mix(1024) at 48 kHz (as the Vita sceAudioOut thread does)
+ * and writes what a player would hear to <wav>.  Without it the host harness has no consumer and the stream ring never drains. */
+#include <pthread.h>
+#include <time.h>
+static FILE *s_pull_wav;
+static void *cleanroom_pull_thread(void *arg) {
+    (void)arg;
+    static int16_t buf[1024 * 2];
+    unsigned long long blocks = 0, wr = 0;
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        snd_mix(buf, 1024);
+        fwrite(buf, 4, 1024, s_pull_wav); wr += 1024; blocks++;
+        if ((blocks & 63) == 0) {
+            fflush(s_pull_wav); rewind(s_pull_wav);
+            uint32_t sz = (uint32_t)(wr * 4), rs = sz + 36;
+            uint8_t h[44] = {'R','I','F','F',0,0,0,0,'W','A','V','E','f','m','t',' ',16,0,0,0,1,0,2,0,0x80,0xBB,0,0,0x00,0xEE,2,0,4,0,16,0,'d','a','t','a'};
+            memcpy(h + 4, &rs, 4); memcpy(h + 40, &sz, 4);
+            fwrite(h, 1, 44, s_pull_wav); fseek(s_pull_wav, 0, SEEK_END);
+        }
+        struct timespec n2; clock_gettime(CLOCK_MONOTONIC, &n2);
+        int64_t el  = (int64_t)(n2.tv_sec - t0.tv_sec) * 1000000000ll + (n2.tv_nsec - t0.tv_nsec);
+        int64_t due = (int64_t)(blocks * 1024ull * 1000000000ull / 48000ull);
+        if (due > el) { struct timespec ts = {(time_t)((due - el) / 1000000000ll), (long)((due - el) % 1000000000ll)}; nanosleep(&ts, 0); }
+    }
+    return 0;
+}
+__attribute__((constructor)) static void cleanroom_start_pull_test(void) {
+    const char *pw = getenv("R2_SND_PULL");
+    if (!pw || !*pw || !strcmp(pw, "0")) return;
+    s_pull_wav = fopen(pw, "wb"); if (!s_pull_wav) return;
+    uint8_t h[44] = {0}; fwrite(h, 1, 44, s_pull_wav);
+    pthread_t th; pthread_create(&th, 0, cleanroom_pull_thread, 0); pthread_detach(th);
+}
+#endif

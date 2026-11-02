@@ -65,8 +65,11 @@
 8c0dcf40  # Kamui ASIC ISR
 8c0f1420
 8c0e3404  # sdStreamTransferChunk
+8c0e2fec  # sdStreamCommand
 8c0e2d50  # sdStreamCheckRoom
 8c0e2cc0  # sdStreamGetPos
 8c0e2e84  # sdStreamCreate
 8c0e2c70  # sdStreamClose
+8c060d44  # game-level stream request diagnostic
+8c060704  # generic resource dispatcher (Prison stream source trace)
 
