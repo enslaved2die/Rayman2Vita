@@ -10,6 +10,7 @@ uint32_t sh4_io_read(uint32_t a, int s) { (void)s; fprintf(stderr, "UNMAPPED rea
 void sh4_io_write(uint32_t a, int s, uint32_t v) { (void)s; (void)v; fprintf(stderr, "UNMAPPED write %08x\n", a); abort(); }
 int hle_verbose = 0;
 void hle_log(const char *f, ...) { (void)f; }
+void hle_orig(SH4Ctx *c, uint32_t a) { (void)c; (void)a; }
 #define MAXH 8
 static struct { uint32_t a; hle_fn f; } hooks[MAXH]; static int nh;
 void hle_hook(uint32_t a, hle_fn f) { hooks[nh].a = a; hooks[nh].f = f; nh++; }
@@ -24,7 +25,7 @@ static void call(uint32_t a) { memset(&C, 0, sizeof C); C.r[4] = ARG4; H(a)(&C);
 
 int main(void) {
     nh = 0; memset(sh4_ram, 0, sizeof sh4_ram);
-    hle_pad_init(); CHECK(nh == 2);
+    hle_pad_init(); CHECK(nh == 3);
     ST32(0x8C0F3030, 1);                       /* image data flag */
     ST32(0x8C0F3034, 0x6F6E2800);              /* "(no device)" marker is only compared by address */
     ST32(0x8C2F09FC, 0x8C300000);
@@ -92,6 +93,23 @@ int main(void) {
 
     /* poll is a no-op when the image flag is cleared */
     ST32(0x8C0F3030, 0); ST32(REC(0) + 8, 0x1234); POLL(); CHECK(LD32(REC(0) + 8) == 0x1234);
+
+    /* menu navigation test (0x8C088180): D-Pad directions mapped into direction word */
+    uint32_t fake_rec = 0x8C005000u;
+    ST32(fake_rec, 0);
+    ST32(fake_rec + 4, PAD_UP | PAD_LEFT);
+    memset(&C, 0, sizeof C);
+    C.r[5] = fake_rec;
+    H(0x8C088180)(&C);
+    CHECK(LD32(fake_rec) == (0x1u | 0x4u)); /* Left (1) | Up (4) */
+
+    ST32(fake_rec, 0);
+    ST32(fake_rec + 4, PAD_DOWN | PAD_RIGHT);
+    memset(&C, 0, sizeof C);
+    C.r[5] = fake_rec;
+    H(0x8C088180)(&C);
+    CHECK(LD32(fake_rec) == (0x2u | 0x8u)); /* Right (2) | Down (8) */
+
     printf("%d checks, %d failures\n", checks, fails);
     return fails != 0;
 }

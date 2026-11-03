@@ -188,6 +188,11 @@ DC_IMAGE        := assets/dc/1ST_READ.BIN
 
 all: $(VPK)
 
+vpk: $(VPK)
+elf: $(ELF)
+velf: $(VELF)
+eboot: $(EBOOT)
+
 stubs: $(BUILD_DIR)/rename.sed $(BUILD_DIR)/hook_stubs.c
 
 $(BUILD_DIR):

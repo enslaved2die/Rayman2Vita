@@ -41,4 +41,5 @@ void pad_get_state(uint32_t *buttons, PadAnalog *analog);
 /* exported for the unit test */
 void hle_pad_h_init(SH4Ctx *c);
 void hle_pad_h_poll(SH4Ctx *c);
+void hle_pad_h_menu_nav(SH4Ctx *c);
 #endif

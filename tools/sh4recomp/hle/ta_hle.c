@@ -38,7 +38,7 @@ unsigned long hle_ta_frame_no(void) { return ta_frames; }
  *   2D: SQ = 0.7556 (patched, exact);  3D: tan(K3*t0) = tan(t0)/0.7556  ->  K3 = 1.2282 (patched; the shipped 1.2/0.8333 pair leaves 3D 3.3% too wide and 2D 10% too wide on 16:9).
  * Controls: env R2_WIDE=0 starts in 4:3 (default 1), R2_WIDE_K3 / R2_WIDE_SQ override the two factors (1.2 / 0.8333 = shipped), hle_ta_wide_set() flips at run time. */
 static int wide_pref = 1, wide_last = -1, wide_patched;
-static float wide_k = 1.2282f, wide_sq = 0.755556f;
+static float wide_k = 1.3436f, wide_sq = 0.755556f;
 #define WIDE_FLAG_ADDR   0x8C0C52DCu
 #define WIDE_OPTION_ADDR 0x8C2D0F44u
 #define WIDE_POOL_K      0x8C0370ECu      /* float 1.2    (3D horizontal FOV angle factor) */
@@ -59,9 +59,19 @@ static void wide_tick(void) {
         else hle_log("[ta] wide: constant pool not as expected (%08x %08x), k left unpatched", a, b);
     }
     uint8_t *flag = hle_ptr(WIDE_FLAG_ADDR);
-    if (wide_pref != wide_last || (wide_pref && *flag != 1)) {
-        wide_last = wide_pref; *flag = (uint8_t)wide_pref;
-        uint32_t o = (uint32_t)wide_pref; memcpy(hle_ptr(WIDE_OPTION_ADDR), &o, 4);
+    uint32_t opt = 0;
+    memcpy(&opt, hle_ptr(WIDE_OPTION_ADDR), 4);
+    if (wide_last < 0) {
+        wide_last = wide_pref;
+        *flag = (uint8_t)wide_pref;
+        uint32_t o = (uint32_t)wide_pref;
+        memcpy(hle_ptr(WIDE_OPTION_ADDR), &o, 4);
+    } else if (opt != (uint32_t)wide_last) {
+        /* Sync with option menu setting */
+        wide_last = opt ? 1 : 0;
+        wide_pref = wide_last;
+        *flag = (uint8_t)wide_last;
+        hle_log("[ta] wide: synced with options menu -> %s", wide_pref ? "16:9" : "4:3");
     }
 }
 

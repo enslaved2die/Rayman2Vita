@@ -114,8 +114,31 @@ void hle_pad_h_poll(SH4Ctx *c) {
     R(0) = 0;
 }
 
+/* FUN_8c088180: Menu directional input evaluation.
+ * Original evaluates analog stick joyX/joyY and writes 4-way direction bits:
+ *   bit 0 (0x1) = Left
+ *   bit 1 (0x2) = Right
+ *   bit 2 (0x4) = Up
+ *   bit 3 (0x8) = Down
+ * into *R(5).
+ * We hook this to also check digital D-Pad buttons from the record's digital button word at R(5)+4.
+ * This enables D-Pad navigation across all menus (including the Pause Menu)
+ * without altering analog stick values or affecting the D-Pad during gameplay. */
+void hle_pad_h_menu_nav(SH4Ctx *c) {
+    hle_orig(c, 0x8C088180);
+    uint32_t r5 = c->r[5];
+    uint32_t buttons = LD32(r5 + 4);
+    uint32_t dir = LD32(r5);
+    if (buttons & PAD_LEFT)  dir |= 0x1u;
+    if (buttons & PAD_RIGHT) dir |= 0x2u;
+    if (buttons & PAD_UP)    dir |= 0x4u;
+    if (buttons & PAD_DOWN)  dir |= 0x8u;
+    ST32(r5, dir);
+}
+
 void hle_pad_init(void) {
     hle_hook(0x8C0CF158, hle_pad_h_init);
     hle_hook(0x8C0CF54E, hle_pad_h_poll);
-    hle_log("[pad] hooks: pdInit 0x8C0CF158, pdPoll 0x8C0CF54E");
+    hle_hook(0x8C088180, hle_pad_h_menu_nav);
+    hle_log("[pad] hooks: pdInit 0x8C0CF158, pdPoll 0x8C0CF54E, menuNav 0x8C088180");
 }

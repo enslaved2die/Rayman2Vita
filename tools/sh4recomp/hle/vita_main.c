@@ -135,10 +135,6 @@ static void vita_update_input(void) {
     int count = sceCtrlPeekBufferPositive(0, &pad, 1);
     if (count <= 0) return;
 
-    { static unsigned prev_sel; unsigned sel = pad.buttons & SCE_CTRL_SELECT;
-      if (sel && !prev_sel) { hle_ta_wide_set(!hle_ta_wide_pref()); vita_log("[vita] 16:9 mode %s", hle_ta_wide_pref() ? "on" : "off (4:3)"); }
-      prev_sel = sel; }
-
     uint32_t dc_buttons = 0;
     if (pad.buttons & SCE_CTRL_CROSS)    dc_buttons |= PAD_A;
     if (pad.buttons & SCE_CTRL_CIRCLE)   dc_buttons |= PAD_B;

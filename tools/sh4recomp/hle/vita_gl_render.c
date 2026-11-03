@@ -188,7 +188,8 @@ static uint32_t *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph)
     TaTexEnv env = { pr + 0x400, PVR_REG(0x005F8108u), PVR_REG(0x005F80E4u) };   /* palette RAM, PAL_RAM_CTRL, TEXT_CONTROL */
     int fmt = (int)((tcw >> 27) & 7);
     if (!(fmt == 5 || fmt == 6)) env.pal = NULL;
-    ta_tex_decode(vram, 8u << 20, tcw, tsp, &env, 0, (int)((tsp >> 19) & 1), px);
+    int force_op = (fmt == 0) ? 0 : (int)((tsp >> 19) & 1);
+    ta_tex_decode(vram, 8u << 20, tcw, tsp, &env, 0, force_op, px);
     *pw = w; *ph = h;
     return px;
 }
@@ -569,7 +570,18 @@ static void vita_gl_render_frame_impl(RenderJob *job)
         s_fv = (TaClipVertex *)malloc(s_cv_cap * sizeof(TaClipVertex));
         if (!s_cv || !s_fv) { free(s_cv); free(s_fv); s_cv = s_fv = NULL; s_cv_cap = 0; return; }
     }
-    float cut = ta_gl_depth_cut(&gl);
+    static float s_stable_cut = 0.0f;
+    float raw_cut = ta_gl_depth_cut(&gl);
+    float cut;
+    if (s_stable_cut <= 0.0f || fabsf(raw_cut - s_stable_cut) > s_stable_cut * 0.8f) {
+        cut = s_stable_cut = raw_cut;
+    } else {
+        float max_d = s_stable_cut * 0.04f;
+        if (raw_cut > s_stable_cut + max_d) s_stable_cut += max_d;
+        else if (raw_cut < s_stable_cut - max_d) s_stable_cut -= max_d;
+        else s_stable_cut = raw_cut;
+        cut = s_stable_cut;
+    }
     ta_gl_make_clip(gl.verts, gl.nverts, cut, s_cv);
     s_ph.build = r2_now_us();
 #if R2_PERF
@@ -664,9 +676,11 @@ static void vita_gl_render_frame_impl(RenderJob *job)
         const int sorted = list_id == TA_L_TRANS && trans_sorted;
         if (sorted) {
             for (uint32_t b = 0; b < n_ord; b++) {
-                const TaBatch *bt = &gl.batches[first_b + b]; float zm = 1e30f;
-                for (uint32_t i = 0; i < bt->count; i++) if (gl.verts[bt->first + i].z < zm) zm = gl.verts[bt->first + i].z;
-                s_key[b] = zm; s_ord[b] = b;
+                const TaBatch *bt = &gl.batches[first_b + b];
+                float sum_z = 0.0f;
+                for (uint32_t i = 0; i < bt->count; i++) sum_z += gl.verts[bt->first + i].z;
+                s_key[b] = bt->count ? (sum_z / (float)bt->count) : 0.0f;
+                s_ord[b] = b;
             }
             for (uint32_t i = 1; i < n_ord; i++) { uint32_t o = s_ord[i]; float k = s_key[o]; uint32_t j = i; while (j > 0 && s_key[s_ord[j - 1]] > k) { s_ord[j] = s_ord[j - 1]; j--; } s_ord[j] = o; }   /* stable insertion sort */
         }
@@ -684,21 +698,32 @@ static void vita_gl_render_frame_impl(RenderJob *job)
 
             gc_depth_test(1);
             gc_depth_func(s_gl_depth_funcs[st->depth_mode & 7]);
-            gc_depth_mask(!(st->z_write_disable || list_id == TA_L_TRANS));
+            int is_cutout_trans = (list_id == TA_L_TRANS && st->textured && st->pixel_format == 0);
+            gc_depth_mask(!st->z_write_disable && (list_id != TA_L_TRANS || is_cutout_trans));
             if (dbg && bi < 8) { const TaGlVertex *v0 = &gl.verts[batch->first]; gl_logf("[vita]     tcw=%08x tsp=%08x shade=%d tex=%d v0 col=%.2f,%.2f,%.2f,%.2f v1 col=%.2f,%.2f,%.2f,%.2f", (unsigned)st->tcw, (unsigned)st->tsp, st->shading, st->textured, v0[0].r, v0[0].g, v0[0].b, v0[0].a, v0[1].r, v0[1].g, v0[1].b, v0[1].a); }
             if (dbg && bi < 8) gl_logf("[vita]   trans b=%u cnt=%u depth_mode=%d zwd=%d mask=%d func=%d", b, batch->count, st->depth_mode, st->z_write_disable, (st->z_write_disable || list_id == TA_L_TRANS) ? 0 : 1, (int)s_gl_depth_funcs[st->depth_mode & 7]);
 
             if (list_id == TA_L_TRANS) {
                 gc_blend(1);
                 gc_blend_func(src_factor(st->src_blend, st->use_alpha), dst_factor(st->dst_blend, st->use_alpha));
-                gc_alpha_test(0);
+                if (is_cutout_trans) {
+                    gc_alpha_test(1);
+                    gc_alpha_ref(128);
+                } else {
+                    gc_alpha_test(0);
+                }
             } else if (list_id == TA_L_PUNCH) {
                 gc_blend(0);
                 gc_alpha_test(1);
                 gc_alpha_ref((int)(pt_ref ? pt_ref : 1));
-            } else {                                  /* opaque: texture/vertex alpha ignored */
+            } else {                                  /* opaque: texture/vertex alpha ignored except ARGB1555 cutouts */
                 gc_blend(0);
-                gc_alpha_test(0);
+                if (st->textured && st->pixel_format == 0) {
+                    gc_alpha_test(1);
+                    gc_alpha_ref(128);
+                } else {
+                    gc_alpha_test(0);
+                }
             }
 
             if (have_shadow) {                            /* receivers mark stencil bit 7 where they are the visible surface; state is only touched on change */

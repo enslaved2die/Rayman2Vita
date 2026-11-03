@@ -92,7 +92,6 @@ static Chan chn[64];
 static uint64_t g_amask;           /* bit ch set <=> chn[ch].active (kept in step at the three places that change it): render_sample walks only the set bits */
 static uint8_t g_keyed[64];       /* latched KYONB per channel (see keyonex) */
 static uint8_t g_dirty[64];       /* channel registers written since the last key-on (diagnostic) */
-static uint64_t st_restart_stale;
 
 /* ---------------------------------------------------------------------------------------------------------------- ARM7 */
 typedef struct {
@@ -154,7 +153,7 @@ SND_INL void ram_wr(uint32_t a, int sz, uint32_t v) {
 }
 
 static void update_fiq_level(void);
-static void keyonex(void);
+static void keyonex(int trig_ch);
 static uint32_t reg_read(uint32_t off, int sz, int from_arm);
 static void reg_write(uint32_t off, int sz, uint32_t v, int from_arm);
 
@@ -232,7 +231,7 @@ static void reg_write(uint32_t off, int sz, uint32_t v, int from_arm) {
     aregs[wo >> 2] = nw;
     if (wo < 0x2000 && (wo & 0x7C) != 0) g_dirty[wo >> 7] = 1;
     if (wo < 0x2000 && (wo & 0x7F) == 0) { if ((cur ^ nw) & ~0x8000u) g_dirty[wo >> 7] = 1; }
-    if (wo < 0x2000 && (wo & 0x7F) == 0 && (nw & 0x8000)) keyonex();
+    if (wo < 0x2000 && (wo & 0x7F) == 0 && (nw & 0x8000)) keyonex(wo >> 7);
 }
 
 /* ============================================================================================================================ AICA channels */
@@ -291,13 +290,14 @@ static void chan_start(int ch) {
  * before its channel is reused). A channel that is still latched ON but finished (sample end / EG at max) is NOT restarted by a later KYONEX for another voice: the previous
  * code restarted every inactive channel with KYONB=1 on every KYONEX ("a finished SFX plays again whenever another sound starts"). Ignored restarts are counted/logged. */
 static uint64_t st_keyon_ignored; static int g_keyon_old;                 /* R2_SND_KEYON_OLD=1: old rule (restart every finished latched channel), A/B only */
-static void keyonex(void) {
+static void keyonex(int trig_ch) {
     for (int ch = 0; ch < 64; ch++) {
         uint32_t r0 = chn_reg(ch, 0);
         int on = (r0 >> 14) & 1;
         Chan *c = &chn[ch];
         if (on) {
-            if (!g_keyed[ch] || (g_keyon_old && (!c->active || c->eg == 3))) { g_keyed[ch] = 1; g_dirty[ch] = 0; chan_start(ch); }
+            int is_trig = (ch == trig_ch) || g_dirty[ch];
+            if (!g_keyed[ch] || is_trig || (g_keyon_old && (!c->active || c->eg == 3))) { g_keyed[ch] = 1; g_dirty[ch] = 0; chan_start(ch); }
             else if (!c->active || c->eg == 3) { st_keyon_ignored++; EV("KEYON_IGNORED ch%d (latched on, active=%d eg=%d) sa=%06x%s", ch, c->active, c->eg, (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)), (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) == 0x18000 || (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) == 0x1E000 ? " RING-VOICE" : ""); }
         } else {
             g_keyed[ch] = 0;
@@ -936,7 +936,7 @@ static void sf_feed(SH4Ctx *c) { g_sf_chunks++; hle_orig(c, 0x8C062F60); }
 /* Music watchdog (always on, guest thread, ~once per 16 ticks): the guest's stream engine says a stream plays (state 3, not paused, no fade) but the AICA model does not have BOTH ring
  * voices (sample address 0x18000 / 0x1E000, channels are allocated dynamically by the ARM driver) active. >= 0.5 s of that is a "hole" (music silent while the game thinks it plays):
  * counted, the first details kept in g_hole_note (printed by the Vita front end through SndStats.stream_note). Also counts guest stream open/stop/pause/resume calls. */
-static uint32_t g_st_open, g_st_stop, g_st_pause, g_st_resume, g_st_holes, g_st_hole_ms_max, g_st_note_seq; static char g_hole_note[200];
+static uint32_t g_st_open, g_st_stop, g_st_pause, g_st_resume, g_st_holes, g_st_hole_ms_max, g_st_note_seq; static char g_hole_note[480];
 static void stream_watchdog(uint32_t ctx) {
     static unsigned tick; static uint64_t bad0; static int inhole;
     if ((++tick & 15) && !inhole) return;

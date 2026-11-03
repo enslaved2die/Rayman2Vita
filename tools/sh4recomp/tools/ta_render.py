@@ -298,7 +298,7 @@ for si in order:
         if not np.isfinite(tri[:, :5]).all() or (tri[:, 2] <= 0).any(): continue
         x, y, z = tri[:, 0].astype(np.float64) * SX + OX, tri[:, 1].astype(np.float64) * SY, tri[:, 2].astype(np.float64)
         det = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0])
-        if (cull == 2 and det < 0) or (cull == 3 and det > 0): continue
+        if (cull == 2 and det > 0) or (cull == 3 and det < 0): continue
         x0, x1 = int(max(VX0, np.floor(x.min()))), int(min(VX1 - 1, np.ceil(x.max())))
         y0, y1 = int(max(0, np.floor(y.min()))), int(min(H - 1, np.ceil(y.max())))
         if x1 < x0 or y1 < y0 or abs(det) < 1e-9: continue

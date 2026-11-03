@@ -194,10 +194,10 @@ static void test_cull_clip_projection(void)
     TaCtx c; ta_init(&c);
     uint32_t tsp = (1u << 20) | (3u << 6) | (3u << 3) | 3u;
     TaBuildOpts o = { 1, 1, 0.f, 0.f, 640.f, 480.f };
-    /* clockwise on screen (y down): det > 0 -> culled by mode 3, kept by mode 2 */
+    /* clockwise on screen (y down): det > 0 -> culled by mode 2, kept by mode 3 (Rayman 2 vertex winding) */
     float cw[3][5] = { { 100, 100, 0.01f, 0, 0 }, { 200, 100, 0.01f, 1, 0 }, { 100, 200, 0.01f, 0, 1 } };
-    TaFrame *f = tri_frame(&c, tsp, 3, cw); TaGl g; CHECK(ta_build_gl_ex(f, &g, &o) == 0); CHECK(g.nverts == 0); ta_gl_free(&g); ta_frame_free(f);
-    f = tri_frame(&c, tsp, 2, cw); CHECK(ta_build_gl_ex(f, &g, &o) == 0); CHECK(g.nverts == 3); ta_gl_free(&g); ta_frame_free(f);
+    TaFrame *f = tri_frame(&c, tsp, 2, cw); TaGl g; CHECK(ta_build_gl_ex(f, &g, &o) == 0); CHECK(g.nverts == 0); ta_gl_free(&g); ta_frame_free(f);
+    f = tri_frame(&c, tsp, 3, cw); CHECK(ta_build_gl_ex(f, &g, &o) == 0); CHECK(g.nverts == 3); ta_gl_free(&g); ta_frame_free(f);
     f = tri_frame(&c, tsp, 0, cw); CHECK(ta_build_gl_ex(f, &g, &o) == 0); CHECK(g.nverts == 3); ta_gl_free(&g); ta_frame_free(f);
     /* a huge triangle with varying 1/W: every clipped vertex must carry the perspective-correct u,v of its screen position */
     float big[3][5] = { { -1000, -500, 0.002f, 0, 0 }, { 3000, -500, 0.02f, 1, 0 }, { -1000, 2500, 0.008f, 0, 1 } };

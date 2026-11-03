@@ -157,17 +157,23 @@ void f_8c026040(SH4Ctx *c) {
   R(2)=(int32_t)(int8_t)LD8(R(1));
   c->t=(R(2)&R(2))==0;
   { uint32_t k=c->t; fp_ld(c,4,R(3)); if(k) goto L8c026092; }
-  R(0)=0x8c02618cu;
-  fp_mov(c,3,4);
-  fp_ld(c,5,R(0));
-  R(0)=0x8c026190u;
-  fp_arith(c,2,3,5);
-  fp_mov(c,2,5);
-  fp_arith(c,1,2,3);
-  fp_ld(c,3,R(0));
-  R(0)=0x10u;
-  fp_arith(c,2,2,3);
-  fp_st(c,2,R(0)+R(15));
+  {
+    float elem_x;
+    uint32_t elem_x_u = LD32(LD32(R(15)+8) + 4);
+    memcpy(&elem_x, &elem_x_u, 4);
+    float anchor_factor = 0.5f;
+    if (elem_x < 400.0f) {
+      anchor_factor = 0.0f; /* Left-anchored HUD (Health bar) */
+    } else if (elem_x > 600.0f) {
+      anchor_factor = 1.0f; /* Right-anchored HUD (Lums counter, Air meter) */
+    }
+    float sq;
+    memcpy(&sq, &c->fr[4], 4);
+    float off_x = anchor_factor * 1000.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off_x, 4);
+    ST32(R(15)+0x10, off_u);
+  }
 L8c026092:;
   R(4)=LD32(R(15)+8);
   R(0)=0x10u;
@@ -1475,6 +1481,7 @@ L8c02696c:;
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
 void f_8c0269a0(SH4Ctx *c) {
+  if ((int32_t)R(4) < 0 || (int32_t)R(4) >= 50) return;
   R(3)=0x41cu;
   R(0)=R(7);
   R(2)=0x8c131e94u;
@@ -1845,6 +1852,19 @@ L8c026c76:;
 L8c026c8a:;
   R(0)=R(5);
   c->t=(int32_t)R(0)==50;
+  if(c->t) {
+    for (uint32_t i = 0; i < 50; i++) {
+      uint32_t s = 0x8c131e94u + i * 0x41cu;
+      uint8_t a = LD8(s + 0x410);
+      uint8_t f = LD8(s + 0x413);
+      if (a == 0 && !(f & 0x01)) {
+        R(5) = i;
+        R(6) = s;
+        c->t = 0;
+        break;
+      }
+    }
+  }
   if(!c->t) goto L8c026c94;
   { R(5)=0xffffffffu; goto L8c026c98; }
 L8c026c94:;
@@ -1933,9 +1953,10 @@ L8c026d40:;
 L8c026d5a:;
   R(0)=0x410u;
   R(3)=(int32_t)(int8_t)LD8(R(14)+R(0));
-  c->t=(R(3)&R(3))==0;
-  if(!c->t) goto L8c026d66;
-  {  goto L8c026e6c; }
+  if ((R(3) & 0xFF) == 0) {
+    uint8_t flags = LD8(R(14) + 0x413);
+    if (!(flags & 0x01)) { goto L8c026e6c; }
+  }
 L8c026d66:;
   R(2)=0x8c12473eu;
   R(1)=(int32_t)(int8_t)LD8(R(2));

@@ -574,17 +574,27 @@ int ta_build_gl_reuse(const TaFrame *f, TaGl *g, const TaBuildOpts *o)
                 TaGlVertex *d = gv + nvl;
                 if (gouraud) { conv_vtx(&d[0], v0, v0, force_a1); conv_vtx(&d[1], v1, v1, force_a1); conv_vtx(&d[2], pv, pv, force_a1); }
                 else         { conv_vtx(&d[0], v0, pv, force_a1); conv_vtx(&d[1], v1, pv, force_a1); conv_vtx(&d[2], pv, pv, force_a1); }
-                if (o && !(fin_f(d[0].x) & fin_f(d[0].y) & fin_f(d[0].z) & fin_f(d[1].x) & fin_f(d[1].y) & fin_f(d[1].z) & fin_f(d[2].x) & fin_f(d[2].y) & fin_f(d[2].z) &
-                           (d[0].z > 0.f) & (d[1].z > 0.f) & (d[2].z > 0.f) & fin_f(d[0].u) & fin_f(d[0].v) & fin_f(d[1].u) & fin_f(d[1].v) & fin_f(d[2].u) & fin_f(d[2].v))) continue;
+                if (o) {
+                    if (!(fin_f(d[0].x) & fin_f(d[0].y) & fin_f(d[1].x) & fin_f(d[1].y) & fin_f(d[2].x) & fin_f(d[2].y) &
+                          fin_f(d[0].u) & fin_f(d[0].v) & fin_f(d[1].u) & fin_f(d[1].v) & fin_f(d[2].u) & fin_f(d[2].v))) continue;
+                    int num_behind = (d[0].z <= 0.f || !fin_f(d[0].z)) + (d[1].z <= 0.f || !fin_f(d[1].z)) + (d[2].z <= 0.f || !fin_f(d[2].z));
+                    if (num_behind == 3) continue;
+                    if (d[0].z <= 0.f || !fin_f(d[0].z)) d[0].z = 1e-4f;
+                    if (d[1].z <= 0.f || !fin_f(d[1].z)) d[1].z = 1e-4f;
+                    if (d[2].z <= 0.f || !fin_f(d[2].z)) d[2].z = 1e-4f;
+                }
                 if (textured) {   /* rebase UVs so GLES varyings stay small: wrap is periodic (repeat: 1, mirror: 2), clamp axes untouched */
                     float mu = fmin_f(d[0].u, fmin_f(d[1].u, d[2].u)), mv = fmin_f(d[0].v, fmin_f(d[1].v, d[2].v));
                     float ku = clamp_u ? 0.f : (flip_u ? ffloor_f(mu * 0.5f) * 2.f : ffloor_f(mu));
                     float kv = clamp_v ? 0.f : (flip_v ? ffloor_f(mv * 0.5f) * 2.f : ffloor_f(mv));
                     if (fabsf(mu) < 1e6f && fabsf(mv) < 1e6f) { d[0].u -= ku; d[0].v -= kv; d[1].u -= ku; d[1].v -= kv; d[2].u -= ku; d[2].v -= kv; }
                 }
-                if (do_cull && cull_mode >= 2) {
+                if (do_cull) {
                     float det = (d[1].x - d[0].x) * (d[2].y - d[0].y) - (d[2].x - d[0].x) * (d[1].y - d[0].y);
-                    if ((cull_mode == 2 && det < 0.f) || (cull_mode == 3 && det > 0.f)) continue;
+                    if (fabsf(det) < 1e-5f) continue;   /* drop degenerate / zero-area triangles when culling enabled */
+                    if (cull_mode >= 2) {
+                        if ((cull_mode == 2 && det > 0.f) || (cull_mode == 3 && det < 0.f)) continue;
+                    }
                 }
                 int inside = 1;
                 if (do_clip)
@@ -677,7 +687,7 @@ void ta_gl_make_clip(const TaGlVertex *in, uint32_t n, float cut, TaClipVertex *
 {
     float invmax = cut * (0.995f / 0.98f);
     for (uint32_t i = 0; i < n; i++) {
-        float iw = in[i].z; if (!(iw > 0.f)) iw = 1e-9f; if (iw > invmax) iw = invmax;
+        float iw = in[i].z; if (!(iw > 1e-4f)) iw = 1e-4f; if (iw > invmax) iw = invmax;
         float W = 1.f / iw, xn = in[i].x * (1.f / 320.f) - 1.f, yn = 1.f - in[i].y * (1.f / 240.f);
         TaClipVertex *o = &out[i];
         o->px = xn * W; o->py = yn * W; o->pz = W;
@@ -710,12 +720,33 @@ static uint32_t twid(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     { uint32_t blk = y / w, yi = y % w; return blk * w * w + (spread16(yi) | (spread16(x) << 1)); }
 }
 static uint32_t rgba8(uint32_t r, uint32_t g, uint32_t b, uint32_t a) { return r | (g << 8) | (b << 16) | (a << 24); }
+static inline uint32_t bump16(uint32_t p)
+{
+    /* PowerVR2 CLX2 16-bit bump map texel:
+     * bits 15:8 = Elevation angle S (0 = normal to surface, 255 = 90 deg / tangent plane)
+     * bits 7:0  = Azimuth angle R (0..255 = 0..360 deg) */
+    uint32_t s_ang = (p >> 8) & 0xFF;
+    uint32_t r_ang = p & 0xFF;
+    float theta = (float)s_ang * (3.14159265f / 512.0f);
+    float phi = (float)r_ang * (6.28318531f / 256.0f);
+    float sin_t = sinf(theta), cos_t = cosf(theta);
+    float nx = sin_t * cosf(phi);
+    float ny = sin_t * sinf(phi);
+    float nz = cos_t;
+    /* Directional lighting vector L = normalize(0.35, 0.35, 0.87) */
+    float diff = 0.35f * nx + 0.35f * ny + 0.87f * nz;
+    int lum = (int)(diff * 255.0f);
+    if (lum < 0) lum = 0; else if (lum > 255) lum = 255;
+    return rgba8((uint32_t)lum, (uint32_t)lum, (uint32_t)lum, 255);
+}
 static uint32_t px16(uint32_t p, int fmt)
 {
     uint32_t r, g, b, a;
     if (fmt == 0) { a = (p & 0x8000) ? 255 : 0; r = (p >> 10) & 31; g = (p >> 5) & 31; b = p & 31; r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); b = (b << 3) | (b >> 2); }
     else if (fmt == 1) { a = 255; r = (p >> 11) & 31; g = (p >> 5) & 63; b = p & 31; r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2); }
-    else { a = ((p >> 12) & 15) * 17; r = ((p >> 8) & 15) * 17; g = ((p >> 4) & 15) * 17; b = (p & 15) * 17; }
+    else if (fmt == 2) { a = ((p >> 12) & 15) * 17; r = ((p >> 8) & 15) * 17; g = ((p >> 4) & 15) * 17; b = (p & 15) * 17; }
+    else if (fmt == 4) return bump16(p);
+    else { a = 255; r = g = b = 128; }
     return rgba8(r, g, b, a);
 }
 static uint32_t pal_px(const TaTexEnv *e, uint32_t idx)
@@ -748,10 +779,10 @@ int ta_tex_decode(const uint8_t *vram, uint32_t vn, uint32_t tcw, uint32_t tsp, 
     uint32_t w = (uint32_t)W >> level, h = (uint32_t)H >> level;
     if (!w) w = 1;
     if (!h) h = 1;
-    if (fmt == 4 || fmt == 7) { for (uint32_t i = 0; i < w * h; i++) out[i] = 0xFF808080u; return -1; }
+    if (fmt == 7) { for (uint32_t i = 0; i < w * h; i++) out[i] = 0xFF808080u; return -1; }
     if (mip) h = w;                                   /* mip chains are square */
     uint32_t S = (w * w - 1) / 3;                     /* texels in all smaller levels (4^k sums) */
-    if (vq && fmt <= 2) {
+    if (vq && (fmt <= 2 || fmt == 4)) {
         uint32_t off = 2048, bw = w > 1 ? w / 2 : 1, bh = h > 1 ? h / 2 : 1;
         if (mip) { uint32_t o = 0; for (uint32_t s = 1; s < w; s <<= 1) o += (s == 1) ? 1 : (s / 2) * (s / 2); off += o; }
         for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
@@ -760,7 +791,7 @@ int ta_tex_decode(const uint8_t *vram, uint32_t vn, uint32_t tcw, uint32_t tsp, 
             uint32_t p = rd16(vram, vn, base + e * 8 + (((x & 1) * 2 + (y & 1)) * 2));
             out[y * w + x] = px16(p, fmt);
         }
-    } else if (fmt <= 2 || fmt == 3) {
+    } else if (fmt <= 2 || fmt == 3 || fmt == 4) {
         uint32_t off = mip ? 2 * S + 6 : 0;
         uint32_t stride = w;
         if (nontw && ((tcw >> 25) & 1)) stride = (env ? (env->text_control & 31) : 0) * 32, stride = stride ? stride : w;
@@ -786,7 +817,7 @@ int ta_tex_decode(const uint8_t *vram, uint32_t vn, uint32_t tcw, uint32_t tsp, 
             out[y * w + x] = pal_px(env, pb + nib);
         }
     }
-    if (force_opaque) for (uint32_t i = 0; i < w * h; i++) out[i] |= 0xFF000000u;
+    if (force_opaque && fmt != 0) for (uint32_t i = 0; i < w * h; i++) out[i] |= 0xFF000000u;
     return 0;
 }
 
