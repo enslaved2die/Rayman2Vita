@@ -205,7 +205,9 @@ static void test_legit_probes_and_scratch(void) {
     CHECK(hle_io_resolve("dcdata\\Sound\\Banks\\", "JINGLE8.wav", out, sizeof out) != 0);
     CHECK(hle_io_resolve("dcdata\\Sound\\Music\\", "JINGLE8.wav", out, sizeof out) == 0);
     CHECK(hle_io_resolve("dcdata\\Sound\\Music\\", "silenST.wav", out, sizeof out) == 0);
-    CHECK(hle_io_resolve("dcdata\\Sound\\Music\\", "MM01.wav", out, sizeof out) != 0);
+    /* MM01..10.wav live inside MM.DCZ under Sound/Music; under Banks or English they do not exist */
+    CHECK(hle_io_resolve("dcdata\\Sound\\Banks\\", "MM01.wav", out, sizeof out) != 0);
+    CHECK(hle_io_resolve("dcdata\\Sound\\Music\\", "MM01.wav", out, sizeof out) == 0);
     CHECK(hle_io_resolve("dcdata\\Sound\\Music\\English\\", "MM01.wav", out, sizeof out) != 0);
     CHECK(hle_io_resolve("dcdata\\Sound\\Music\\", "MM.DCZ", out, sizeof out) == 0);
     CHECK(hle_io_resolve("dcdata\\Sound\\Music\\English\\", "ENGLISH.DCZ", out, sizeof out) == 0);
@@ -217,7 +219,7 @@ static void test_legit_probes_and_scratch(void) {
     CHECK(gd >= HLE_IO_SCRATCH_BASE && gd + HLE_IO_GD_STRIDE <= HLE_IO_SCRATCH_BASE + 0x600);
     call(0x8C012ACC, SLOT(0), 0, 0);
     put_str(0x8C100000, "\\DCDATA\\FIX.TMP"); call(0x8C042B96, 0x8C100000, 0, 0);
-    CHECK(C.r[0] >= HLE_IO_SCRATCH_BASE && C.r[0] < HLE_IO_SCRATCH_BASE + 0x600);
+    CHECK(C.r[0] >= HLE_IO_DIRENT_BASE && C.r[0] < HLE_IO_DIRENT_BASE + 512 * 0x2C);
 }
 
 int main(void) {

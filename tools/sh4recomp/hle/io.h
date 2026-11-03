@@ -15,13 +15,15 @@
 #include "hle.h"
 
 /* ---- configuration ---- */
-/* Guest RAM region used for fake gdFs handles (HLE_IO_GD_STRIDE bytes each) and synthetic directory entries (0x2C bytes each).
- * Default: 0x8C009000.. (1456 bytes used): inside the BIOS/IP.BIN system area, which hw_inventory.md section 3 lists as touched by the game only at
- * 0x8C0000B0/B8/BC/E0, 0x8C0080F0..FE, 0x8C008300, 0x8C00FC00, 0x8C00FFF0/F4 and (below the stack watermark 0x8C00C000) nothing else.
- * It used to be 0x8C2EB020, claimed to be an unused "gdFs request table". That was WRONG: 0x8C2EB020..0x8C2EB566 is the Maple pd peripheral
- * table (24 records x 0x34 + type words at 0x8C2EB500 + latch/threshold bytes, see hle/pad.c) cleared by pdInit 0x8C0CF158 and rewritten every
- * frame by the pd poll 0x8C0CF54E, so fake gd handles there were corrupted/corrupting the pad state. */
+/* Guest RAM regions used for fake gdFs handles and synthetic directory entries (0x2C bytes each).
+ * Fake gdFs handles: 0x8C009000.. (HLE_IO_GD_STRIDE bytes each, inside BIOS/IP.BIN scratch area below pad buffers at 0x8C009800).
+ * Synthetic directory entries: 0x8C001000.. (28 KB untouched BIOS scratch area 0x8C001000..0x8C008000).
+ * MAX_DIRENT is 512 entries (512 * 0x2C = 22,528 bytes = 0x5800 bytes, safe within 0x8C001000..0x8C006800).
+ * Entries are permanently bound per unique file/member; the engine stores returned dirent pointers
+ * directly into sound descriptors (desc + 48) and relies on them never moving or recycling.
+ */
 #define HLE_IO_SCRATCH_BASE 0x8C009000u
+#define HLE_IO_DIRENT_BASE  0x8C001000u
 #define HLE_IO_GD_STRIDE   0x54u
 void hle_io_set_scratch(uint32_t gd_base, unsigned n_gd, uint32_t dirent_base, unsigned n_dirent);
 void hle_io_set_root(const char *root);        /* also called by hle_io_init */

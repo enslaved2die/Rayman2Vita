@@ -28,15 +28,15 @@ enum {
 /* ---------------------------------------------------------------- state */
 typedef struct { char path[1024]; uint32_t size; } RegFile;
 typedef struct { int used; int fd; int reg; uint32_t base; } GdEnt;   /* base = first sector of the range inside the host file (DCZ members) */
-typedef struct { int reg; uint32_t base; uint64_t stamp; } DirEnt;
+typedef struct { int used; int reg; uint32_t base; uint32_t size; char name[32]; } DirEnt;
 #define MAX_REG 16384
 #define MAX_GD  64
-#define MAX_DIRENT 64
+#define MAX_DIRENT 512
 static char g_root[900]; static int g_idx_ready;
 static RegFile *g_reg; static int g_nreg;
 static GdEnt g_gd[MAX_GD]; static unsigned g_ngd = 10;
-static DirEnt g_dir[MAX_DIRENT]; static unsigned g_ndir = 14; static uint64_t g_stamp;
-static uint32_t g_gd_base = HLE_IO_SCRATCH_BASE, g_dir_base = HLE_IO_SCRATCH_BASE + 10 * HLE_IO_GD_STRIDE;
+static DirEnt g_dir[MAX_DIRENT]; static unsigned g_ndir = MAX_DIRENT; static unsigned g_ndir_used;
+static uint32_t g_gd_base = HLE_IO_SCRATCH_BASE, g_dir_base = HLE_IO_DIRENT_BASE;
 int hle_io_force_scan;
 
 void hle_io_set_scratch(uint32_t gd_base, unsigned n_gd, uint32_t dirent_base, unsigned n_dirent) {
@@ -46,7 +46,7 @@ void hle_io_set_scratch(uint32_t gd_base, unsigned n_gd, uint32_t dirent_base, u
 void hle_io_set_root(const char *root) { g_idx_ready = 0; snprintf(g_root, sizeof g_root, "%s", root ? root : "."); size_t n = strlen(g_root); while (n > 1 && g_root[n - 1] == '/') g_root[--n] = 0; }
 void hle_io_reset(void) {
     for (unsigned i = 0; i < MAX_GD; i++) { if (g_gd[i].used && g_gd[i].fd >= 0) close(g_gd[i].fd); g_gd[i].used = 0; g_gd[i].fd = -1; }
-    free(g_reg); g_reg = 0; g_nreg = 0; memset(g_dir, 0, sizeof g_dir); g_stamp = 0; g_idx_ready = 0;
+    free(g_reg); g_reg = 0; g_nreg = 0; memset(g_dir, 0, sizeof g_dir); g_ndir_used = 0; g_idx_ready = 0;
 }
 
 /* ---------------------------------------------------------------- guest memory helpers */
@@ -465,24 +465,40 @@ void hle_io_h_close(SH4Ctx *c) {
 static uint32_t dirent_for(const char *host, uint32_t size, uint32_t base, const char *qname) {
     if (!base) size = reg_size(host);
     int id = reg_find(host, size); if (id < 0 || !g_ndir) return 0;
-    unsigned slot = g_ndir, lru = 0;
-    for (unsigned i = 0; i < g_ndir; i++) {
-        if (g_dir[i].stamp && g_dir[i].reg == id && g_dir[i].base == base) { slot = i; break; }
-        if (g_dir[i].stamp < g_dir[lru].stamp) lru = i;
+    const char *bn = strrchr(base ? qname : host, base ? '\\' : '/'); const char *bs = base ? qname : host; if (bn) bs = bn + 1;
+    if (base) { const char *sl = strrchr(bs, '/'); if (sl) bs = sl + 1; }
+
+    for (unsigned i = 0; i < g_ndir_used; i++) {
+        if (g_dir[i].used && g_dir[i].reg == id && g_dir[i].base == base) {
+            return g_dir_base + i * 0x2C;
+        }
     }
-    if (slot == g_ndir) {
-        slot = lru; if (g_dir[slot].stamp) hle_log("[io] synthetic dirent table full (%u), recycling slot %u", g_ndir, slot);
-        g_dir[slot].reg = id; g_dir[slot].base = base;
+    if (g_ndir_used >= g_ndir) {
+        hle_log("[io] ERROR: synthetic dirent table full (%u), cannot allocate slot for %s (base %u name '%s')",
+                g_ndir, host, base, bs);
+        return 0;
     }
-    g_dir[slot].stamp = ++g_stamp;
+    unsigned slot = g_ndir_used++;
+    g_dir[slot].used = 1;
+    g_dir[slot].reg = id;
+    g_dir[slot].base = base;
+    g_dir[slot].size = size;
+    snprintf(g_dir[slot].name, sizeof g_dir[slot].name, "%s", bs);
+
     uint32_t e = g_dir_base + slot * 0x2C;
     for (uint32_t o = 0; o < 0x2C; o += 4) put32(e + o, 0);
     put32(e + 0, ((uint32_t)(id + 1) << LBA_SHIFT) + base);                 /* lba (the game adds 150 before calling gdFs) */
     put32(e + 4, size);
     ST8(e + 8, 0);                                                  /* flag 0 = file */
-    const char *bn = strrchr(base ? qname : host, base ? '\\' : '/'); const char *bs = base ? qname : host; if (bn) bs = bn + 1;
-    if (base) { const char *sl = strrchr(bs, '/'); if (sl) bs = sl + 1; }
     for (int i = 0; i < 31 && bs[i]; i++) ST8(e + 10 + i, (uint8_t)bs[i]);
+    if (!strcasecmp(bs, "JailMus.wav") || !strcasecmp(bs, "FO25.wav")) {
+        hle_log("[io-dirent] slot=%u name=%s host=%s base=%u e=0x%08x lba=0x%08x",
+                slot, bs, host, base, e, LD32(e));
+    }
+    if (hle_verbose >= 2) {
+        hle_log("[io] dirent alloc slot=%u/%u e=0x%08x id=%d base=%u size=%u name='%s'",
+                slot, g_ndir, e, id, base, size, bs);
+    }
     return e;
 }
 void hle_io_h_dir_find(SH4Ctx *c) {
