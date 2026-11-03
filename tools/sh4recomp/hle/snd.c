@@ -296,8 +296,8 @@ static void keyonex(int trig_ch) {
         int on = (r0 >> 14) & 1;
         Chan *c = &chn[ch];
         if (on) {
-            int is_trig = (ch == trig_ch) || g_dirty[ch];
-            if (!g_keyed[ch] || is_trig || (g_keyon_old && (!c->active || c->eg == 3))) { g_keyed[ch] = 1; g_dirty[ch] = 0; chan_start(ch); }
+            int is_retrigger = (ch == trig_ch) && (!c->active || c->eg == 3);
+            if (!g_keyed[ch] || is_retrigger || (g_keyon_old && (!c->active || c->eg == 3))) { g_keyed[ch] = 1; g_dirty[ch] = 0; chan_start(ch); }
             else if (!c->active || c->eg == 3) { st_keyon_ignored++; EV("KEYON_IGNORED ch%d (latched on, active=%d eg=%d) sa=%06x%s", ch, c->active, c->eg, (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)), (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) == 0x18000 || (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) == 0x1E000 ? " RING-VOICE" : ""); }
         } else {
             g_keyed[ch] = 0;

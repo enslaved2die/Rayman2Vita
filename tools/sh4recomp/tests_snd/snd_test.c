@@ -159,8 +159,15 @@ static void t6(void) {
     snd_test_regwrite(1 * 0x80, snd_test_regs()[0x80 >> 2] | 0x4000 | 0x8000);        /* key on ch1 only; ch0 still has KYONB=1 latched */
     snd_test_advance(2000, NULL); snd_get_stats(&s);
     CHECK(s.active_channels == 1, "finished ch0 not restarted by KYONEX for ch1 (active %d, expect 1)", s.active_channels);
+    snd_test_regwrite(0 * 0x80, snd_test_regs()[0 >> 2] | 0x4000 | 0x8000);        /* re-trigger finished ch0 directly without key-off (looping ambient SFX) */
+    snd_test_advance(50, NULL); snd_get_stats(&s);
+    CHECK(s.active_channels == 2, "direct re-trigger of latched finished ch0 restarts it (active %d, expect 2)", s.active_channels);
     keyon(0); snd_test_advance(50, NULL); snd_get_stats(&s);
     CHECK(s.active_channels == 2, "explicit key-off + key-on restarts ch0 (active %d, expect 2)", s.active_channels);
+    /* writing non-KYONEX registers on an active channel must not restart or kill it (ch0 finished its 100 samples, ch1 still loops) */
+    snd_test_regwrite(1 * 0x80 + 0x24, 0x1F << 8);
+    snd_test_advance(50, NULL); snd_get_stats(&s);
+    CHECK(s.active_channels == 1, "register write on active ch1 leaves playback undisturbed (active %d, expect 1)", s.active_channels);
 }
 
 /* ---- T7: the sd command block (0x13200..0x1330F) is written word by word by the guest while the audio thread runs the ARM7: the AICA must not advance inside a block write ---- */
