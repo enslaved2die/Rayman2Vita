@@ -41,7 +41,7 @@ unsigned long hle_ta_frame_no(void) { return ta_frames; }
  *   3D: tan(K3*pi/4) = 45/34  ->  K3 = atan(45/34) / (pi/4) = 1.176154f (exact 1:1 pixel aspect ratio; 0.00% distortion).
  * Controls: env R2_WIDE=0 starts in 4:3 (default 1), R2_WIDE_K3 / R2_WIDE_SQ override the two factors, hle_ta_wide_set() flips at run time. */
 static int wide_pref = 1, wide_last = -1, wide_patched;
-static float wide_k = 1.3436f, wide_sq = 0.755556f;
+static float wide_k = 1.176154f, wide_sq = 0.755556f;
 #define WIDE_FLAG_ADDR   0x8C0C52DCu
 #define WIDE_OPTION_ADDR 0x8C2D0F44u
 #define WIDE_POOL_K      0x8C0370ECu      /* float 1.2    (3D horizontal FOV angle factor) */

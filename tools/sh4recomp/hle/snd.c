@@ -91,6 +91,7 @@ typedef struct {
 static Chan chn[64];
 static uint64_t g_amask;           /* bit ch set <=> chn[ch].active (kept in step at the three places that change it): render_sample walks only the set bits */
 static uint8_t g_keyed[64];       /* latched KYONB per channel (see keyonex) */
+static uint8_t g_key_req[64];     /* KYONB=1 written to channel's reg0 since last keyonex */
 static uint8_t g_dirty[64];       /* channel registers written since the last key-on (diagnostic) */
 
 /* ---------------------------------------------------------------------------------------------------------------- ARM7 */
@@ -153,7 +154,7 @@ SND_INL void ram_wr(uint32_t a, int sz, uint32_t v) {
 }
 
 static void update_fiq_level(void);
-static void keyonex(int trig_ch);
+static void keyonex(void);
 static uint32_t reg_read(uint32_t off, int sz, int from_arm);
 static void reg_write(uint32_t off, int sz, uint32_t v, int from_arm);
 
@@ -230,8 +231,12 @@ static void reg_write(uint32_t off, int sz, uint32_t v, int from_arm) {
     }
     aregs[wo >> 2] = nw;
     if (wo < 0x2000 && (wo & 0x7C) != 0) g_dirty[wo >> 7] = 1;
-    if (wo < 0x2000 && (wo & 0x7F) == 0) { if ((cur ^ nw) & ~0x8000u) g_dirty[wo >> 7] = 1; }
-    if (wo < 0x2000 && (wo & 0x7F) == 0 && (nw & 0x8000)) keyonex(wo >> 7);
+    if (wo < 0x2000 && (wo & 0x7F) == 0) {
+        if ((cur ^ nw) & ~0x8000u) g_dirty[wo >> 7] = 1;
+        if (nw & 0x4000) g_key_req[wo >> 7] = 1;
+        else g_key_req[wo >> 7] = 0;
+    }
+    if (wo < 0x2000 && (wo & 0x7F) == 0 && (nw & 0x8000)) keyonex();
 }
 
 /* ============================================================================================================================ AICA channels */
@@ -290,19 +295,27 @@ static void chan_start(int ch) {
  * before its channel is reused). A channel that is still latched ON but finished (sample end / EG at max) is NOT restarted by a later KYONEX for another voice: the previous
  * code restarted every inactive channel with KYONB=1 on every KYONEX ("a finished SFX plays again whenever another sound starts"). Ignored restarts are counted/logged. */
 static uint64_t st_keyon_ignored; static int g_keyon_old;                 /* R2_SND_KEYON_OLD=1: old rule (restart every finished latched channel), A/B only */
-static void keyonex(int trig_ch) {
+static void keyonex(void) {
     for (int ch = 0; ch < 64; ch++) {
         uint32_t r0 = chn_reg(ch, 0);
         int on = (r0 >> 14) & 1;
         Chan *c = &chn[ch];
         if (on) {
-            int is_trig = (ch == trig_ch);
-            if (!g_keyed[ch] || is_trig || (g_keyon_old && (!c->active || c->eg == 3))) { g_keyed[ch] = 1; g_dirty[ch] = 0; chan_start(ch); }
-            else if (!c->active || c->eg == 3) { st_keyon_ignored++; EV("KEYON_IGNORED ch%d (latched on, active=%d eg=%d) sa=%06x%s", ch, c->active, c->eg, (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)), (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) == 0x18000 || (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) == 0x1E000 ? " RING-VOICE" : ""); }
+            uint32_t base = (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) & (ARAM_SIZE - 1);
+            int is_ring = (base == 0x18000 || base == 0x1E000);
+            int is_retrigger = g_key_req[ch];
+            if (!g_keyed[ch] || (is_retrigger && (!is_ring || !c->active)) || (g_keyon_old && (!c->active || c->eg == 3))) {
+                g_keyed[ch] = 1; g_dirty[ch] = 0; chan_start(ch);
+            }
+            else if (!c->active || c->eg == 3) {
+                st_keyon_ignored++;
+                EV("KEYON_IGNORED ch%d (latched on, active=%d eg=%d) sa=%06x%s", ch, c->active, c->eg, base, is_ring ? " RING-VOICE" : "");
+            }
         } else {
             g_keyed[ch] = 0;
             if (c->active && c->eg != 3) { c->eg = 3; EV("KEYOFF ch%d pos=%u att=%.0f rr=%u", ch, c->pos, c->att, chn_reg(ch, 0x14) & 31); }
         }
+        g_key_req[ch] = 0;
     }
     for (int ch = 0; ch < 64; ch++) aregs[(ch * 0x80) >> 2] &= ~0x8000u;
 }
@@ -700,6 +713,7 @@ undef:
 
 static void arm_reset(void) {
     memset(g_keyed, 0, sizeof g_keyed);
+    memset(g_key_req, 0, sizeof g_key_req);
     memset(&A, 0, sizeof A);
     A.cpsr = 0xD3;                                  /* SVC, I,F masked */
     A.r[15] = 0;

@@ -298,6 +298,21 @@ L8c01aefa:;
   { uint32_t tg=R(9); c->pr=0x8c01af28u; fp_mov(c,4,3); sh4_call(c,tg); }
   R(2)=LD32(R(15)+4);
   R(0)=0xcu;
+  if (LD8(0x8c0c52dcu)) {
+    float elem_x;
+    uint32_t elem_u = LD32(R(2));
+    memcpy(&elem_x, &elem_u, 4);
+    float sq;
+    uint32_t sq_u = LD32(0x8c0c52e4u);
+    memcpy(&sq, &sq_u, 4);
+    float anchor = 0.5f;
+    if (elem_x < 40.0f) anchor = 0.0f;
+    else if (elem_x > 60.0f) anchor = 1.0f;
+    float off = anchor * 100.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off, 4);
+    c->fr[15] = off_u;
+  }
   fp_mov(c,6,15);
   R(5)=0x0u;
   R(3)=R(2);
@@ -351,6 +366,21 @@ L8c01af66:;
   { uint32_t tg=R(9); c->pr=0x8c01af94u; fp_mov(c,4,3); sh4_call(c,tg); }
   R(2)=LD32(R(15)+4);
   R(0)=0xcu;
+  if (LD8(0x8c0c52dcu)) {
+    float elem_x;
+    uint32_t elem_u = LD32(R(2));
+    memcpy(&elem_x, &elem_u, 4);
+    float sq;
+    uint32_t sq_u = LD32(0x8c0c52e4u);
+    memcpy(&sq, &sq_u, 4);
+    float anchor = 0.5f;
+    if (elem_x < 40.0f) anchor = 0.0f;
+    else if (elem_x > 60.0f) anchor = 1.0f;
+    float off = anchor * 100.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off, 4);
+    c->fr[15] = off_u;
+  }
   fp_mov(c,6,15);
   R(5)=0x0u;
   R(3)=R(2);
@@ -406,6 +436,21 @@ L8c01b020:;
   { uint32_t tg=R(9); c->pr=0x8c01b04eu; fp_mov(c,4,3); sh4_call(c,tg); }
   R(2)=LD32(R(15)+4);
   R(0)=0xcu;
+  if (LD8(0x8c0c52dcu)) {
+    float elem_x;
+    uint32_t elem_u = LD32(R(2));
+    memcpy(&elem_x, &elem_u, 4);
+    float sq;
+    uint32_t sq_u = LD32(0x8c0c52e4u);
+    memcpy(&sq, &sq_u, 4);
+    float anchor = 0.5f;
+    if (elem_x < 40.0f) anchor = 0.0f;
+    else if (elem_x > 60.0f) anchor = 1.0f;
+    float off = anchor * 100.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off, 4);
+    c->fr[15] = off_u;
+  }
   fp_mov(c,6,15);
   R(5)=0x0u;
   R(3)=R(2);
@@ -459,6 +504,21 @@ L8c01b08c:;
   { uint32_t tg=R(9); c->pr=0x8c01b0bau; fp_mov(c,4,3); sh4_call(c,tg); }
   R(2)=LD32(R(15)+4);
   R(0)=0xcu;
+  if (LD8(0x8c0c52dcu)) {
+    float elem_x;
+    uint32_t elem_u = LD32(R(2));
+    memcpy(&elem_x, &elem_u, 4);
+    float sq;
+    uint32_t sq_u = LD32(0x8c0c52e4u);
+    memcpy(&sq, &sq_u, 4);
+    float anchor = 0.5f;
+    if (elem_x < 40.0f) anchor = 0.0f;
+    else if (elem_x > 60.0f) anchor = 1.0f;
+    float off = anchor * 100.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off, 4);
+    c->fr[15] = off_u;
+  }
   fp_mov(c,6,15);
   R(5)=0x0u;
   R(3)=R(2);
@@ -657,6 +717,21 @@ L8c01b200:;
   R(0)=0xcu;
   fp_mov(c,0,12);
   R(5)=0x0u;
+  if (LD8(0x8c0c52dcu)) {
+    float elem_x;
+    uint32_t elem_u = LD32(R(2));
+    memcpy(&elem_x, &elem_u, 4);
+    float sq;
+    uint32_t sq_u = LD32(0x8c0c52e4u);
+    memcpy(&sq, &sq_u, 4);
+    float anchor = 0.5f;
+    if (elem_x < 40.0f) anchor = 0.0f;
+    else if (elem_x > 60.0f) anchor = 1.0f;
+    float off = anchor * 100.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off, 4);
+    c->fr[15] = off_u;
+  }
   fp_mov(c,6,15);
   R(3)=R(2);
   R(4)=LD32(R(15));
@@ -794,6 +869,21 @@ L8c01b332:;
   R(0)=0xcu;
   fp_mov(c,0,12);
   R(5)=0x0u;
+  if (LD8(0x8c0c52dcu)) {
+    float elem_x;
+    uint32_t elem_u = LD32(R(2));
+    memcpy(&elem_x, &elem_u, 4);
+    float sq;
+    uint32_t sq_u = LD32(0x8c0c52e4u);
+    memcpy(&sq, &sq_u, 4);
+    float anchor = 0.5f;
+    if (elem_x < 40.0f) anchor = 0.0f;
+    else if (elem_x > 60.0f) anchor = 1.0f;
+    float off = anchor * 100.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off, 4);
+    c->fr[15] = off_u;
+  }
   fp_mov(c,6,15);
   R(3)=R(2);
   R(4)=LD32(R(15));
@@ -931,6 +1021,21 @@ L8c01b4ac:;
   R(0)=0xcu;
   fp_mov(c,0,12);
   R(5)=0x0u;
+  if (LD8(0x8c0c52dcu)) {
+    float elem_x;
+    uint32_t elem_u = LD32(R(2));
+    memcpy(&elem_x, &elem_u, 4);
+    float sq;
+    uint32_t sq_u = LD32(0x8c0c52e4u);
+    memcpy(&sq, &sq_u, 4);
+    float anchor = 0.5f;
+    if (elem_x < 40.0f) anchor = 0.0f;
+    else if (elem_x > 60.0f) anchor = 1.0f;
+    float off = anchor * 100.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off, 4);
+    c->fr[15] = off_u;
+  }
   fp_mov(c,6,15);
   R(3)=R(2);
   R(4)=LD32(R(15));
@@ -1068,6 +1173,21 @@ L8c01b5ca:;
   R(0)=0xcu;
   fp_mov(c,0,12);
   R(5)=0x0u;
+  if (LD8(0x8c0c52dcu)) {
+    float elem_x;
+    uint32_t elem_u = LD32(R(2));
+    memcpy(&elem_x, &elem_u, 4);
+    float sq;
+    uint32_t sq_u = LD32(0x8c0c52e4u);
+    memcpy(&sq, &sq_u, 4);
+    float anchor = 0.5f;
+    if (elem_x < 40.0f) anchor = 0.0f;
+    else if (elem_x > 60.0f) anchor = 1.0f;
+    float off = anchor * 100.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off, 4);
+    c->fr[15] = off_u;
+  }
   fp_mov(c,6,15);
   R(3)=R(2);
   R(4)=LD32(R(15));
@@ -1899,17 +2019,28 @@ L8c01be54:;
   if(c->t) goto L8c01bec0;
 L8c01be8e:;
   R(3)=0x8c0c52e4u;
-  R(0)=0x8c01bfecu;
-  fp_ld(c,3,R(0));
-  R(0)=0x8c01bff4u;
-  fp_ld(c,2,R(3));
-  fp_mov(c,1,3);
-  fp_arith(c,2,2,3);
-  fp_arith(c,1,1,2);
-  fp_ld(c,2,R(0));
-  R(0)=0x78u;
-  fp_arith(c,2,1,2);
-  fp_st(c,1,R(0)+R(15));
+  {
+    float x1, x2;
+    uint32_t u1 = LD32(R(14) + 0x1c);
+    uint32_t u2 = LD32(R(14) + 0x28);
+    memcpy(&x1, &u1, 4);
+    memcpy(&x2, &u2, 4);
+    float elem_x = (x1 + x2) * 0.5f;
+    float anchor = 0.5f;
+    if (elem_x < 40.0f) {
+      anchor = 0.0f; /* Left-anchored HUD (Health bar) */
+    } else if (elem_x > 60.0f) {
+      anchor = 1.0f; /* Right-anchored HUD (Lums counter, Air meter) */
+    }
+    float sq;
+    uint32_t sq_u = LD32(R(3));
+    memcpy(&sq, &sq_u, 4);
+    float off = anchor * 100.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off, 4);
+    c->fr[1] = off_u;
+    ST32(R(15) + 0x78, off_u);
+  }
   R(0)=0x1cu;
   fp_mov(c,3,1);
   fp_ld(c,1,R(0)+R(14));
@@ -2017,17 +2148,28 @@ L8c01bf48:;
   if(c->t) goto L8c01bfac;
 L8c01bf7a:;
   R(3)=0x8c0c52e4u;
-  R(0)=0x8c01bfecu;
-  fp_ld(c,3,R(0));
-  R(0)=0x8c01bff4u;
-  fp_ld(c,2,R(3));
-  fp_mov(c,1,3);
-  fp_arith(c,2,2,3);
-  fp_arith(c,1,1,2);
-  fp_ld(c,2,R(0));
-  R(0)=0x78u;
-  fp_arith(c,2,1,2);
-  fp_st(c,1,R(0)+R(15));
+  {
+    float x1, x2;
+    uint32_t u1 = LD32(R(14) + 0x1c);
+    uint32_t u2 = LD32(R(14) + 0x28);
+    memcpy(&x1, &u1, 4);
+    memcpy(&x2, &u2, 4);
+    float elem_x = (x1 + x2) * 0.5f;
+    float anchor = 0.5f;
+    if (elem_x < 40.0f) {
+      anchor = 0.0f; /* Left-anchored HUD (Health bar) */
+    } else if (elem_x > 60.0f) {
+      anchor = 1.0f; /* Right-anchored HUD (Lums counter, Air meter) */
+    }
+    float sq;
+    uint32_t sq_u = LD32(R(3));
+    memcpy(&sq, &sq_u, 4);
+    float off = anchor * 100.0f * (1.0f - sq);
+    uint32_t off_u;
+    memcpy(&off_u, &off, 4);
+    c->fr[1] = off_u;
+    ST32(R(15) + 0x78, off_u);
+  }
   R(0)=0x1cu;
   fp_mov(c,3,1);
   fp_ld(c,1,R(0)+R(14));

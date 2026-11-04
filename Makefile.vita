@@ -102,7 +102,7 @@ CFLAGS          := $(OPT) -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
                    -DCPA_PLATFORM_VITA -DR2_DREAMCAST_BASELINE -D__vita__ \
                    -I$(RECOMP_DIR) -I$(HGEN) -I$(HLE_DIR) -Iinclude -Isrc/platform/vita
 
-LDFLAGS         := -Wl,-q -Wl,--gc-sections -L$(VITASDK)/arm-vita-eabi/lib
+LDFLAGS         := -Wl,-q -Wl,--gc-sections -Wl,--defsym,__sce_headroom=0x20000 -L$(VITASDK)/arm-vita-eabi/lib
 # V_ORDER=1 (variants *_packed): a linker script (default script + hot list, hotorder.py) puts the .text.f_<addr> sections of the profiled hot functions (hot_funcs.txt, most-called first) contiguously at the
 # start of .text, so the hot set occupies ~1/3 of the pages / cache sets it is otherwise spread over (the lifter emits functions in address order; hot and cold interleave).
 HOT_ORDER       := $(BUILD_DIR)/hot_order.ld

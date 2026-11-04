@@ -168,6 +168,26 @@ static void t6(void) {
     snd_test_regwrite(1 * 0x80 + 0x24, 0x1F << 8);
     snd_test_advance(50, NULL); snd_get_stats(&s);
     CHECK(s.active_channels == 1, "register write on active ch1 leaves playback undisturbed (active %d, expect 1)", s.active_channels);
+    /* multi-channel key-on: ch2 configured with KYONB=1 (no KYONEX), ch3 with KYONB=1 + KYONEX */
+    for (int c = 2; c <= 3; c++) { chreg(c, 0, 0); chreg(c, 4, 0x1000); chreg(c, 8, 0); chreg(c, 0xC, 441); chreg(c, 0x10, 31); chreg(c, 0x14, 31); chreg(c, 0x18, 0); chreg(c, 0x24, 0xF << 8); }
+    chreg(2, 0, 1 << 9); chreg(3, 0, 1 << 9);
+    snd_test_regwrite(2 * 0x80, snd_test_regs()[(2 * 0x80) >> 2] | 0x4000);             /* KYONB=1 only */
+    snd_test_regwrite(3 * 0x80, snd_test_regs()[(3 * 0x80) >> 2] | 0x4000 | 0x8000);   /* KYONB=1 + KYONEX */
+    snd_test_advance(50, NULL); snd_get_stats(&s);
+    CHECK(s.active_channels == 3, "multi-channel key-on starts both ch2 and ch3 (active %d, expect 3)", s.active_channels);
+    /* voice stealing / rapid re-trigger: active ch2 re-triggered with KYONB=1 + KYONEX restarts cleanly */
+    snd_test_regwrite(2 * 0x80, snd_test_regs()[(2 * 0x80) >> 2] | 0x4000 | 0x8000);
+    snd_test_advance(50, NULL); snd_get_stats(&s);
+    CHECK(s.active_channels == 3, "voice stealing re-trigger keeps ch2 active without drop (active %d, expect 3)", s.active_channels);
+    /* active ring voice at 0x18000 must not be restarted by KYONEX on another channel or itself */
+    chreg(4, 0, 0); chreg(4, 4, 0x18000); chreg(4, 8, 0); chreg(4, 0xC, 8192); chreg(4, 0x10, 31); chreg(4, 0x14, 31); chreg(4, 0x18, 0); chreg(4, 0x24, 0xF << 8);
+    chreg(4, 0, 1 << 9);
+    keyon(4);
+    snd_test_advance(100, NULL); snd_get_stats(&s);
+    CHECK(s.active_channels == 4, "ring voice ch4 started (active %d, expect 4)", s.active_channels);
+    snd_test_regwrite(4 * 0x80, snd_test_regs()[(4 * 0x80) >> 2] | 0x4000 | 0x8000);
+    snd_test_advance(50, NULL); snd_get_stats(&s);
+    CHECK(s.active_channels == 4, "ring voice ch4 protected from re-trigger while active (active %d, expect 4)", s.active_channels);
 }
 
 /* ---- T7: the sd command block (0x13200..0x1330F) is written word by word by the guest while the audio thread runs the ARM7: the AICA must not advance inside a block write ---- */
