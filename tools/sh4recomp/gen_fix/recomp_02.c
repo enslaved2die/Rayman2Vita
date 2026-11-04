@@ -1864,9 +1864,11 @@ L8c026c8a:;
       uint32_t s = 0x8c131e94u + i * 0x41cu;
       uint8_t a = LD8(s + 0x410);
       uint8_t f = LD8(s + 0x413);
-      if (a == 0 && !(f & 0x01) && LD8(s) == 0) {
+      if (a == 0 && !(f & 0x01)) {
         R(5) = i;
         R(6) = s;
+        ST8(s, 0);
+        ST8(s + 0x413, 0);
         c->t = 0;
         break;
       }
@@ -1956,8 +1958,11 @@ L8c026d40:;
   R(0)=0x410u;
   fp_ftrc(c,3);
   R(2)=c->fpul;
-  if ((R(2) & 0xFF) != 0 || (LD8(R(14) + 0x413) & 0x02) || LD8(R(14)) == 0) {
-    ST8(R(14)+R(0),R(2));
+  uint8_t slot_flags = LD8(R(14) + 0x413);
+  if ((slot_flags & 0x08) && (R(2) & 0xFF) == 0 && !(slot_flags & 0x02)) {
+    /* Preserve 2D dialog box alpha when 3D speaker actor leaves camera frustum during active dialogue */
+  } else {
+    ST8(R(14)+R(0), R(2));
   }
 L8c026d5a:;
   R(0)=0x410u;
@@ -2104,19 +2109,10 @@ void f_8c026ec0(SH4Ctx *c) {
   { uint32_t k=c->t; c->fr[13]=0x00000000u; if(k) goto L8c026f06; }
   R(3)=0x8c0c52e4u;
   {
-    float elem_x;
-    uint32_t elem_x_u = LD32(R(8) + 0x404);
-    memcpy(&elem_x, &elem_x_u, 4);
-    float anchor_factor = 0.5f;
-    if (elem_x < 400.0f) {
-      anchor_factor = 0.0f;
-    } else if (elem_x > 600.0f) {
-      anchor_factor = 1.0f;
-    }
     float sq;
     uint32_t sq_u = LD32(R(3));
     memcpy(&sq, &sq_u, 4);
-    float off_x = anchor_factor * 1000.0f * (1.0f - sq);
+    float off_x = 0.5f * 1000.0f * (1.0f - sq);
     uint32_t off_u;
     memcpy(&off_u, &off_x, 4);
     c->fr[13] = off_u;
@@ -2437,19 +2433,10 @@ void f_8c027200(SH4Ctx *c) {
   { uint32_t k=c->t; R(8)=R(12); if(k) goto L8c027252; }
   R(3)=0x8c0c52e4u;
   {
-    float elem_x;
-    uint32_t elem_x_u = LD32(R(10) + 0x404);
-    memcpy(&elem_x, &elem_x_u, 4);
-    float anchor_factor = 0.5f;
-    if (elem_x < 400.0f) {
-      anchor_factor = 0.0f;
-    } else if (elem_x > 600.0f) {
-      anchor_factor = 1.0f;
-    }
     float sq;
     uint32_t sq_u = LD32(R(3));
     memcpy(&sq, &sq_u, 4);
-    float off_x = anchor_factor * 1000.0f * (1.0f - sq);
+    float off_x = 0.5f * 1000.0f * (1.0f - sq);
     uint32_t off_u;
     memcpy(&off_u, &off_x, 4);
     ST32(R(15) + 0x20, off_u);
