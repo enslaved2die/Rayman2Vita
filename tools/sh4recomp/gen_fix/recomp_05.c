@@ -13705,7 +13705,19 @@ void f_8c039ce6(SH4Ctx *c) {
   {uint32_t v=LD32(R(15));R(15)+=4;c->pr=v;}
   R(2)=LD32(R(4));
   R(2)+=0xffffffffu;
-  { ST32(R(4),R(2)); return; }
+  ST32(R(4),R(2));
+  {
+    uint32_t km_list = LD32(0x8c0fa894u);
+    if (km_list) {
+      uint32_t buf_idx = LD32(0x8c0c54e4u);
+      uint32_t fb_desc = LD32(km_list + ((buf_idx & 1) << 2));
+      if (fb_desc) {
+        uint32_t fb_off = LD32(fb_desc + 28);
+        vita_gl_present_fb(fb_off);
+      }
+    }
+    return;
+  }
 }
 void f_8c039cf8(SH4Ctx *c) {
   {uint32_t v=c->pr;R(15)-=4;ST32(R(15),v);}
@@ -13722,7 +13734,19 @@ void f_8c039d08(SH4Ctx *c) {
   {uint32_t v=LD32(R(15));R(15)+=4;c->pr=v;}
   R(2)=LD32(R(4));
   R(2)+=0xffffffffu;
-  { ST32(R(4),R(2)); return; }
+  ST32(R(4),R(2));
+  {
+    uint32_t km_list = LD32(0x8c0fa894u);
+    if (km_list) {
+      uint32_t buf_idx = LD32(0x8c0c54e4u);
+      uint32_t fb_desc = LD32(km_list + ((buf_idx & 1) << 2));
+      if (fb_desc) {
+        uint32_t fb_off = LD32(fb_desc + 28);
+        vita_gl_present_fb(fb_off);
+      }
+    }
+    return;
+  }
 }
 void f_8c039e00(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
@@ -14679,7 +14703,18 @@ L8c03a890:;
   R(1)=0x994u;
   R(15)+=R(1);
   {uint32_t v=LD32(R(15));R(15)+=4;c->pr=v;}
-  { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
+  { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;}
+    uint32_t km_list = LD32(0x8c0fa894u);
+    if (km_list) {
+      uint32_t buf_idx = LD32(0x8c0c54e4u);
+      uint32_t fb_desc = LD32(km_list + ((buf_idx & 1) << 2));
+      if (fb_desc) {
+        uint32_t fb_off = LD32(fb_desc + 28);
+        vita_gl_present_fb(fb_off);
+      }
+    }
+    return;
+  }
 }
 void f_8c03a89c(SH4Ctx *c) {
   R(4)=0x8c0c5534u;

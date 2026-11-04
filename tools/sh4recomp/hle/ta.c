@@ -578,10 +578,7 @@ int ta_build_gl_reuse(const TaFrame *f, TaGl *g, const TaBuildOpts *o)
                     if (!(fin_f(d[0].x) & fin_f(d[0].y) & fin_f(d[1].x) & fin_f(d[1].y) & fin_f(d[2].x) & fin_f(d[2].y) &
                           fin_f(d[0].u) & fin_f(d[0].v) & fin_f(d[1].u) & fin_f(d[1].v) & fin_f(d[2].u) & fin_f(d[2].v))) continue;
                     int num_behind = (d[0].z <= 0.f || !fin_f(d[0].z)) + (d[1].z <= 0.f || !fin_f(d[1].z)) + (d[2].z <= 0.f || !fin_f(d[2].z));
-                    if (num_behind == 3) continue;
-                    if (d[0].z <= 0.f || !fin_f(d[0].z)) d[0].z = 1e-4f;
-                    if (d[1].z <= 0.f || !fin_f(d[1].z)) d[1].z = 1e-4f;
-                    if (d[2].z <= 0.f || !fin_f(d[2].z)) d[2].z = 1e-4f;
+                    if (num_behind > 0) continue;
                 }
                 if (textured) {   /* rebase UVs so GLES varyings stay small: wrap is periodic (repeat: 1, mirror: 2), clamp axes untouched */
                     float mu = fmin_f(d[0].u, fmin_f(d[1].u, d[2].u)), mv = fmin_f(d[0].v, fmin_f(d[1].v, d[2].v));

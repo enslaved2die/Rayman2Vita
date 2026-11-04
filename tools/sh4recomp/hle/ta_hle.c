@@ -15,6 +15,7 @@
 #if defined(__vita__) || defined(R2_HOST_GL)
 #include "vita_gl_render.h"      /* R2_HOST_GL: host build that runs the real vita_gl_render.c against hle/tests_ta/fakegl (see tests_ta/Makefile `rungl`) */
 #endif
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -34,22 +35,71 @@ unsigned long hle_ta_frame_no(void) { return ta_frames; }
  *             is  fx'/fx = tan(t0)/tan(K3*t0)  with t0 = 0.6 rad:  K3=1.2 -> 0.781 (measured 0.7806), K3=4/3 -> 0.664 (measured 0.6644), y scale unchanged.  K3 is an ANGLE factor, not a tan factor.
  *     SQ (2D): multiplied into the x of every screen-space 2D layout routine (HUD, menu, font, sprites; ~20 pool references, e.g. around 0x8C026040): x' = 320 + (x-320)*SQ.
  *   The option itself is the word 0x8C2D0F44 (set by FUN_8C04C31E, the options-menu setter; 0 = 4:3, 1 = 16:9).
- * The renderer maps the 640x480 screen space onto the whole 960x544 display: x*1.5, y*1.1333.  Square pixels need the guest-side x scale to be (544/480)/(960/640) = 0.7556 of the 4:3 one:
- *   2D: SQ = 0.7556 (patched, exact);  3D: tan(K3*t0) = tan(t0)/0.7556  ->  K3 = 1.2282 (patched; the shipped 1.2/0.8333 pair leaves 3D 3.3% too wide and 2D 10% too wide on 16:9).
- * Controls: env R2_WIDE=0 starts in 4:3 (default 1), R2_WIDE_K3 / R2_WIDE_SQ override the two factors (1.2 / 0.8333 = shipped), hle_ta_wide_set() flips at run time. */
+ * The renderer maps the 640x480 screen space onto the whole 960x544 display: x*1.5, y*1.1333 (stretch ratio 45/34 = 1.3235).
+ * Square pixels need the guest-side x scale to be (544/480)/(960/640) = 34/45 = 0.755556 of the 4:3 baseline:
+ *   2D: SQ = 34/45 = 0.755556 (patched, exact);
+ *   3D: tan(K3*pi/4) = 45/34  ->  K3 = atan(45/34) / (pi/4) = 1.176154f (exact 1:1 pixel aspect ratio; 0.00% distortion).
+ * Controls: env R2_WIDE=0 starts in 4:3 (default 1), R2_WIDE_K3 / R2_WIDE_SQ override the two factors, hle_ta_wide_set() flips at run time. */
 static int wide_pref = 1, wide_last = -1, wide_patched;
 static float wide_k = 1.3436f, wide_sq = 0.755556f;
 #define WIDE_FLAG_ADDR   0x8C0C52DCu
 #define WIDE_OPTION_ADDR 0x8C2D0F44u
 #define WIDE_POOL_K      0x8C0370ECu      /* float 1.2    (3D horizontal FOV angle factor) */
 #define WIDE_POOL_SQ     0x8C0370F0u      /* float 0.8333 (2D x squeeze) */
-void hle_ta_wide_set(int on) { wide_pref = on ? 1 : 0; }
-int  hle_ta_wide_pref(void) { return wide_pref; }
+
+#if defined(__vita__)
+static const char *config_path = "ux0:data/rayman2/config.ini";
+#else
+static const char *config_path = "config.ini";
+#endif
+
+static int config_loaded = 0;
+
+static void config_load(void) {
+    if (config_loaded) return;
+    config_loaded = 1;
+    wide_pref = 1;
+    FILE *f = fopen(config_path, "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        int v;
+        if (sscanf(line, "widescreen = %d", &v) == 1 || sscanf(line, "widescreen=%d", &v) == 1) {
+            wide_pref = v ? 1 : 0;
+        }
+    }
+    fclose(f);
+}
+
+static void config_save(void) {
+    FILE *f = fopen(config_path, "w");
+    if (!f) {
+        hle_log("[ta] wide: failed to open %s for writing", config_path);
+        return;
+    }
+    fprintf(f, "[video]\nwidescreen = %d\n", wide_pref ? 1 : 0);
+    fclose(f);
+}
+
+void hle_ta_wide_set(int on) {
+    wide_pref = on ? 1 : 0;
+    config_save();
+    *hle_ptr(WIDE_FLAG_ADDR) = (uint8_t)wide_pref;
+    *(uint32_t *)hle_ptr(WIDE_OPTION_ADDR) = (uint32_t)wide_pref;
+    wide_last = wide_pref;
+}
+
+int  hle_ta_wide_pref(void) {
+    if (!config_loaded) config_load();
+    return wide_pref;
+}
 int  hle_ta_wide_active(void) { return *hle_ptr(WIDE_FLAG_ADDR) == 1; }
 float hle_ta_wide_k(void) { return wide_k; }
+
 static void wide_tick(void) {
     if (!wide_patched) {
         wide_patched = 1;
+        config_load();
         const char *e = getenv("R2_WIDE"); if (e && *e) wide_pref = atoi(e) != 0;
         e = getenv("R2_WIDE_K3"); if (e && *e) { float k = (float)atof(e); if (k >= 1.0f && k <= 2.0f) wide_k = k; }
         e = getenv("R2_WIDE_SQ"); if (e && *e) { float k = (float)atof(e); if (k >= 0.3f && k <= 1.0f) wide_sq = k; }
@@ -59,19 +109,11 @@ static void wide_tick(void) {
         else hle_log("[ta] wide: constant pool not as expected (%08x %08x), k left unpatched", a, b);
     }
     uint8_t *flag = hle_ptr(WIDE_FLAG_ADDR);
-    uint32_t opt = 0;
-    memcpy(&opt, hle_ptr(WIDE_OPTION_ADDR), 4);
     if (wide_last < 0) {
         wide_last = wide_pref;
         *flag = (uint8_t)wide_pref;
         uint32_t o = (uint32_t)wide_pref;
         memcpy(hle_ptr(WIDE_OPTION_ADDR), &o, 4);
-    } else if (opt != (uint32_t)wide_last) {
-        /* Sync with option menu setting */
-        wide_last = opt ? 1 : 0;
-        wide_pref = wide_last;
-        *flag = (uint8_t)wide_last;
-        hle_log("[ta] wide: synced with options menu -> %s", wide_pref ? "16:9" : "4:3");
     }
 }
 

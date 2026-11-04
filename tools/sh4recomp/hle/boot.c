@@ -286,6 +286,7 @@ uint32_t hle_vram_max_epoch(uint32_t off, uint32_t len) {
  * 0x655000..0x6a0000, i.e. on Rayman's character textures (surfaces 0x2852c0..0x292ac0: torso, hair, ...), which then rendered black (see re_analysis/dc/notes_textures.md).
  * CPU accesses to the 64-bit area inside any FB region seen in the SOF registers are therefore kept in a separate shadow buffer. */
 static uint8_t fbshadow[8 << 20];
+uint8_t *hle_fbshadow_ptr(void) { return fbshadow; }
 static struct { uint32_t lo, hi; } fb_rng[8]; static int fb_nrng; 
 static void fb_note1(uint32_t sof, uint32_t len) {
     uint32_t lo = sof & 0x7FFFFF, hi = lo + len; if (hi > 0x800000u) hi = 0x800000u;

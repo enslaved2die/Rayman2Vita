@@ -256,7 +256,6 @@ static int game_main(void) {
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
 
     /* 2. Initialize vitaGL hardware rendering context */
-    hle_ta_wide_set(R2_VITA_WIDE);
     vita_gl_render_init();
     vita_log("[vita] render thread: %s (game cpu mask 0x%x, audio 0x%x, render 0x%x; R2_RENDER_THREAD default %d, disable at run time with an empty file ux0:data/rayman2/NO_RENDER_THREAD)",
              vita_gl_rt_active() ? "ACTIVE (build + texture upload + GL submit + swap on the render thread)" : "off (inline on the game thread)", (unsigned)R2_GAME_CPU, (unsigned)R2_AUDIO_CPU, (unsigned)R2_RENDER_CPU, R2_RENDER_THREAD);

@@ -5,6 +5,8 @@
 #                    (b) the software model of the vitaGL path (test_glpath) must reproduce tools/ta_render.py's picture.
 CFLAGS ?= -O1 -std=gnu11 -Wall -Wextra -I../.. -I../../gen -frounding-math
 FRAMEDIR ?= ../../build_hle
+.PHONY: check test
+check: test
 test: test_ta.c ../ta.c ../ta.h
 	cc $(CFLAGS) test_ta.c ../ta.c -lm -o test_ta && ./test_ta
 test-real: test_ta.c ../ta.c ../ta.h

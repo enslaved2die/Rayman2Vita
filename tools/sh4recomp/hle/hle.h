@@ -71,6 +71,7 @@ void hle_set_ta_dma_sink(void (*fn)(uint32_t dst, const uint8_t *src, uint32_t l
 /* ---- PVR core hooks (boot.c -> ta glue) ---- */
 void hle_set_startrender_cb(void (*fn)(SH4Ctx *c));   /* called when the guest writes PVR STARTRENDER (0xA05F8014), before the EOR interrupt is queued */
 uint8_t *hle_vram_ptr(void);                          /* 8 MiB host VRAM image (physical 0x04000000 + offset, 32-bit area view) */
+uint8_t *hle_fbshadow_ptr(void);                      /* 8 MiB host frame-buffer shadow (physical VRAM 64-bit area writes) */
 /* VRAM dirty-page epochs: newest write stamp over vram[off, off+len) (4 KiB pages); calling it opens a new epoch, so equal values at two calls mean "no byte of the range
  * changed in between" (writes that do not change a byte, and frame-buffer-shadow writes, do not count). Used by the texture cache (texmap.c / vita_gl_render.c). */
 uint32_t hle_vram_max_epoch(uint32_t off, uint32_t len);

@@ -99,6 +99,7 @@ typedef struct { uint32_t tcw, tsp; int slot; } TexRef;
 typedef struct RenderJob {
     TaFrame *frame;                     /* owned by the job: freed by the render side after drawing (NULL until parsed when raw != NULL) */
     TaRaw *raw; uint32_t shad_scale;    /* deferred parse: captured packets, parsed by the render thread; FPU_SHAD_SCALE as of STARTRENDER */
+    int is_fb; uint32_t fb_off;         /* direct frame-buffer presentation job (swirl / loading vignet) */
     uint32_t regs[2048];                /* PVR register file 0x5F8000..0x5F9FFF at STARTRENDER (palette RAM at word 0x400, fog table at 0x80 ...) */
     float bg[3][4]; uint32_t bg_isp, bg_tsp, bg_tcw; int have_bg;   /* ISP_BACKGND plane (lives in VRAM) */
     int wide;                           /* hle_ta_wide_active() */
@@ -570,18 +571,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
         s_fv = (TaClipVertex *)malloc(s_cv_cap * sizeof(TaClipVertex));
         if (!s_cv || !s_fv) { free(s_cv); free(s_fv); s_cv = s_fv = NULL; s_cv_cap = 0; return; }
     }
-    static float s_stable_cut = 0.0f;
-    float raw_cut = ta_gl_depth_cut(&gl);
-    float cut;
-    if (s_stable_cut <= 0.0f || fabsf(raw_cut - s_stable_cut) > s_stable_cut * 0.8f) {
-        cut = s_stable_cut = raw_cut;
-    } else {
-        float max_d = s_stable_cut * 0.04f;
-        if (raw_cut > s_stable_cut + max_d) s_stable_cut += max_d;
-        else if (raw_cut < s_stable_cut - max_d) s_stable_cut -= max_d;
-        else s_stable_cut = raw_cut;
-        cut = s_stable_cut;
-    }
+    float cut = 1.0f;
     ta_gl_make_clip(gl.verts, gl.nverts, cut, s_cv);
     s_ph.build = r2_now_us();
 #if R2_PERF
@@ -966,6 +956,7 @@ static RenderJob *prepare_job(TaFrame *frame, TaRaw *raw, uint32_t shad)
     RenderJob *j = &s_jobs[s_job_next];
     uint64_t t0 = r2_now_us();
     s_gframe_no++;
+    j->is_fb = 0; j->fb_off = 0;
     j->frame = frame; j->raw = raw; j->shad_scale = shad; j->nops = 0; j->nrefs = 0;
     memcpy(j->regs, hle_pvr_regs(), sizeof j->regs);
     j->have_bg = hle_ta_background(j->bg, &j->bg_isp, &j->bg_tsp, &j->bg_tcw);
@@ -1001,6 +992,18 @@ static RenderJob *prepare_job(TaFrame *frame, TaRaw *raw, uint32_t shad)
     return j;
 }
 
+static RenderJob *prepare_fb_job(uint32_t fb_off)
+{
+    RenderJob *j = &s_jobs[s_job_next];
+    s_job_next = (s_job_next + 1) % (RT_JOBS + 1);
+    s_gframe_no++;
+    memset(j, 0, sizeof(*j));
+    j->is_fb = 1;
+    j->fb_off = fb_off;
+    j->fpmode = fp_get();
+    return j;
+}
+
 static void render_job_exec(RenderJob *j)
 {
 #if R2_PERF
@@ -1008,6 +1011,74 @@ static void render_job_exec(RenderJob *j)
 #endif
     uint32_t fp_saved = fp_get();
     if (fp_saved != j->fpmode) fp_set(j->fpmode);     /* no-op inline; on the render thread: the guest's rounding mode */
+    if (j->is_fb) {
+        s_frame_no++;
+        vita_gl_perf.frames++;
+        static GLuint s_fb_tex = 0;
+        if (!s_fb_tex) {
+            glGenTextures(1, &s_fb_tex);
+            glBindTexture(GL_TEXTURE_2D, s_fb_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, s_fb_tex);
+        }
+        s_cur_tex = s_fb_tex;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 640, 480, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, hle_fbshadow_ptr() + (j->fb_off & 0x7FFFFF));
+
+        int wide = hle_ta_wide_active();
+        if (!wide) {
+            glViewport(0, 0, SCREEN_W, SCREEN_H);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+        int vp_x = wide ? 0 : VIEW_X, vp_w = wide ? SCREEN_W : VIEW_W;
+        glViewport(vp_x, 0, vp_w, SCREEN_H);
+
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_ALPHA_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_SCISSOR_TEST);
+        glDepthMask(GL_FALSE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+        glEnable(GL_TEXTURE_2D);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+
+        float id[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        glMatrixMode(GL_PROJECTION); glLoadMatrixf(id);
+        glMatrixMode(GL_MODELVIEW); glLoadMatrixf(id);
+
+        static const TaClipVertex qv[6] = {
+            { -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f },
+            {  1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f },
+            {  1.0f,  1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f },
+            { -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f },
+            {  1.0f,  1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f },
+            { -1.0f,  1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f },
+        };
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glEnableClientState(GL_COLOR_ARRAY);
+        glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+        glVertexPointer(3, GL_FLOAT, sizeof(TaClipVertex), &qv[0].px);
+        glTexCoordPointer(2, GL_FLOAT, sizeof(TaClipVertex), &qv[0].u);
+        glColorPointer(4, GL_FLOAT, sizeof(TaClipVertex), &qv[0].r);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glDisableClientState(GL_VERTEX_ARRAY);
+
+        s_cur_tex = (GLuint)-1;
+        if (fp_saved != j->fpmode) fp_set(fp_saved);
+#if R2_PERF
+        g_perf.t_render += r2_now_us() - t0;
+#endif
+        return;
+    }
     vita_gl_render_frame_impl(j);
     if (fp_saved != j->fpmode) fp_set(fp_saved);
 #if R2_PERF
@@ -1088,7 +1159,7 @@ static void render_thread_loop(void)
             snprintf(ln, sizeof ln, "[perf] RT first frames #%d: waited for job %llu us | ops/uploads %llu | build+cut %llu | up to clear %llu | glClear %llu | setup %llu | draws %llu (first glDrawArrays %llu) | swap %llu | total %llu us (verts %u)",
                      s_frame_no, (unsigned long long)s_ph_wait, PH(s_ph.ops, s_ph.t0), PH(s_ph.build, s_ph.ops), PH(s_ph.clear0, s_ph.build),
                      PH(s_ph.clear1, s_ph.clear0), PH(s_ph.draw0, s_ph.clear1), PH(s_ph.draws_end, s_ph.draw0), PH(s_ph.first_draw1, s_ph.first_draw0),
-                     (unsigned long long)(t_sw1 - t_sw0), (unsigned long long)(t_sw1 - s_ph.t0), (unsigned)j->frame->nverts);
+                     (unsigned long long)(t_sw1 - t_sw0), (unsigned long long)(t_sw1 - s_ph.t0), (unsigned)(j->frame ? j->frame->nverts : 0));
             rt_log(ln);
         }
         ta_frame_free(j->frame); j->frame = NULL;
@@ -1168,6 +1239,20 @@ void vita_gl_present_raw(TaRaw *raw, uint32_t shad_scale)
 #endif
 }
 
+void vita_gl_present_fb(uint32_t fb_off)
+{
+    if (s_rt_on) {
+        rsem_wait(&s_sem_free);
+        s_ring[s_ring_head] = prepare_fb_job(fb_off);
+        s_ring_head = (s_ring_head + 1) % (RT_JOBS + 1);
+        rsem_post(&s_sem_job);
+    } else {
+        RenderJob *j = prepare_fb_job(fb_off);
+        render_job_exec(j);
+        render_swap();
+    }
+}
+
 /* ---- inline (single-thread) path, API unchanged: vita_gl_render_frame(f); vita_gl_swap(); caller frees f ---- */
 void vita_gl_render_frame(const TaFrame *frame)
 {
@@ -1190,6 +1275,7 @@ void vita_gl_render_frame(const TaFrame *frame) { (void)frame; }
 void vita_gl_swap(void) {}
 void vita_gl_present_frame(TaFrame *frame) { ta_frame_free(frame); }
 void vita_gl_present_raw(TaRaw *raw, uint32_t shad_scale) { (void)shad_scale; ta_raw_free(raw); }
+void vita_gl_present_fb(uint32_t fb_offset) { (void)fb_offset; }
 int vita_gl_rt_active(void) { return 0; }
 void vita_gl_texture_cache_clear(void) {}
 

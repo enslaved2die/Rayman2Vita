@@ -1,4 +1,6 @@
 #include "recomp_decls.h"
+int hle_ta_wide_pref(void);
+void hle_ta_wide_set(int on);
 void f_8c044d22(SH4Ctx *c) {
   R(6)=0x0u;
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
@@ -12206,6 +12208,9 @@ void f_8c04c318(SH4Ctx *c) {
   { ST32(R(1),R(4)); return; }
 }
 void f_8c04c31e(SH4Ctx *c) {
+  if (c->pr == 0x8c030644u) {
+    hle_ta_wide_set(R(4) ? 1 : 0);
+  }
   R(2)=0x8c2d0f44u;
   R(3)=R(4);
   {uint32_t v=R(4);R(15)-=4;ST32(R(15),v);}
@@ -12252,9 +12257,9 @@ void f_8c04c3c0(SH4Ctx *c) {
   { c->pr=0x8c04c3c8u; R(4)=0x7fu; f_8c04c336(c); }
   { c->pr=0x8c04c3ccu; R(4)=0x7fu; f_8c04c34e(c); }
   R(0)=0xb6cu;
-  R(4)=0x0u;
-  R(14)=0x8c2d03d8u;
-  R(5)=R(4);
+  R(4) = (uint32_t)hle_ta_wide_pref();
+  R(14) = 0x8c2d03d8u;
+  R(5) = R(4);
   R(3)=0x8c123c48u;
   R(2)=0x8c03703au;
   ST32(R(14)+R(0),R(4));
