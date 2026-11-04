@@ -17,6 +17,7 @@ void hle_hook(uint32_t a, hle_fn f) { (void)a; (void)f; }
 void hle_orig(SH4Ctx *c, uint32_t a) { (void)c; (void)a; }
 static uint8_t *g_vram; static uint32_t g_pvr[2048];
 uint8_t *hle_vram_ptr(void) { return g_vram; }
+uint8_t *hle_fbshadow_ptr(void) { static uint8_t fb[8 << 20]; return fb; }
 const uint32_t *hle_pvr_regs(void) { return g_pvr; }
 uint32_t hle_pvr_pal_epoch(void) { return 1; }
 uint32_t hle_pvr_fog_epoch(void) { return 1; }

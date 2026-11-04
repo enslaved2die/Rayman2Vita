@@ -13727,6 +13727,15 @@ void f_8c039ce6(SH4Ctx *c) {
 }
 void f_8c039cf8(SH4Ctx *c) {
   {uint32_t v=c->pr;R(15)-=4;ST32(R(15),v);}
+  {
+    /* swirl init (once per level load): the game's CPU swirl/fade draws on top of the frozen last scene, which only exists on the host GL side -> snapshot it into both FB shadows
+     * (before f_8c03994a copies display->render buffer, or clears both when the flag at 0x8c0c42a4 is 0) */
+    uint32_t km_list = LD32(0x8c0fa894u);
+    if (km_list) {
+      uint32_t d0 = LD32(km_list), d1 = LD32(km_list + 4);
+      if (d0 && d1) vita_gl_capture_scene(LD32(d0 + 28), LD32(d1 + 28));
+    }
+  }
   { c->pr=0x8c039cfeu;  f_8c039640(c); }
   R(3)=0x8c0c54e8u;
   R(1)=0x0u;

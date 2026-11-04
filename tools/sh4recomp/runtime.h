@@ -50,6 +50,7 @@ typedef void (*sh4_fn)(SH4Ctx *);
 extern uint8_t sh4_ram[SH4_RAM_SIZE];
 extern unsigned long sh4_stat_unmapped;     /* count of slow-path/unmapped accesses */
 void vita_gl_present_fb(uint32_t fb_offset);
+void vita_gl_capture_scene(uint32_t off0, uint32_t off1);
 
 #define R(n) (c->r[n])
 

@@ -23,6 +23,7 @@ void vita_gl_swap(void);
 void vita_gl_present_frame(TaFrame *frame);
 void vita_gl_present_raw(TaRaw *raw, uint32_t shad_scale);     /* deferred parse: raw TA packets of one scene (ta.h TaRaw), parsed on the render thread; takes ownership */
 void vita_gl_present_fb(uint32_t fb_offset);                   /* direct frame-buffer presentation (swirl / loading vignet) */
+void vita_gl_capture_scene(uint32_t off0, uint32_t off1);       /* snapshot the last presented scene into the 640x480 RGB565 frame-buffer shadows at off0/off1 (base image of the swirl) */
 int  vita_gl_rt_active(void);
 
 /* per-process GL submission counters (cheap; read by vita_main.c's periodic log and by the host fake-GL test) */

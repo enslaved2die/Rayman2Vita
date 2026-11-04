@@ -58,7 +58,7 @@ int main(int argc, char **argv)
     f.verts = malloc(nv * sizeof(TaVertex)); memcpy(f.verts, fr + 16 + 32 * ns, nv * sizeof(TaVertex)); f.nverts = nv;
     TaGl gl; TaBuildOpts o = { 1, 1, -2.f, -2.f, 642.f, 482.f };
     if (ta_build_gl_ex(&f, &gl, &o)) return 1;
-    float cut = ta_gl_depth_cut(&gl), M[16]; ta_gl_projection(cut, M);
+    float cut = ta_gl_depth_cut(&gl), M[16]; if (getenv("R2_CUT")) cut = (float)atof(getenv("R2_CUT"));   /* experiment: override the depth ceiling (1.0 = no 1/W clamp at all) */ ta_gl_projection(cut, M);
     TaClipVertex *cv = malloc((gl.nverts + 1) * sizeof *cv); ta_gl_make_clip(gl.verts, gl.nverts, cut, cv);
     memset(fb, 0, sizeof fb); memset(zb, 0, sizeof zb);                 /* clear: colour 0, depth 0 (GL_GREATER) */
     static const int order[3] = { TA_L_OPAQUE, TA_L_PUNCH, TA_L_TRANS };
@@ -68,6 +68,7 @@ int main(int argc, char **argv)
         int L = order[li];
         for (uint32_t b = 0; b < gl.list_count[L]; b++) {
             const TaBatch *bt = &gl.batches[gl.list_first[L] + b]; const TaState *st = &bt->st;
+            if (getenv("R2_NOBUMP") && st->textured && ((st->tcw >> 27) & 7) == 4) continue;   /* experiment: skip bump-format batches */
             const Tex *tx = st->textured ? get_tex(vr, vn, &env, st->tcw, st->tsp) : NULL;
             int clamp_u = st->clamp_u, clamp_v = st->clamp_v, flip_u = st->flip_u, flip_v = st->flip_v;   /* TSP: 15 ClampV, 16 ClampU, 17 FlipV, 18 FlipU (decoded by ta_decode_header) */
             for (uint32_t t = 0; t + 2 < bt->count; t += 3) {
@@ -88,7 +89,7 @@ int main(int argc, char **argv)
                     if (l0 < 0 || l1 < 0 || l2 < 0) continue;
                     float z = l0 * sz[0] + l1 * sz[1] + l2 * sz[2];
                     int pass; float zo = zb[y][x];
-                    switch (st->depth_mode & 7) { case 0: pass = 0; break; case 1: pass = z < zo; break; case 2: pass = z == zo; break; case 3: pass = z <= zo; break; case 4: pass = z > zo; break; case 5: pass = z != zo; break; case 6: pass = z >= zo; break; default: pass = 1; }
+                    switch (st->depth_mode & 7) { case 0: pass = 0; break; case 1: pass = z < zo; break; case 2: pass = z == zo; break; case 3: pass = z <= zo; break; case 4: pass = (L == TA_L_TRANS) ? z >= zo : z > zo; break;   /* translucent ties pass (coplanar overlays), mirrors vita_gl_render.c */ case 5: pass = z != zo; break; case 6: pass = z >= zo; break; default: pass = 1; }
                     if (!pass) continue;
                     float p0 = l0 / cw[0], p1 = l1 / cw[1], p2 = l2 / cw[2], ps = p0 + p1 + p2; p0 /= ps; p1 /= ps; p2 /= ps;   /* GL perspective-correct weights */
                     const TaClipVertex *v0 = &cv[bt->first + t], *v1 = v0 + 1, *v2 = v0 + 2;

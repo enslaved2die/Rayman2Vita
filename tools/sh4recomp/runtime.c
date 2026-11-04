@@ -6,6 +6,7 @@ uint8_t sh4_ram[SH4_RAM_SIZE];
 unsigned long sh4_stat_unmapped;
 unsigned long sh4_stat_io_rd, sh4_stat_io_wr;      /* slow-path loads / stores that are not store-queue accesses (perf.c prints them per frame) */
 __attribute__((weak)) void vita_gl_present_fb(uint32_t fb_offset) { (void)fb_offset; }
+__attribute__((weak)) void vita_gl_capture_scene(uint32_t off0, uint32_t off1) { (void)off0; (void)off1; }
 static void default_fault(const char *what, uint32_t a, uint32_t b) {
     fprintf(stderr, "sh4 fault: %s %08x %08x\n", what, a, b); abort();
 }

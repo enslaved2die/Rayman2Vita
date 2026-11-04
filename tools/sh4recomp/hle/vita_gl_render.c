@@ -100,6 +100,7 @@ typedef struct RenderJob {
     TaFrame *frame;                     /* owned by the job: freed by the render side after drawing (NULL until parsed when raw != NULL) */
     TaRaw *raw; uint32_t shad_scale;    /* deferred parse: captured packets, parsed by the render thread; FPU_SHAD_SCALE as of STARTRENDER */
     int is_fb; uint32_t fb_off;         /* direct frame-buffer presentation job (swirl / loading vignet) */
+    int is_cap;                         /* scene-capture job: read the presented (front) buffer back into s_scene565 (base image of the swirl transition) */
     uint32_t regs[2048];                /* PVR register file 0x5F8000..0x5F9FFF at STARTRENDER (palette RAM at word 0x400, fog table at 0x80 ...) */
     float bg[3][4]; uint32_t bg_isp, bg_tsp, bg_tcw; int have_bg;   /* ISP_BACKGND plane (lives in VRAM) */
     int wide;                           /* hle_ta_wide_active() */
@@ -689,7 +690,9 @@ static void vita_gl_render_frame_impl(RenderJob *job)
             if (s_only_tcw && list_id == TA_L_TRANS && st->tcw != s_only_tcw) continue;
 
             gc_depth_test(1);
-            gc_depth_func(s_gl_depth_funcs[st->depth_mode & 7]);
+            /* Translucent list: the game's coplanar overlays (bump-map / detail strips over the terrain, water ripples) share the exact depth of the surface below and use depth mode GREATER (never GEQUAL
+             * in any dumped frame), so they must pass on equality like on the PVR (its sorted translucent pass ties pass); strict GREATER rejected every pixel of them. */
+            gc_depth_func(list_id == TA_L_TRANS && (st->depth_mode & 7) == 4 ? GL_GEQUAL : s_gl_depth_funcs[st->depth_mode & 7]);
             if (list_id == TA_L_TRANS) {                /* HUD-layer translucent batch (every vertex at the clamped ceiling): coplanar with the bars, so a strict depth func would reject it; draw in order */
                 int hud = 1;
                 for (uint32_t i = 0; i < batch->count; i++) if (gl.verts[batch->first + i].z < hud_z * 0.999f) { hud = 0; break; }
@@ -748,15 +751,21 @@ static void vita_gl_render_frame_impl(RenderJob *job)
             } else {
                 gc_tex2d(0);
             }
-            /* Translucent table fog: pre-fog the vertex colour toward FOG_COL_RAM (alpha untouched) before the blend (approximation: HW fogs after texture modulation) */
+            /* Fog (PVR2 fogs the final post-texture colour; alpha is never touched):
+             *  - untextured translucent: pre-fog the vertex colour toward FOG_COL_RAM before the blend (exact: no texture to modulate);
+             *  - additive translucent (dst factor ONE): fog fades toward black, so the colour is scaled by (1 - fog), no extra pass;
+             *  - textured translucent: colour left alone here, fogged by the post pass below (pre-fogging the vertex colour would MODULATE the texture by the fog colour). */
             int pre_fogged = 0;
-            if (R2_TFOG && list_id == TA_L_TRANS && (st->fog_ctrl == 0 || st->fog_ctrl == 3) && fog_den) {
+            const int tfog_on = R2_TFOG && fog_den && (list_id == TA_L_PUNCH ? st->fog_ctrl == 0 : (st->fog_ctrl == 0 || st->fog_ctrl == 3));
+            const int additive = (list_id == TA_L_TRANS && st->dst_blend == 1);
+            if (list_id == TA_L_TRANS && tfog_on && (additive || !tex_id)) {
                 float amax = 0.0f;
                 for (uint32_t i = 0; i < batch->count; i++) {
                     uint32_t vi = batch->first + i;
                     float a = ta_fog_alpha(gl.verts[vi].z, fog_den, fog_table);
                     s_fv[vi] = s_cv[vi];
-                    s_fv[vi].r = s_cv[vi].r + (fog_r - s_cv[vi].r) * a; s_fv[vi].g = s_cv[vi].g + (fog_g - s_cv[vi].g) * a; s_fv[vi].b = s_cv[vi].b + (fog_b - s_cv[vi].b) * a;
+                    if (additive) { s_fv[vi].r = s_cv[vi].r * (1.0f - a); s_fv[vi].g = s_cv[vi].g * (1.0f - a); s_fv[vi].b = s_cv[vi].b * (1.0f - a); }
+                    else { s_fv[vi].r = s_cv[vi].r + (fog_r - s_cv[vi].r) * a; s_fv[vi].g = s_cv[vi].g + (fog_g - s_cv[vi].g) * a; s_fv[vi].b = s_cv[vi].b + (fog_b - s_cv[vi].b) * a; }
                     if (a > amax) amax = a;
                 }
                 if (amax > 1.0f / 255.0f) { gc_color_ptr(&s_fv[0].r); pre_fogged = 1; }
@@ -780,22 +789,39 @@ static void vita_gl_render_frame_impl(RenderJob *job)
             g_perf.area[list_id == TA_L_TRANS ? 2 : list_id == TA_L_PUNCH ? 1 : 0] += perf_area(&gl.verts[batch->first], batch->count);
 #endif
             if (pre_fogged) gc_color_ptr(&s_cv[0].r);
-            /* Table fog (TSP fog control 0) on opaque polygons: a second untextured pass in FOG_COL_RAM with the per-vertex fog alpha, blended over the
-             * lit/textured result and depth-tested GEQUAL (same vertices -> same depth, so exactly the visible pixels).  Translucent/punch-through are not fogged [ASSUMED approximation]. */
-            if (list_id == TA_L_OPAQUE && st->fog_ctrl == 0 && (st->depth_mode == 4 || st->depth_mode == 6) && fog_den) {
+            /* Table fog (TSP fog control 0): a second pass over the same vertices in FOG_COL_RAM with the per-vertex fog alpha, blended over the result and depth-tested
+             * GEQUAL (same vertices -> same depth, so exactly the visible pixels; ALWAYS for batches drawn with ALWAYS).  Untextured, except for polygons with per-texel
+             * transparency (opaque ARGB1555 cutout, punch-through, smooth-alpha translucent): that pass is textured with TEXTURE_ENV_MODE=BLEND and env colour = vertex
+             * colour = fog colour (rgb = fog colour for every texel, a = texel alpha * vertex alpha * fog), so it keeps the main pass's cutout/alpha shape instead of painting a
+             * fog-coloured box over the transparent texels.  Untextured/additive translucent were fogged above; other translucent blend modes are not fogged [ASSUMED]. */
+            const int fog_textured = tex_id && (st->shading & 3) != 2 && (list_id == TA_L_PUNCH || list_id == TA_L_TRANS || (list_id == TA_L_OPAQUE && st->pixel_format == 0));
+            const int fog_func_ok = (gc.depth_func == (int)GL_GREATER || gc.depth_func == (int)GL_GEQUAL || gc.depth_func == (int)GL_ALWAYS);
+            const int fog_post = fog_func_ok && fog_den && !additive &&
+                (list_id == TA_L_OPAQUE ? st->fog_ctrl == 0 : list_id == TA_L_PUNCH ? tfog_on : (tfog_on && tex_id && st->dst_blend == 5));
+            if (fog_post) {
                 float amax = 0.0f;
                 for (uint32_t i = 0; i < batch->count; i++) {
                     uint32_t vi = batch->first + i;
                     float a = ta_fog_alpha(gl.verts[vi].z, fog_den, fog_table);
-                    s_fv[vi].px = s_cv[vi].px; s_fv[vi].py = s_cv[vi].py; s_fv[vi].pz = s_cv[vi].pz; s_fv[vi].u = 0; s_fv[vi].v = 0;
-                    s_fv[vi].r = fog_r; s_fv[vi].g = fog_g; s_fv[vi].b = fog_b; s_fv[vi].a = a;
+                    s_fv[vi].px = s_cv[vi].px; s_fv[vi].py = s_cv[vi].py; s_fv[vi].pz = s_cv[vi].pz; s_fv[vi].u = s_cv[vi].u; s_fv[vi].v = s_cv[vi].v;
+                    s_fv[vi].r = fog_r; s_fv[vi].g = fog_g; s_fv[vi].b = fog_b;
+                    s_fv[vi].a = (list_id != TA_L_OPAQUE) ? s_cv[vi].a * a : a;
                     if (a > amax) amax = a;
                 }
                 if (amax > 1.0f / 255.0f) {
                     if (st_cur) { glDisable(GL_STENCIL_TEST); st_cur = 0; vita_gl_perf.state_calls++; }
-                    gc_tex2d(0);
+                    if (fog_textured) {
+                        static uint32_t s_envcol_key = 0xFFFFFFFFu;
+                        if (s_envcol_key != fog_ram) { const GLfloat ec[4] = { fog_r, fog_g, fog_b, 1.0f }; glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, ec); s_envcol_key = fog_ram; }
+                        gc_texenv(GL_BLEND);
+                        /* 1-bit alpha (ARGB1555) / punch-through: the test must still decide on the texel; the fog-weighted product would drop light fog, so test "> 0" (product is 0 or fog) */
+                        if (list_id != TA_L_TRANS || st->pixel_format == 0) { gc_alpha_test(1); gc_alpha_ref(1); } else gc_alpha_test(0);
+                    } else {
+                        gc_tex2d(0);
+                        gc_alpha_test(0);
+                    }
                     gc_blend(1); gc_blend_func(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                    gc_depth_func(GL_GEQUAL); gc_depth_mask(0);
+                    gc_depth_func(gc.depth_func == (int)GL_ALWAYS ? GL_ALWAYS : GL_GEQUAL); gc_depth_mask(0);
                     gc_color_ptr(&s_fv[0].r);
                     glDrawArrays(GL_TRIANGLES, batch->first, batch->count);
                     vita_gl_perf.fog_draws++; vita_gl_perf.verts += batch->count;
@@ -963,7 +989,7 @@ static RenderJob *prepare_job(TaFrame *frame, TaRaw *raw, uint32_t shad)
     RenderJob *j = &s_jobs[s_job_next];
     uint64_t t0 = r2_now_us();
     s_gframe_no++;
-    j->is_fb = 0; j->fb_off = 0;
+    j->is_fb = 0; j->fb_off = 0; j->is_cap = 0;
     j->frame = frame; j->raw = raw; j->shad_scale = shad; j->nops = 0; j->nrefs = 0;
     memcpy(j->regs, hle_pvr_regs(), sizeof j->regs);
     j->have_bg = hle_ta_background(j->bg, &j->bg_isp, &j->bg_tsp, &j->bg_tcw);
@@ -1011,6 +1037,28 @@ static RenderJob *prepare_fb_job(uint32_t fb_off)
     return j;
 }
 
+/* Last presented scene as a 640x480 RGB565 image (the Dreamcast frame buffer the game's CPU swirl/fade code draws on top of).  Filled by capture_front_to_scene() on the GL thread. */
+static uint16_t s_scene565[640 * 480];
+static int s_scene_ok;
+static void capture_front_to_scene(int wide)
+{
+    uint8_t *px = (uint8_t *)malloc((size_t)SCREEN_W * SCREEN_H * 4);
+    if (!px) return;
+    glFinish();
+    glReadPixels(0, 0, SCREEN_W, SCREEN_H, GL_RGBA, GL_UNSIGNED_BYTE, px);       /* vitaGL: the presented (front) buffer = the last scene frame */
+    int vx = wide ? 0 : VIEW_X, vw = wide ? SCREEN_W : VIEW_W;
+    for (int y = 0; y < 480; y++) {
+        int sy = SCREEN_H - 1 - (y * SCREEN_H + SCREEN_H / 2) / 480;            /* GL rows are bottom-up */
+        const uint8_t *row = px + (size_t)sy * SCREEN_W * 4;
+        for (int x = 0; x < 640; x++) {
+            const uint8_t *q = row + (size_t)(vx + (x * vw + vw / 2) / 640) * 4;
+            s_scene565[y * 640 + x] = (uint16_t)(((q[0] >> 3) << 11) | ((q[1] >> 2) << 5) | (q[2] >> 3));
+        }
+    }
+    s_scene_ok = 1;
+    free(px);
+}
+
 static void render_job_exec(RenderJob *j)
 {
 #if R2_PERF
@@ -1018,6 +1066,7 @@ static void render_job_exec(RenderJob *j)
 #endif
     uint32_t fp_saved = fp_get();
     if (fp_saved != j->fpmode) fp_set(j->fpmode);     /* no-op inline; on the render thread: the guest's rounding mode */
+    if (j->is_cap) { capture_front_to_scene(j->wide); if (fp_saved != j->fpmode) fp_set(fp_saved); return; }
     if (j->is_fb) {
         s_frame_no++;
         vita_gl_perf.frames++;
@@ -1121,7 +1170,7 @@ static void rsem_init(RSem *s, int n) { pthread_mutex_init(&s->m, NULL); pthread
 static void rsem_wait(RSem *s) { pthread_mutex_lock(&s->m); while (s->n <= 0) pthread_cond_wait(&s->c, &s->m); s->n--; pthread_mutex_unlock(&s->m); }
 static void rsem_post(RSem *s) { pthread_mutex_lock(&s->m); s->n++; pthread_cond_signal(&s->c); pthread_mutex_unlock(&s->m); }
 #endif
-static RSem s_sem_free, s_sem_job, s_sem_ready;
+static RSem s_sem_free, s_sem_job, s_sem_ready, s_sem_cap;
 static int s_ring_head, s_ring_tail;                // guest advances head, render advances tail (each owns its index)
 static RenderJob *s_ring[RT_JOBS + 1];
 #if defined(R2_RT_STRESS)
@@ -1159,6 +1208,7 @@ static void render_thread_loop(void)
 #endif
         }
         render_job_exec(j);
+        if (j->is_cap) { rsem_post(&s_sem_cap); rsem_post(&s_sem_free); continue; }      /* capture job: no swap (it would present the stale back buffer) */
         uint64_t t_sw0 = r2_now_us();
         render_swap();
         if (s_frame_no <= RT_PHASE_FRAMES) {
@@ -1191,7 +1241,7 @@ void vita_gl_render_init(void)
     if (getenv("R2_TACHK")) want = 0;      /* the host cross-check builds frames on the guest thread with the same (static-buffer) depth-cut code */
 #endif
     if (!want) { gl_start(); return; }
-    rsem_init(&s_sem_free, R2_RT_DEPTH); rsem_init(&s_sem_job, 0); rsem_init(&s_sem_ready, 0);
+    rsem_init(&s_sem_free, R2_RT_DEPTH); rsem_init(&s_sem_job, 0); rsem_init(&s_sem_ready, 0); rsem_init(&s_sem_cap, 0);
 #if defined(__vita__)
     SceUID th = sceKernelCreateThread("rayman2_render", render_thread_entry, 0x10000100, 256 * 1024, 0, R2_RENDER_CPU, NULL);
     if (th < 0 || sceKernelStartThread(th, 0, NULL) < 0) { gl_logf("[vita] render thread create failed 0x%08x: rendering inline", th); gl_start(); return; }
@@ -1260,6 +1310,30 @@ void vita_gl_present_fb(uint32_t fb_off)
     }
 }
 
+/* GUEST, at the start of a level transition (swirl init): snapshot the last presented scene into both 640x480 RGB565 frame-buffer shadows (fb offsets off0/off1) so the CPU swirl/fade
+ * (black pixels written by f_8c039bc0 into the shadow) and the next present_fb draw over the frozen last frame instead of over black.  Synchronous: the guest waits for the GL thread, so
+ * it can not race the guest's own shadow writes that follow. */
+void vita_gl_capture_scene(uint32_t off0, uint32_t off1)
+{
+    RenderJob *j = &s_jobs[s_job_next];
+    if (s_rt_on) {
+        rsem_wait(&s_sem_free);
+        j = &s_jobs[s_job_next]; s_job_next = (s_job_next + 1) % (RT_JOBS + 1);
+        memset(j, 0, sizeof(*j)); j->is_cap = 1; j->wide = hle_ta_wide_active(); j->fpmode = fp_get();
+        s_ring[s_ring_head] = j; s_ring_head = (s_ring_head + 1) % (RT_JOBS + 1);
+        rsem_post(&s_sem_job);
+        rsem_wait(&s_sem_cap);
+    } else {
+        s_job_next = (s_job_next + 1) % (RT_JOBS + 1);
+        memset(j, 0, sizeof(*j)); j->is_cap = 1; j->wide = hle_ta_wide_active(); j->fpmode = fp_get();
+        render_job_exec(j);
+    }
+    if (!s_scene_ok) return;
+    uint32_t o[2] = { off0 & 0x7FFFFF, off1 & 0x7FFFFF };
+    for (int i = 0; i < 2; i++)
+        if (o[i] + sizeof s_scene565 <= (8u << 20)) memcpy(hle_fbshadow_ptr() + o[i], s_scene565, sizeof s_scene565);
+}
+
 /* ---- inline (single-thread) path, API unchanged: vita_gl_render_frame(f); vita_gl_swap(); caller frees f ---- */
 void vita_gl_render_frame(const TaFrame *frame)
 {
@@ -1283,6 +1357,7 @@ void vita_gl_swap(void) {}
 void vita_gl_present_frame(TaFrame *frame) { ta_frame_free(frame); }
 void vita_gl_present_raw(TaRaw *raw, uint32_t shad_scale) { (void)shad_scale; ta_raw_free(raw); }
 void vita_gl_present_fb(uint32_t fb_offset) { (void)fb_offset; }
+void vita_gl_capture_scene(uint32_t off0, uint32_t off1) { (void)off0; (void)off1; }
 int vita_gl_rt_active(void) { return 0; }
 void vita_gl_texture_cache_clear(void) {}
 

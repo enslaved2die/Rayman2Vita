@@ -55,6 +55,8 @@ static inline void glDepthFunc(GLenum f) { fgr.depth_func = f; FGC(depth_func); 
 static inline void glBlendFunc(GLenum a, GLenum b) { fgr.bsrc = a; fgr.bdst = b; FGC(blend_func); }
 static inline void glAlphaFunc(GLenum f, float r) { fgr.afunc = f; fgr.aref = r; FGC(alpha_func); }
 static inline void glTexEnvi(GLenum a, GLenum b, GLint c) { (void)a; (void)b; fgr.texenv = c; FGC(texenv); }
+#define GL_TEXTURE_ENV_COLOR 0x2201
+static inline void glTexEnvfv(GLenum a, GLenum b, const GLfloat *c) { (void)a; (void)b; (void)c; fg.other++; }
 static inline void glBindTexture(GLenum t, GLuint id) { (void)t; fgr.bound = (int)(id & 0xFFFF); FGC(bind); }
 static inline void glTexImage2D(GLenum t, int l, int ifmt, int w, int h, int b, GLenum f, GLenum ty, const void *p) { (void)t; (void)l; (void)ifmt; (void)b; (void)f; (void)ty; fgr.tex[fgr.bound].pix = fgr_hash_bytes(p, (size_t)w * h * 4); fgr.tex[fgr.bound].w = w; fgr.tex[fgr.bound].h = h; fgr.tex[fgr.bound].has = 1; fg.teximage++; }
 static inline void glGenTextures(int n, GLuint *ids) { static GLuint next = 1; for (int i = 0; i < n; i++) { ids[i] = next++; if (next > 60000) next = 1; memset(&fgr.tex[ids[i]], 0, sizeof fgr.tex[0]); } fg.gen++; }

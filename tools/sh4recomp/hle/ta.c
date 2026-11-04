@@ -717,24 +717,21 @@ static uint32_t twid(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     { uint32_t blk = y / w, yi = y % w; return blk * w * w + (spread16(yi) | (spread16(x) << 1)); }
 }
 static uint32_t rgba8(uint32_t r, uint32_t g, uint32_t b, uint32_t a) { return r | (g << 8) | (b << 16) | (a << 24); }
+/* PVR2 bump-map texel (fmt 4): bits 15:8 = S (elevation, 0..255 -> 0..90 deg), bits 7:0 = R (azimuth, 0..255 -> 0..360 deg).  The hardware does not shade it with a fixed light: the polygon's
+ * (flat-shaded = last vertex) OFFSET colour carries the coefficients, K1 = offset.a (ambient), K2 = offset.r, K3 = offset.g, Q = offset.b (light azimuth, fraction of a turn), and the texel
+ * becomes WHITE with alpha = clamp(K1 + K2*sin(S) + K3*cos(S)*cos(R - 2*pi*Q)), which is then modulated by the base colour and blended like any translucent texel [DOC; same formula as Flycast].
+ * The game draws these as translucent coplanar overlays (the grass / floor "detail" noise) over the terrain.  The coefficients are per polygon, but the decode cache is keyed by (tcw, tsp)
+ * and the vertices are not parsed yet when the texture is decoded, so fixed K are used: in 5 dumped scenes (Woods of Light / Fairy Glade / cave attract demos) EVERY bump strip has
+ * K2 = 59/255, Q = 80/255, K3 = 18/255 (50/255 on ~15 % of the non-mip strips) and K1 = 16/255 on the mip variant (tcw[31]) / 0 on the non-mip one.  [GAME bits, approximation] */
+static int s_bump_mip;
 static inline uint32_t bump16(uint32_t p)
 {
-    /* PowerVR2 CLX2 16-bit bump map texel:
-     * bits 15:8 = Elevation angle S (0 = normal to surface, 255 = 90 deg / tangent plane)
-     * bits 7:0  = Azimuth angle R (0..255 = 0..360 deg) */
-    uint32_t s_ang = (p >> 8) & 0xFF;
-    uint32_t r_ang = p & 0xFF;
-    float theta = (float)s_ang * (3.14159265f / 512.0f);
-    float phi = (float)r_ang * (6.28318531f / 256.0f);
-    float sin_t = sinf(theta), cos_t = cosf(theta);
-    float nx = sin_t * cosf(phi);
-    float ny = sin_t * sinf(phi);
-    float nz = cos_t;
-    /* Directional lighting vector L = normalize(0.35, 0.35, 0.87) */
-    float diff = 0.35f * nx + 0.35f * ny + 0.87f * nz;
-    int lum = (int)(diff * 255.0f);
-    if (lum < 0) lum = 0; else if (lum > 255) lum = 255;
-    return rgba8((uint32_t)lum, (uint32_t)lum, (uint32_t)lum, 255);
+    const float K1 = s_bump_mip ? 16.0f / 255.0f : 0.0f, K2 = 59.0f / 255.0f, K3 = 18.0f / 255.0f, Q = 80.0f / 255.0f;
+    float s = (float)((p >> 8) & 0xFF) * (3.14159265f * 0.5f / 255.0f), r = (float)(p & 0xFF) * (6.28318531f / 255.0f);
+    float a = K1 + K2 * sinf(s) + K3 * cosf(s) * cosf(r - 6.28318531f * Q);
+    int ia = (int)(a * 255.0f + 0.5f);
+    if (ia < 0) ia = 0; else if (ia > 255) ia = 255;
+    return rgba8(255, 255, 255, (uint32_t)ia);
 }
 static uint32_t px16(uint32_t p, int fmt)
 {
@@ -773,6 +770,7 @@ int ta_tex_decode(const uint8_t *vram, uint32_t vn, uint32_t tcw, uint32_t tsp, 
     int W, H; ta_tex_size(tsp, &W, &H);
     int mip = (int)(tcw >> 31), vq = (int)((tcw >> 30) & 1), fmt = (int)((tcw >> 27) & 7), nontw = (int)((tcw >> 26) & 1);
     uint32_t base = (tcw & 0x1FFFFFu) << 3;
+    s_bump_mip = mip;
     uint32_t w = (uint32_t)W >> level, h = (uint32_t)H >> level;
     if (!w) w = 1;
     if (!h) h = 1;
@@ -815,6 +813,27 @@ int ta_tex_decode(const uint8_t *vram, uint32_t vn, uint32_t tcw, uint32_t tsp, 
         }
     }
     if (force_opaque && fmt != 0) for (uint32_t i = 0; i < w * h; i++) out[i] |= 0xFF000000u;
+    /* Colour bleed: alpha-0 texels decode to RGB 0 (black).  Bilinear/mip filtering (and glGenerateMipmap's box filter) blends those into the visible edge of sprites such as the
+     * Prison lum particles -> dark halos / faint black lines.  Give every fully transparent texel the mean RGB of its non-transparent 8-neighbours (alpha stays 0, so alpha-tested and
+     * blended coverage is unchanged; texels with no opaque neighbour stay as they were).  Only touches alpha==0 texels, so opaque textures are bit-identical.  [UNVERIFIED on hardware] */
+    {
+        uint32_t n = w * h, nt = 0;
+        for (uint32_t i = 0; i < n; i++) nt += (out[i] >> 24) == 0;
+        if (nt && nt < n) {
+            for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
+                if (out[y * w + x] >> 24) continue;
+                uint32_t sr = 0, sg = 0, sb = 0, c = 0;
+                for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                    int xx = (int)x + dx, yy = (int)y + dy;
+                    if ((dx | dy) == 0 || xx < 0 || yy < 0 || xx >= (int)w || yy >= (int)h) continue;
+                    uint32_t p = out[(uint32_t)yy * w + (uint32_t)xx];
+                    if (!(p >> 24)) continue;
+                    sr += p & 255; sg += (p >> 8) & 255; sb += (p >> 16) & 255; c++;
+                }
+                if (c) out[y * w + x] = (sr / c) | ((sg / c) << 8) | ((sb / c) << 16);
+            }
+        }
+    }
     return 0;
 }
 
