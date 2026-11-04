@@ -664,12 +664,14 @@ static void vita_gl_render_frame_impl(RenderJob *job)
         const int dbg = R2_GL_DEBUG && (s_frame_no <= 12 || s_frame_no % 60 == 0) && list_id == TA_L_TRANS;
         uint32_t n_ord = n_b < 4096 ? n_b : 4096;
         const int sorted = list_id == TA_L_TRANS && trans_sorted;
+        const float hud_z = cut * (0.995f / 0.98f);   /* same ceiling as ta_gl_make_clip */
         if (sorted) {
             for (uint32_t b = 0; b < n_ord; b++) {
                 const TaBatch *bt = &gl.batches[first_b + b];
                 float sum_z = 0.0f;
                 for (uint32_t i = 0; i < bt->count; i++) sum_z += gl.verts[bt->first + i].z;
                 s_key[b] = bt->count ? (sum_z / (float)bt->count) : 0.0f;
+                if (s_key[b] > hud_z) s_key[b] = hud_z;   /* 2D/HUD layer (1/W clamped to the depth-cut ceiling in ta_gl_make_clip): all one depth -> keep submission order (stable sort), so dialog text stays above the letterbox bars */
                 s_ord[b] = b;
             }
             for (uint32_t i = 1; i < n_ord; i++) { uint32_t o = s_ord[i]; float k = s_key[o]; uint32_t j = i; while (j > 0 && s_key[s_ord[j - 1]] > k) { s_ord[j] = s_ord[j - 1]; j--; } s_ord[j] = o; }   /* stable insertion sort */
@@ -688,6 +690,11 @@ static void vita_gl_render_frame_impl(RenderJob *job)
 
             gc_depth_test(1);
             gc_depth_func(s_gl_depth_funcs[st->depth_mode & 7]);
+            if (list_id == TA_L_TRANS) {                /* HUD-layer translucent batch (every vertex at the clamped ceiling): coplanar with the bars, so a strict depth func would reject it; draw in order */
+                int hud = 1;
+                for (uint32_t i = 0; i < batch->count; i++) if (gl.verts[batch->first + i].z < hud_z * 0.999f) { hud = 0; break; }
+                if (hud) gc_depth_func(GL_ALWAYS);
+            }
             int is_cutout_trans = (list_id == TA_L_TRANS && st->textured && st->pixel_format == 0);
             gc_depth_mask(!st->z_write_disable && (list_id != TA_L_TRANS || is_cutout_trans));
             if (dbg && bi < 8) { const TaGlVertex *v0 = &gl.verts[batch->first]; gl_logf("[vita]     tcw=%08x tsp=%08x shade=%d tex=%d v0 col=%.2f,%.2f,%.2f,%.2f v1 col=%.2f,%.2f,%.2f,%.2f", (unsigned)st->tcw, (unsigned)st->tsp, st->shading, st->textured, v0[0].r, v0[0].g, v0[0].b, v0[0].a, v0[1].r, v0[1].g, v0[1].b, v0[1].a); }

@@ -1,4 +1,5 @@
 #include "recomp_decls.h"
+#include "r2_trace.h"
 void f_8c031bb4(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   R(15)-=fp_sz(c);fp_st(c,15,R(15));
@@ -2241,7 +2242,7 @@ void f_8c032c08(SH4Ctx *c) {
   {uint32_t v=LD32(R(15));R(15)+=4;c->pr=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
-void f_8c032c40(SH4Ctx *c) {
+static void f_8c032c40_o(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=c->pr;R(15)-=4;ST32(R(15),v);}
@@ -2398,6 +2399,11 @@ L8c032db4:;
   {uint32_t v=LD32(R(15));R(15)+=4;c->pr=v;}
   {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
+}
+void f_8c032c40(SH4Ctx *c) {
+  uint32_t n_=R(5)-12u, id_=LD32(n_);
+  if (id_>=0x206u && id_<=0x208u) r2_tr_site(n_, id_, R(4), R(4));
+  f_8c032c40_o(c);
 }
 void f_8c032d20(SH4Ctx *c) {
   R(6)=R(15);

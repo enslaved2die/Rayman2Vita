@@ -1,4 +1,27 @@
 #include "recomp_decls.h"
+#include "r2_trace.h"
+
+/* ---- 16:9 HUD edge anchoring (shared policy; identical copy in recomp_01.c / recomp_02.c) ----
+ * Edge anchoring is only meaningful for the in-game HUD (health bar left, lums / air meter right).  Menu and hub
+ * ("Menu" = title/menus, "Mapmonde2" = Isle of Doors with its level-info card) are composed of widgets whose parts
+ * (card sprite vs. text) are placed by different layout routines with different reference points, so any per-element
+ * X classification there splits a widget.  There everything keeps the authentic centred squeeze.
+ * n = element X normalised to 0..1 of the layout space.  Returns 0 (left), 0.5 (centre) or 1 (right). */
+static inline int r2_lvl_is(const char *s) {
+  uint32_t a = 0x8c123b09u;
+  for (;; s++, a++) {
+    uint8_t ch = LD8(a);
+    if (ch >= 'A' && ch <= 'Z') ch = (uint8_t)(ch + 32);
+    if (ch != (uint8_t)*s) return 0;
+    if (!*s) return 1;
+  }
+}
+static inline float r2_hud_anchor(float n) {
+  if (LD8(0x8c123b09u) == 0 || r2_lvl_is("menu") || r2_lvl_is("mapmonde2") || r2_lvl_is("staff_10")) return 0.5f;
+  if (n < 0.4f) return 0.0f;
+  if (n > 0.6f) return 1.0f;
+  return 0.5f;
+}
 void f_8c025ee6(SH4Ctx *c) {
   R(2)=0x61u;
   c->t=R(4)>=R(2);
@@ -127,7 +150,7 @@ void f_8c025fa0(SH4Ctx *c) {
   R(1)=c->fpul;
   { ST32(R(7),R(1)); return; }
 }
-void f_8c026040(SH4Ctx *c) {
+static void f_8c026040_o(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(12);R(15)-=4;ST32(R(15),v);}
@@ -161,12 +184,7 @@ void f_8c026040(SH4Ctx *c) {
     float elem_x;
     uint32_t elem_x_u = LD32(LD32(R(15)+8) + 4);
     memcpy(&elem_x, &elem_x_u, 4);
-    float anchor_factor = 0.5f;
-    if (elem_x < 400.0f) {
-      anchor_factor = 0.0f; /* Left-anchored HUD (Health bar) */
-    } else if (elem_x > 600.0f) {
-      anchor_factor = 1.0f; /* Right-anchored HUD (Lums counter, Air meter) */
-    }
+    float anchor_factor = r2_hud_anchor(elem_x / 1000.0f);
     float sq;
     memcpy(&sq, &c->fr[4], 4);
     float off_x = anchor_factor * 1000.0f * (1.0f - sq);
@@ -444,7 +462,12 @@ L8c0262e4:;
   {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
-void f_8c026320(SH4Ctx *c) {
+void f_8c026040(SH4Ctx *c) {
+  uint32_t s=R(4);
+  if (s>=R2_TR_B_BASE && s<R2_TR_B_BASE+50*R2_TR_B_STRIDE) r2_tr_b_state("DRAW box", s, 0, 6);
+  f_8c026040_o(c);
+}
+static void f_8c026320_o(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(12);R(15)-=4;ST32(R(15),v);}
@@ -478,12 +501,7 @@ void f_8c026320(SH4Ctx *c) {
     float elem_x;
     uint32_t elem_x_u = LD32(R(12) + 4);
     memcpy(&elem_x, &elem_x_u, 4);
-    float anchor_factor = 0.5f;
-    if (elem_x < 400.0f) {
-      anchor_factor = 0.0f; /* Left-anchored HUD (Health bar) */
-    } else if (elem_x > 600.0f) {
-      anchor_factor = 1.0f; /* Right-anchored HUD (Lums counter, Air meter) */
-    }
+    float anchor_factor = r2_hud_anchor(elem_x / 1000.0f);
     float sq;
     uint32_t sq_u = LD32(R(3));
     memcpy(&sq, &sq_u, 4);
@@ -939,6 +957,11 @@ L8c02682a:;
   {uint32_t v=LD32(R(15));R(15)+=4;R(12)=v;}
   {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
+}
+void f_8c026320(SH4Ctx *c) {
+  uint32_t s=R(4);
+  if (s>=R2_TR_B_BASE && s<R2_TR_B_BASE+50*R2_TR_B_STRIDE) r2_tr_b_state("DRAW text", s, 0, 7);
+  f_8c026320_o(c);
 }
 void f_8c026400(SH4Ctx *c) {
   ST32(R(15)+R(0),R(0));
@@ -1418,7 +1441,7 @@ L8c0268b0:;
 L8c0268ec:;
   {  return; }
 }
-void f_8c0268f0(SH4Ctx *c) {
+static void f_8c0268f0_o(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(12);R(15)-=4;ST32(R(15),v);}
@@ -1487,7 +1510,14 @@ L8c02696c:;
   {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
-void f_8c0269a0(SH4Ctx *c) {
+void f_8c0268f0(SH4Ctx *c) {
+  uint32_t a4=R(4),a5=R(5),a6=R(6),a7=R(7); char p[20]; int u0;
+  r2_tr_level_poll(); u0=r2_tr_a_used();
+  f_8c0268f0_o(c);
+  r2_tr_pfx(a5,p);
+  r2_tr("[ui] f=%u A[--] CREATE r4=%08x r5=%08x('%s') r6=%08x r7=%08x ret=%08x used %d->%d", r2_tr_frame(), a4,a5,p,a6,a7,R(0), u0, r2_tr_a_used());
+}
+static void f_8c0269a0_o(SH4Ctx *c) {
   if ((int32_t)R(4) < 0 || (int32_t)R(4) >= 50) return;
   R(3)=0x41cu;
   R(0)=R(7);
@@ -1512,7 +1542,15 @@ L8c0269c6:;
   ST8(R(14)+R(0),R(3));
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
-void f_8c0269ce(SH4Ctx *c) {
+void f_8c0269a0(SH4Ctx *c) {
+  int idx=(int32_t)R(4); uint32_t src_=R(5); int32_t len=(int32_t)R(7); char p[20]; uint32_t bf[1];
+  (void)bf;
+  f_8c0269a0_o(c);
+  if (idx>=0&&idx<50) { uint32_t s=R2_TR_A_BASE+(uint32_t)idx*R2_TR_A_STRIDE; r2_tr_pfx(s,p);
+    if (r2_tr_gate(3, idx, r2_tr_hash(p)^(uint32_t)len)) r2_tr("[ui] f=%u A[%02d] WRITE len=%d str='%s' owner=%08x alpha=%u flags=%02x", r2_tr_frame(), idx, (int)len, p, LD32(s+0x400), (unsigned)LD8(s+0x410), (unsigned)LD8(s+0x413)); }
+  else r2_tr("[ui] f=%u A[--] WRITE bad idx=%d len=%d src=%08x", r2_tr_frame(), idx, (int)len, src_);
+}
+static void f_8c0269ce_o(SH4Ctx *c) {
   R(2)=0x32u;
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   c->t=(int32_t)R(4)>=(int32_t)R(2);
@@ -1667,6 +1705,14 @@ L8c026ba0:;
 L8c026bb2:;
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
+void f_8c0269ce(SH4Ctx *c) {
+  int idx=(int32_t)R(4); uint32_t op=R(5); uint32_t fv=c->fr[4]; uint32_t s=0,a0=0,f0=0,o0=0,a1,f1,o1;
+  if (idx>=0&&idx<50) { s=R2_TR_A_BASE+(uint32_t)idx*R2_TR_A_STRIDE; a0=LD8(s+0x410); f0=LD8(s+0x413); o0=LD32(s+0x400); }
+  f_8c0269ce_o(c);
+  if (s) { a1=LD8(s+0x410); f1=LD8(s+0x413); o1=LD32(s+0x400);
+    if (r2_tr_gate(4, idx, op ^ (a1<<8) ^ (f1<<16) ^ fv ^ (a0<<20)) || a0!=a1 || f0!=f1 || o0!=o1)
+      r2_tr("[ui] f=%u A[%02d] SET op=%u val=%.3f alpha %u->%u flags %02x->%02x owner %08x->%08x", r2_tr_frame(), idx, (unsigned)op, r2_tr_f(fv), (unsigned)a0,(unsigned)a1,(unsigned)f0,(unsigned)f1,o0,o1); }
+}
 void f_8c026a40(SH4Ctx *c) {
   R(14)=R(14)&0xFF;
   c->t=(R(14)&R(14))==0;
@@ -1769,7 +1815,7 @@ void f_8c026ba0(SH4Ctx *c) {
   ST8(R(1),R(0));
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
-void f_8c026bb6(SH4Ctx *c) {
+static void f_8c026bb6_o(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=c->pr;R(15)-=4;ST32(R(15),v);}
   R(15)+=0xfffffffcu;
@@ -1805,7 +1851,16 @@ L8c026bf2:;
   {uint32_t v=LD32(R(15));R(15)+=4;c->pr=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
-void f_8c026bfc(SH4Ctx *c) {
+void f_8c026bb6(SH4Ctx *c) {
+  uint32_t key=R(4); int u0=r2_tr_a_used(); int idx;
+  r2_tr_level_poll();
+  f_8c026bb6_o(c);
+  idx=(int32_t)R(0);
+  if (idx<0||idx>=50) r2_tr("[ui] f=%u A[--] FIND key=%08x FAILED ret=%d (pool full, used %d)", r2_tr_frame(), key, idx, r2_tr_a_used());
+  else if (r2_tr_gate(0, idx, key ^ 0x5a5a0000u) || r2_tr_a_used()!=u0)
+    r2_tr("[ui] f=%u A[%02d] FIND key=%08x -> slot (used %d->%d)%s", r2_tr_frame(), idx, key, u0, r2_tr_a_used(), r2_tr_a_used()!=u0?" NEWLY ALLOCATED":"");
+}
+static void f_8c026bfc_o(SH4Ctx *c) {
   R(1)=0x41cu;
   R(5)=0x0u;
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
@@ -1835,7 +1890,16 @@ L8c026c26:;
 L8c026c30:;
   { {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;} return; }
 }
-void f_8c026c60(SH4Ctx *c) {
+void f_8c026bfc(SH4Ctx *c) {
+  uint32_t key=R(4); int i, found=-1; uint32_t s=0; char p[20]="";
+  for (i=0;i<50;i++) if (LD32(R2_TR_A_BASE+(uint32_t)i*R2_TR_A_STRIDE+0x400)==key) { found=i; break; }
+  if (found>=0) { s=R2_TR_A_BASE+(uint32_t)found*R2_TR_A_STRIDE; r2_tr_pfx(s,p); }
+  r2_tr_level_poll();
+  f_8c026bfc_o(c);
+  r2_tr("[ui] f=%u A[%02d] FREE owner=%08x %s alpha=%u flags=%02x str='%s' used=%d", r2_tr_frame(), found<0?99:found, key, found<0?"(no slot owns it)":"", found<0?0u:(unsigned)LD8(s+0x410), found<0?0u:(unsigned)LD8(s+0x413), p, r2_tr_a_used());
+  if (found>=0) r2_tr_gate_reset(0,found);
+}
+static void f_8c026c60_o(SH4Ctx *c) {
   R(7)=0x41cu;
   R(5)=0x0u;
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
@@ -1859,21 +1923,6 @@ L8c026c76:;
 L8c026c8a:;
   R(0)=R(5);
   c->t=(int32_t)R(0)==50;
-  if(c->t) {
-    for (uint32_t i = 0; i < 50; i++) {
-      uint32_t s = 0x8c131e94u + i * 0x41cu;
-      uint8_t a = LD8(s + 0x410);
-      uint8_t f = LD8(s + 0x413);
-      if (a == 0 && !(f & 0x01)) {
-        R(5) = i;
-        R(6) = s;
-        ST8(s, 0);
-        ST8(s + 0x413, 0);
-        c->t = 0;
-        break;
-      }
-    }
-  }
   if(!c->t) goto L8c026c94;
   { R(5)=0xffffffffu; goto L8c026c98; }
 L8c026c94:;
@@ -1882,6 +1931,12 @@ L8c026c94:;
 L8c026c98:;
   R(0)=R(5);
   { {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;} return; }
+}
+void f_8c026c60(SH4Ctx *c) {
+  uint32_t key=R(4); int idx;
+  f_8c026c60_o(c);
+  idx=(int32_t)R(0);
+  r2_tr("[ui] f=%u A[%02d] ALLOC owner=%08x -> %d%s used=%d", r2_tr_frame(), idx<0?99:idx, key, idx, idx<0?" POOL FULL":"", r2_tr_a_used());
 }
 void f_8c026c9e(SH4Ctx *c) {
   R(3)=0x32u;
@@ -1899,6 +1954,8 @@ L8c026cb4:;
   {  return; }
 }
 void f_8c026ce0(SH4Ctx *c) {
+  int trc_br=0, trc_note=0; uint32_t trc_a0=0;
+  r2_tr_level_poll();
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(12);R(15)-=4;ST32(R(15),v);}
@@ -1939,6 +1996,7 @@ void f_8c026ce0(SH4Ctx *c) {
   { uint32_t k=!c->t; R(10)=0x8u; if(k) goto L8c026d32; }
   {  goto L8c026e80; }
 L8c026d32:;
+  trc_br=1; trc_note=0;
   R(0)=0x400u;
   R(14)=R(12);
   R(3)=LD32(R(14)+R(0));
@@ -1946,6 +2004,7 @@ L8c026d32:;
   if(!c->t) goto L8c026d40;
   {  goto L8c026e6c; }
 L8c026d40:;
+  trc_br=0; trc_a0=LD8(R(12)+0x410); { uint32_t o_=LD32(R(12)+0x400); if(!(LD32(o_+0x2c)&8u)) trc_note|=1; }
   R(3)=LD32(R(8)+R(0));
   R(2)=LD32(R(3)+44);
   c->t=(R(2)&R(10))==0;
@@ -1960,23 +2019,22 @@ L8c026d40:;
   R(2)=c->fpul;
   uint8_t slot_flags = LD8(R(14) + 0x413);
   if ((slot_flags & 0x08) && (R(2) & 0xFF) == 0 && !(slot_flags & 0x02)) {
-    /* Preserve 2D dialog box alpha when 3D speaker actor leaves camera frustum during active dialogue */
+    trc_note|=2; /* Preserve 2D dialog box alpha when 3D speaker actor leaves camera frustum during active dialogue */
   } else {
     ST8(R(14)+R(0), R(2));
   }
 L8c026d5a:;
   R(0)=0x410u;
   R(3)=(int32_t)(int8_t)LD8(R(14)+R(0));
-  if ((R(3) & 0xFF) == 0) {
-    uint8_t flags = LD8(R(14) + 0x413);
-    if (!(flags & 0x01)) { goto L8c026e6c; }
-  }
+  c->t=(R(3)&R(3))==0;
+  if(!c->t) goto L8c026d66;
+  { trc_br=2; goto L8c026e6c; }
 L8c026d66:;
   R(2)=0x8c12473eu;
   R(1)=(int32_t)(int8_t)LD8(R(2));
   c->t=(R(1)&R(1))==0;
   if(c->t) goto L8c026d72;
-  {  goto L8c026e6c; }
+  { trc_br=3; goto L8c026e6c; }
 L8c026d72:;
   R(0)=0x413u;
   R(1)=0x8c0c4684u;
@@ -1985,6 +2043,7 @@ L8c026d72:;
   R(0)=R(0)&0xFF;
   c->t=(R(0)&0x1)==0;
   { uint32_t k=c->t; fp_arith(c,2,4,13); if(k) goto L8c026e00; }
+  trc_br=4;
   R(0)=0x410u;
   R(4)=(int32_t)(int8_t)LD8(R(14)+R(0));
   R(4)=R(4)&0xFF;
@@ -2005,11 +2064,13 @@ L8c026da2:;
   R(0)=0x410u;
   { ST8(R(14)+R(0),R(4)); goto L8c026e2e; }
 L8c026e00:;
+  trc_br=6;
   R(0)=0x413u;
   R(0)=(int32_t)(int8_t)LD8(R(14)+R(0));
   R(0)=R(0)&0xFF;
   c->t=(R(0)&0x2)==0;
   if(c->t) goto L8c026e2e;
+  trc_br=5;
   R(0)=0x410u;
   R(4)=(int32_t)(int8_t)LD8(R(14)+R(0));
   R(4)=R(4)&0xFF;
@@ -2034,7 +2095,7 @@ L8c026e2e:;
   R(3)=(int32_t)(int8_t)LD8(R(14)+R(0));
   R(3)=R(3)&0xFF;
   c->t=(R(3)&R(10))==0;
-  if(c->t) goto L8c026e68;
+  if(c->t) { trc_note|=4; goto L8c026e68; }
   R(6)=R(15);
   R(5)=R(9);
   R(6)+=0xcu;
@@ -2060,6 +2121,9 @@ L8c026e2e:;
 L8c026e68:;
   { c->pr=0x8c026e6cu; R(4)=R(14); f_8c027200(c); }
 L8c026e6c:;
+  { uint32_t s_=R(12); int i_=r2_tr_aidx(s_);
+    if (trc_br==1) { if (r2_tr_last[0][i_]) { r2_tr("[ui] f=%u A[%02d] EMPTY (owner cleared)", r2_tr_frame(), i_); r2_tr_last[0][i_]=0; } }
+    else r2_tr_a_state("FRAME", s_, trc_br, trc_note, trc_a0, 0); }
   R(3)=LD32(R(15));
   R(12)+=R(13);
   R(3)+=R(13);

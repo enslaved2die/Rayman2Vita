@@ -1,4 +1,5 @@
 #include "recomp_decls.h"
+#include "r2_trace.h"
 void f_8c057020(SH4Ctx *c) {
   R(2)=0x0u;
   R(1)=R(2);
@@ -9440,6 +9441,7 @@ L8c05bc80:;
 void f_8c05bc8a(SH4Ctx *c) {
   R(0)=LD32(R(4)+16);
   c->t=(int32_t)R(0)==1;
+  if(c->t) r2_tr_btn("JustPressed", R(4));
   R(0)=c->t;
   {  return; }
 }

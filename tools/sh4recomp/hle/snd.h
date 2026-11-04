@@ -33,6 +33,8 @@ extern "C" {
  * the AICA MMIO ranges are mapped from a constructor in snd.c, so the guest can always reach them. */
 int  snd_init(int out_rate);
 void snd_shutdown(void);
+/* Flush + close snd_trace.log (Vita: ux0:data/rayman2/snd_trace.log, always on; host: R2_SND_TRACELOG=<file>). Also runs atexit. */
+void snd_trace_close(void);
 
 /* Pull `frames` stereo frames (interleaved L,R int16) at the rate given to snd_init(); advances the emulated sound CPU/AICA in real
  * (audio) time. Safe to call from the audio thread while the guest runs on another thread. */
@@ -82,6 +84,7 @@ void      snd_test_sh4_aram_wr(uint32_t a, int sz, uint32_t v);   /* replay: a g
 void      snd_test_sh4_reg_wr(uint32_t a, int sz, uint32_t v);
 void      snd_test_dma_to_aram(uint32_t a, const void *p, uint32_t len);
 uint64_t  snd_test_samples(void);
+uint32_t  snd_test_mon(int ch);                /* ARM-side read of the channel monitor (0x2810) for ch */
 void      snd_test_set_pull(int on);
 void      snd_test_arm_reset(int run);         /* 1 = release ARM (as the guest clearing ARMRST), 0 = hold */
 

@@ -23,6 +23,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <time.h>
 
 #if defined(__vita__)
@@ -61,6 +62,54 @@ static int g_trace;
 static int g_evlog;                                     /* R2_SND_EV=1: per-voice key-on/off/end/loop event log */
 static uint64_t st_samples_fwd(void);
 #define EV(...) do { if (g_evlog) { fprintf(stderr, "[ev] t=%.4f f=%lu ", (double)st_samples_fwd() / 44100.0, hle_frame_count); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
+/* ---- snd_trace.log: always-on (Vita) / R2_SND_TRACELOG=<file> (host) buffered key-on diagnostics for swallowed-SFX hunting. No behaviour change: only reads emulator state.
+ * Text lines "f=<guest frame> t=<aica s> EVENT ...", buffered in RAM, written (no fflush per event) when 32 KiB are pending, every 30 guest frames, and at exit. Capped at 4 MiB (then stops). */
+#define TL_CAP_BYTES (4u << 20)
+#define TL_BUF 65536
+#if defined(__vita__)
+#define TL_DEFAULT_PATH "ux0:data/rayman2/snd_trace.log"
+#else
+#define TL_DEFAULT_PATH NULL
+#endif
+static int g_tl_on; static FILE *g_tl_f; static const char *g_tl_path = TL_DEFAULT_PATH;
+static char g_tl_buf[TL_BUF]; static unsigned g_tl_n; static uint64_t g_tl_total; static volatile int g_tl_spin;
+static unsigned long g_tl_lastframe, g_tl_flushframe;
+static void tl_flush_nolock(void) {
+    if (!g_tl_n) return;
+    if (!g_tl_f && g_tl_path) { g_tl_f = fopen(g_tl_path, "w"); if (!g_tl_f) { g_tl_on = 0; g_tl_n = 0; return; } }
+    if (g_tl_f) { fwrite(g_tl_buf, 1, g_tl_n, g_tl_f); fflush(g_tl_f); }
+    g_tl_n = 0;
+}
+static void tl_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void tl_printf(const char *fmt, ...) {
+    if (!g_tl_on) return;
+    while (__sync_lock_test_and_set(&g_tl_spin, 1)) ;
+    if (g_tl_total + g_tl_n < TL_CAP_BYTES) {
+        if (g_tl_n + 700 > TL_BUF) { g_tl_total += g_tl_n; tl_flush_nolock(); }
+        if (g_tl_on) {
+            int k = snprintf(g_tl_buf + g_tl_n, 160, "f=%lu t=%.4f ", hle_frame_count, (double)st_samples_fwd() / 44100.0);
+            va_list ap; va_start(ap, fmt);
+            int m = vsnprintf(g_tl_buf + g_tl_n + k, 520, fmt, ap); va_end(ap);
+            if (m > 519) m = 519;
+            if (m < 0) m = 0;
+            g_tl_n += (unsigned)(k + m); g_tl_buf[g_tl_n++] = '\n';
+        }
+    } else if (g_tl_on) {
+        g_tl_total += g_tl_n; tl_flush_nolock();
+        if (g_tl_f) { fputs("-- log cap reached, stopped --\n", g_tl_f); fclose(g_tl_f); g_tl_f = 0; }
+        g_tl_on = 0;
+    }
+    __sync_lock_release(&g_tl_spin);
+}
+#define EVT(...) do { EV(__VA_ARGS__); if (g_tl_on) tl_printf(__VA_ARGS__); } while (0)
+void snd_trace_close(void) {
+    if (!g_tl_path && !g_tl_f) return;
+    while (__sync_lock_test_and_set(&g_tl_spin, 1)) ;
+    tl_flush_nolock(); if (g_tl_f) { fclose(g_tl_f); g_tl_f = 0; }
+    g_tl_on = 0;
+    __sync_lock_release(&g_tl_spin);
+}
 static int g_vdump_s;                                   /* R2_SND_VDUMP=<s>: dump every active voice every <s> seconds of AICA time (stuck/orphan voice diagnosis) */
 static int g_ringlog;                                   /* R2_SND_RING=1: log music stream ring refills vs. voice wraps */
 static uint64_t g_rw_bytes[2], g_rw_n[2], g_rw_wraps[2]; static uint32_t g_rw_lo[2], g_rw_hi[2];
@@ -87,6 +136,7 @@ typedef struct {
     int32_t  lsa_pred, lsa_step; int lsa_saved;
     int      lp_flag;
     uint64_t t0;                 /* st_samples at key-on (voice dump) */
+    uint32_t sa;                 /* sample address / format word (reg0 bits 7-8 + SA) captured at key-on: tells a real voice steal from a redundant KYONB rewrite */
 } Chan;
 static Chan chn[64];
 static uint64_t g_amask;           /* bit ch set <=> chn[ch].active (kept in step at the three places that change it): render_sample walks only the set bits */
@@ -184,11 +234,15 @@ static uint32_t mon_read(uint32_t off) {
     return (c->pos << 0) & 0xFFFF;                       /* CA: current sample address (low bits) */
 }
 
+static uint64_t g_armrd_hist[0x8000 / 4];      /* R2_SND_EV diagnostics: ARM reads per AICA register word */
 static uint32_t reg_read(uint32_t off, int sz, int from_arm) {
     off &= 0x7FFF;
+    if (from_arm && (g_evlog || g_tl_on)) g_armrd_hist[off >> 2]++;
     uint32_t w = aregs[off >> 2];
     switch (off & ~3u) {
-    case 0x2810: case 0x2814: w = mon_read(off & ~3u); break;
+    case 0x2810: case 0x2814: w = mon_read(off & ~3u);
+        if (from_arm && g_tl_on && (off & ~3u) == 0x2810) { static uint32_t lastv[64]; unsigned mch = (aregs[0x280C / 4] >> 8) & 0x3F; if (lastv[mch] != w + 1) { lastv[mch] = w + 1; tl_printf("MONRD ch%u %04x (lp=%u sgc=%u eg=%u) active=%d keyed=%d armpc=%05x", mch, w, (w >> 15) & 1, (w >> 13) & 3, w & 0x1FFF, chn[mch].active, g_keyed[mch], A.r[15]); } }
+        break;
     case 0x2D00: w = from_arm ? intreq_level : w; break;
     case 0x2890: w = (tim_pre[0] << 8) | tim_cnt[0]; break;
     case 0x2894: w = (tim_pre[1] << 8) | tim_cnt[1]; break;
@@ -204,6 +258,17 @@ static uint32_t reg_read(uint32_t off, int sz, int from_arm) {
 }
 
 static void arm_reset(void);
+/* snd_trace.log: every channel reg0 write (KYONB/KYONEX/SA-high/format/loop), with the channel's current latch + EG state; flags a rewrite of a still-latched channel */
+static void tl_reg0(int ch, uint32_t old, uint32_t nw, int from_arm) {
+    const Chan *c = &chn[ch];
+    uint32_t sa_new = (((nw & 0x7F) << 16) | (aregs[(ch * 0x80 + 4) >> 2] & 0xFFFF)) & (ARAM_SIZE - 1);
+    int kb_old = (old >> 14) & 1, kb_new = (nw >> 14) & 1;
+    if (!kb_old && !kb_new && !g_keyed[ch] && !c->active) return;      /* idle channel, KYONEX strobe only: skip the noise */
+    tl_printf("R0WR ch%d src=%s KYONB %d->%d KYONEX=%d sa=%06x fmt=%d loop=%d | latched=%d active=%d eg=%d att=%.0f", ch, from_arm ? "arm" : "sh4", kb_old, kb_new, (nw >> 15) & 1,
+              sa_new, (nw >> 7) & 3, (nw >> 9) & 1, g_keyed[ch], c->active, c->eg, c->att);
+    if (g_keyed[ch] && kb_new && (nw & 0x1FFF80u) != (old & 0x1FFF80u))
+        tl_printf("LATCHED_REWRITE ch%d reg0 %08x->%08x new_sa=%06x (cur voice sa=%06x fmt=%u playing=%d)", ch, old, nw, sa_new, c->sa & 0x0FFFFFFFu, c->sa >> 28, c->active && c->eg != 3);
+}
 static void reg_write(uint32_t off, int sz, uint32_t v, int from_arm) {
     off &= 0x7FFF;
     uint32_t wo = off & ~3u, cur = aregs[wo >> 2], nw;
@@ -230,6 +295,7 @@ static void reg_write(uint32_t off, int sz, uint32_t v, int from_arm) {
     default: break;
     }
     aregs[wo >> 2] = nw;
+    if (g_tl_on && wo < 0x2000 && (wo & 0x7F) == 0) tl_reg0(wo >> 7, cur, nw, from_arm);
     if (wo < 0x2000 && (wo & 0x7C) != 0) g_dirty[wo >> 7] = 1;
     if (wo < 0x2000 && (wo & 0x7F) == 0) {
         if ((cur ^ nw) & ~0x8000u) g_dirty[wo >> 7] = 1;
@@ -275,10 +341,11 @@ static void chan_start(int ch) {
     c->ad_pred = 0; c->ad_step = 127;
     uint32_t r0 = chn_reg(ch, 0), base = (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) & (ARAM_SIZE - 1), lsa = chn_reg(ch, 8) & 0xFFFF;
     int pcms = (r0 >> 7) & 3;
+    c->sa = base | ((uint32_t)pcms << 28);
     if (pcms >= 2) { c->ad_pos = 0; c->s0 = adpcm_next(c, base, lsa); c->s1 = adpcm_next(c, base, lsa); }
     else { c->s0 = chan_sample(c, 0, base, pcms); c->s1 = chan_sample(c, 1, base, pcms); }
     st_keyon++;
-    EV("KEYON ch%d pcms=%d sa=%06x lsa=%u lea=%u loop=%d rr=%u d2r=%u tl=%u dl=%u fns=%u oct=%d pan=%u", ch, pcms, base, lsa, chn_reg(ch, 0xC) & 0xFFFF, (r0 >> 9) & 1, chn_reg(ch, 0x14) & 31, (r10 >> 11) & 31, (chn_reg(ch, 0x28) >> 8) & 255, (chn_reg(ch, 0x24) >> 8) & 15, chn_reg(ch, 0x18) & 0x3FF, ((int)((chn_reg(ch, 0x18) >> 11) & 15) ^ 8) - 8, chn_reg(ch, 0x24) & 31);
+    EVT("KEYON ch%d pcms=%d sa=%06x lsa=%u lea=%u loop=%d rr=%u d2r=%u tl=%u dl=%u fns=%u oct=%d pan=%u", ch, pcms, base, lsa, chn_reg(ch, 0xC) & 0xFFFF, (r0 >> 9) & 1, chn_reg(ch, 0x14) & 31, (r10 >> 11) & 31, (chn_reg(ch, 0x28) >> 8) & 255, (chn_reg(ch, 0x24) >> 8) & 15, chn_reg(ch, 0x18) & 0x3FF, ((int)((chn_reg(ch, 0x18) >> 11) & 15) ^ 8) - 8, chn_reg(ch, 0x24) & 31);
     if (TRACE && pcms >= 2) {      /* decode-quality probe: statistics of the first samples (a correct ADPCM decode is ~zero-mean, not saturated) */
         Chan t; memset(&t, 0, sizeof t); t.ad_step = 127; uint32_t n = chn_reg(ch, 0xC) & 0xFFFF; if (n > 8192) n = 8192;
         double sum = 0, sq = 0; int sat = 0;
@@ -294,7 +361,7 @@ static void chan_start(int ch) {
 /* KYONEX: latch each channel's KYONB. Key-on happens on a KYONB 0 -> 1 transition of the latched state, key-off on 1 -> 0 (Sega driver: a voice is keyed off explicitly
  * before its channel is reused). A channel that is still latched ON but finished (sample end / EG at max) is NOT restarted by a later KYONEX for another voice: the previous
  * code restarted every inactive channel with KYONB=1 on every KYONEX ("a finished SFX plays again whenever another sound starts"). Ignored restarts are counted/logged. */
-static uint64_t st_keyon_ignored; static int g_keyon_old;                 /* R2_SND_KEYON_OLD=1: old rule (restart every finished latched channel), A/B only */
+static uint64_t st_keyon_ignored; static int g_keyon_old; static uint8_t g_ign_logged[64];       /* IGNORED is logged once per latch (it repeated for every unrelated KYONEX: 1154 lines vs 188 KEYON in one session) */                 /* R2_SND_KEYON_OLD=1: old rule (restart every finished latched channel), A/B only */
 static void keyonex(void) {
     for (int ch = 0; ch < 64; ch++) {
         uint32_t r0 = chn_reg(ch, 0);
@@ -303,17 +370,22 @@ static void keyonex(void) {
         if (on) {
             uint32_t base = (((r0 & 0x7F) << 16) | (chn_reg(ch, 4) & 0xFFFF)) & (ARAM_SIZE - 1);
             int is_ring = (base == 0x18000 || base == 0x1E000);
-            int is_retrigger = g_key_req[ch];
-            if (!g_keyed[ch] || (is_retrigger && (!is_ring || !c->active)) || (g_keyon_old && (!c->active || c->eg == 3))) {
-                g_keyed[ch] = 1; g_dirty[ch] = 0; chan_start(ch);
+            /* g_key_req is set by ANY reg0 write with KYONB=1 (the driver rewrites reg0 of voices that are already playing, KYONB kept at 1, whenever it keys on another voice). Restarting
+             * every such active voice cut/restarted all playing SFX on each new key-on (fist spam + lum pickup). Hardware ignores KYONB=1 on a voice that is already keyed on, so an
+             * ACTIVE (non-releasing) voice is restarted only when the write really loads a different sound (new SA/format) = a voice steal without key-off. */
+            int playing = c->active && c->eg != 3;
+            int is_retrigger = g_key_req[ch] && (!playing || (!is_ring && c->sa != (base | ((uint32_t)((r0 >> 7) & 3) << 28))));
+            if (!g_keyed[ch] || (is_retrigger && !(is_ring && playing)) || (g_keyon_old && (!c->active || c->eg == 3))) {
+                if (g_tl_on && playing) tl_printf("STEAL ch%d: playing sa=%06x fmt=%u eg=%d pos=%u replaced by sa=%06x (no key-off)", ch, c->sa & 0x0FFFFFFFu, c->sa >> 28, c->eg, c->pos, base);
+                g_keyed[ch] = 1; g_ign_logged[ch] = 0; g_dirty[ch] = 0; chan_start(ch);
             }
             else if (!c->active || c->eg == 3) {
                 st_keyon_ignored++;
-                EV("KEYON_IGNORED ch%d (latched on, active=%d eg=%d) sa=%06x%s", ch, c->active, c->eg, base, is_ring ? " RING-VOICE" : "");
+                if (!g_ign_logged[ch]) { g_ign_logged[ch] = 1; EVT("KEYON_IGNORED ch%d (latched on, active=%d eg=%d) sa=%06x%s [first ignore of this latch; counted in ignored_total]", ch, c->active, c->eg, base, is_ring ? " RING-VOICE" : ""); }
             }
         } else {
-            g_keyed[ch] = 0;
-            if (c->active && c->eg != 3) { c->eg = 3; EV("KEYOFF ch%d pos=%u att=%.0f rr=%u", ch, c->pos, c->att, chn_reg(ch, 0x14) & 31); }
+            g_keyed[ch] = 0; g_ign_logged[ch] = 0;
+            if (c->active && c->eg != 3) { c->eg = 3; EVT("KEYOFF ch%d pos=%u att=%.0f rr=%u", ch, c->pos, c->att, chn_reg(ch, 0x14) & 31); }
         }
         g_key_req[ch] = 0;
     }
@@ -335,7 +407,7 @@ static inline void render_sample(float *outl, float *outr) {
         case 1: { unsigned d1 = (r10 >> 6) & 31; float dl = (float)(((r14 >> 5) & 31) << 5);
                   c->att += g_dec_step[d1]; if (c->att >= dl) { c->att = dl; c->eg = 2; } break; }
         case 2: { unsigned d2 = (r10 >> 11) & 31; c->att += g_dec_step[d2]; if (c->att > 1023.0f) c->att = 1023.0f; break; }
-        default: { unsigned rr = r14 & 31; c->att += g_dec_step[rr]; if (c->att >= 1023.0f) { c->att = 1023.0f; c->active = 0; g_amask &= ~(1ull << ch); EV("REL_END ch%d", ch); } break; }
+        default: { unsigned rr = r14 & 31; c->att += g_dec_step[rr]; if (c->att >= 1023.0f) { c->att = 1023.0f; c->active = 0; g_amask &= ~(1ull << ch); EVT("REL_END ch%d", ch); } break; }
         }
         if (!c->active) continue;
         /* sample */
@@ -369,7 +441,7 @@ static inline void render_sample(float *outl, float *outr) {
                     }
                     c->pos = lsa;
                     if (pcms >= 2) { c->ad_pos = lsa; if (pcms != 3) { c->ad_pred = c->lsa_saved ? c->lsa_pred : 0; c->ad_step = c->lsa_saved ? c->lsa_step : 127; } /* pcms 3 = ADPCM long-stream: decoder state continues across the loop (ring-buffer streams) */ c->s0 = adpcm_next(c, base, lsa); c->s1 = adpcm_next(c, base, lsa); continue; }
-                } else { c->active = 0; g_amask &= ~(1ull << ch); EV("SAMPLE_END ch%d sa=%06x lea=%u eg=%d", ch, base, lea, c->eg); break; }
+                } else { c->lp_flag = 1; /* AICA sets the loop-end flag (0x2810 bit15) when a non-looping sample reaches LEA too: the MANATEE ARM driver only ends a voice (keys it off, clears its playing flag = the SH4-visible status byte) when it sees this bit (ARM 0x7298 tst #0x8000) */ c->active = 0; g_amask &= ~(1ull << ch); EVT("SAMPLE_END ch%d sa=%06x lea=%u eg=%d", ch, base, lea, c->eg); break; }
             }
             c->s0 = c->s1;
             uint32_t nx = c->pos + 1;
@@ -415,8 +487,10 @@ SND_INL uint32_t mrd(uint32_t a, int sz) {
     if (a >= 0x800000u && a < 0x808000u) return reg_read(a - 0x800000u, sz, 1);
     return 0;
 }
+static uint32_t g_stat_base;      /* diagnostics: ARAM base of the per-handle status blocks (guest [sd+0x1B8]+0x200, 0x20 per handle), set by the slot snapshot */
+static void tl_printf(const char *fmt, ...);
 SND_INL void mwr(uint32_t a, int sz, uint32_t v) {
-    if (a < 0x800000u) { ram_wr(a, sz, v); return; }
+    if (a < 0x800000u) { if (g_stat_base && g_tl_on && a >= g_stat_base && a < g_stat_base + 0x100 && !(a & 0x1F) && sz == 1) if ((v & 0xFF) != ram_rd(a, 1)) tl_printf("ARMSTAT h%u <- %02x (was %02x) armpc=%05x lr=%05x", (a - g_stat_base) >> 5, v & 0xFF, ram_rd(a, 1), A.r[15], A.r[14]); ram_wr(a, sz, v); return; }
     if (a >= 0x800000u && a < 0x808000u) reg_write(a - 0x800000u, sz, v, 1);
 }
 static inline uint32_t ror32(uint32_t x, unsigned n) { n &= 31; return n ? (x >> n) | (x << (32 - n)) : x; }
@@ -847,7 +921,27 @@ static uint64_t mix_now_us(void);
 static uint64_t st_tp_arm, st_tp_vox, st_tp_n; static double g_clock_cal_us;     /* probe sums (us) over st_tp_n probed samples */
 /* advance the emulated machine by n AICA sample periods; out (may be NULL) gets stereo int16 at 44.1 kHz. Caller holds the lock. */
 static uint64_t g_slow_ns; static uint64_t mix_now_us(void);
+static void tl_frame(void) {
+    if (hle_frame_count == g_tl_lastframe) return;
+    g_tl_lastframe = hle_frame_count;
+    char a[400], r[400], l[400]; int na = 0, nr = 0, nl = 0, pa = 0, pr = 0, pl = 0;
+    for (int ch = 0; ch < 64; ch++) {
+        if (g_keyed[ch]) { nl++; if (pl < 380) pl += snprintf(l + pl, 20, "%d,", ch); }
+        if (!chn[ch].active) continue;
+        if (chn[ch].eg == 3) { nr++; if (pr < 380) pr += snprintf(r + pr, 20, "%d,", ch); }
+        else { na++; if (pa < 380) pa += snprintf(a + pa, 20, "%d,", ch); }
+    }
+    a[pa] = r[pr] = l[pl] = 0;
+    tl_printf("FRAME active=%d [%s] release=%d [%s] latched=%d [%s] keyon_total=%llu ignored_total=%llu", na, a, nr, r, nl, l, (unsigned long long)st_keyon, (unsigned long long)st_keyon_ignored);
+    if (hle_frame_count - g_tl_flushframe >= 30) {
+        g_tl_flushframe = hle_frame_count;
+        while (__sync_lock_test_and_set(&g_tl_spin, 1)) ;
+        g_tl_total += g_tl_n; tl_flush_nolock();
+        __sync_lock_release(&g_tl_spin);
+    }
+}
 static void advance_locked(int n, int16_t *out) {
+    if (g_tl_on) tl_frame();
     float mv = (aregs[0x2800 / 4] & 15) == 0 ? 0.0f : powf(2.0f, ((float)(aregs[0x2800 / 4] & 15) - 15.0f) * 0.5f);   /* MVOL: 15 = 0 dB, 3 dB/step (approximation) */
     for (int k = 0; k < n; k++) {
         /* cost probe: every 64th sample is timed in its two halves (timers+ARM7 | voices) with the clock read at the boundaries; snd_get_stats extrapolates to a 1024-frame block */
@@ -970,6 +1064,7 @@ static void stream_watchdog(uint32_t ctx) {
     }
     if (inhole) { uint32_t ms = (uint32_t)((now - bad0) / 44); if (ms > g_st_hole_ms_max) g_st_hole_ms_max = ms; }
 }
+static void slots_snapshot(void);
 static void sf_disp_body(SH4Ctx *c);
 static void sf_disp(SH4Ctx *c) { uint64_t t0 = r2_now_us(); sf_disp_body(c); g_perf.t_snd_tick += r2_now_us() - t0; g_perf.snd_tick_n++; }
 static void sf_disp_body(SH4Ctx *c) {
@@ -983,6 +1078,7 @@ static void sf_disp_body(SH4Ctx *c) {
     }
     g_sf_ticks++; c->pr = pr;
     stream_watchdog(ctx);
+    if (g_evlog || g_tl_on) slots_snapshot();
     if (g_evlog && getenv("R2_SND_CMDDUMP")) {      /* every tick where the command block changed: entries whose op is not a 0x15/0x16 status poll, plus the 0x13400 sequence words */
         static char last[1400]; char b[1400]; int n = 0;
         for (uint32_t o = 0x13200; o < 0x13320; o += 16) { uint32_t w0 = ram_rd(o, 4), w1 = ram_rd(o + 4, 4); unsigned op = w0 & 0xFF; if (op && op != 0x15 && op != 0x16) n += snprintf(b + n, sizeof b - n, " [%x:%08x %08x]", o & 0xFFF, w0, w1); }
@@ -1007,8 +1103,37 @@ static void sf_resume(SH4Ctx *c) { g_st_resume++; if (g_evlog) EV("GUEST stream-
 /* guest sd command taps (R2_SND_EV=1 log, counters): sd cmd 0x11 key-on request 0x8C0F06BC (r4 = sd handle, byte at +1 = driver handle id) and cmd 0x12 stop 0x8C0F08E4.
  * Used to compare what the GAME asks for with what the AICA model plays (KEYON events): they must match 1:1. */
 static unsigned long st_gstart, st_gstop;
-static void sf_cmd_start(SH4Ctx *c) { st_gstart++; if (g_evlog) EV("GUEST start-cmd #%lu handle=%u args r5=%u r6=%u r7=%d", st_gstart, (unsigned)(LD8(c->r[4] + 1)), c->r[5] & 0xFF, c->r[6] & 0xFF, (int)c->r[7]); hle_orig(c, 0x8C0F06BC); }
-static void sf_cmd_stop(SH4Ctx *c) { st_gstop++; if (g_evlog) EV("GUEST stop-cmd #%lu handle=%u", st_gstop, (unsigned)(LD8(c->r[4] + 1))); hle_orig(c, 0x8C0F08E4); }
+static void sf_cmd_start(SH4Ctx *c) {
+    st_gstart++; unsigned long n = st_gstart; unsigned h = LD8(c->r[4] + 1), r5 = c->r[5] & 0xFF, r6 = c->r[6] & 0xFF; int r7 = (int)c->r[7]; uint32_t pr = c->pr; uint64_t s0 = st_samples;
+    hle_orig(c, 0x8C0F06BC);
+    /* r0 = sd error code (0 = accepted). The game's wrapper (f_8c098b?? @8c098c46) treats nonzero as "start failed": status 4 + immediate stop-cmd + fail counter 0x8C0C9478 */
+    if (g_evlog || g_tl_on) { uint32_t q = LD32(0x8C0F4334u) + 0x158u;      /* sd command queue: +12 base, +16 capacity, +20 pending count, +24 write idx (entries of 0x1C bytes) */
+        EVT("GUEST start-cmd #%lu handle=%u args r5=%u r6=%u r7=%d pr=%08x ret=%08x (waited %llu AICA samples) sdq[base=%08x cap=%u cnt=%u wr=%u]", n, h, r5, r6, r7, pr, c->r[0], (unsigned long long)(st_samples - s0), LD32(q + 12), LD32(q + 16), LD32(q + 20), LD32(q + 24)); }
+}
+static void sf_cmd_stop(SH4Ctx *c) { st_gstop++; if (g_evlog || g_tl_on) EVT("GUEST stop-cmd #%lu handle=%u pr=%08x", st_gstop, (unsigned)(LD8(c->r[4] + 1)), c->pr); hle_orig(c, 0x8C0F08E4); }
+/* Game-side SFX play request FUN_8c098f20(req=r4, prio_bias=r5, cb=r6, cbarg=r7, def=[sp]) -> handle or -1 (dropped). Drop reasons (re_analysis/dc/notes_sfx_voices.md): score = req[4]*def[0xC] < *0x8C0C947C
+ * and !def[0xB]; no free handle-table entry (0x8C2E6CD8 x60); no victim among the 8 real slots (0x8C2E2CD8 x 0x100, +4 state, +0xE4 class, +0xF4 age). Logged with a snapshot of the 8 slots. */
+static void sf_play_req(SH4Ctx *c) {
+    uint32_t req = c->r[4], def = LD32(c->r[15]), pr = c->pr; unsigned score = LD8(req + 4) * LD8(def + 12); int bias = (int)c->r[5];
+    hle_orig(c, 0x8C098F20);
+    if (g_evlog || g_tl_on) {
+        char b[200]; int n = 0;
+        for (int i = 0; i < 8; i++) { uint32_t sl = 0x8C2E2CD8u + i * 0x100u; n += snprintf(b + n, sizeof b - n, " %u:%u/a%d/c%u", i, LD32(sl + 4), (int)LD32(sl + 0xF4), LD32(sl + 0xE4)); }
+        EVT("PLAYREQ ret=%d vol=%u prio=%u score=%u minscore=%u queueable=%u class=%d snd=%08x pr=%08x slots[state/age/class]:%s", (int)c->r[0], LD8(req + 4), LD8(def + 12), score, LD32(0x8C0C947Cu), LD32(def + 44), (int)bias, def, pr, b);
+    }
+}
+/* per-frame snapshot of the 8 real SFX slots when anything changed: state, sd driver handle id, sound def ptr, game priority class */
+static void slots_snapshot(void) {
+    static unsigned long lastf = ~0ul; static char last[384]; char b[384]; int n = 0;
+    if (hle_frame_count == lastf) return; lastf = hle_frame_count;
+    if ((g_evlog || g_tl_on) && hle_frame_count == 600) for (int i = 0; i < 0x8000 / 4; i++) if (g_armrd_hist[i] && (i * 4 >= 0x2000 || (i & 0x1F) < 0x14)) EVT("ARMRD %05x n=%llu", i * 4, (unsigned long long)g_armrd_hist[i]);
+    for (int i = 0; i < 8; i++) { uint32_t sl = 0x8C2E2CD8u + i * 0x100u, sd = LD32(sl); int h = sd ? (int)LD8(sd + 1) : -1; uint32_t sb = LD32(0x8C0F4334u), ab = sb ? LD32(sb + 0x1B8u) : 0;      /* driver status byte (bit0 = playing) = ARAM[[sd+0x1B8] + 0x200 + h*0x20] */
+        n += snprintf(b + n, sizeof b - n, " %u:s%u/h%d/st%02x/d%05x", i, LD32(sl + 4), h, (h >= 0 && ab < 0x200000u) ? (g_stat_base = ab + 0x200, ram_rd(ab + 0x200 + h * 0x20, 1)) : 0xEE, LD32(sl + 0xE0) & 0xFFFFF); }
+    if (strcmp(b, last)) { strcpy(last, b); EVT("SLOTS%s", b); }
+}
+/* sd queue service taps: 0x8C0D6FDC = per-tick service (calls 0x8C0D6CDC drain loop, then 0x8C0E2A7C), 0x8C0D6CDC moves <= 32 queued commands to the AICA command block */
+static uint32_t sdq_cnt(void) { uint32_t b = LD32(0x8C0F4334u); return b ? LD32(b + 0x16Cu) : 0; }
+static void sf_sdq_svc(SH4Ctx *c) { uint32_t c0 = sdq_cnt(), pr = c->pr; hle_orig(c, 0x8C0D6FDC); if (g_evlog || g_tl_on) { uint32_t b = LD32(0x8C0F4334u); uint32_t ha = b ? LD32(b + 0x1BCu) : 0; EVT("SDQ svc pr=%08x cnt %u->%u pend=%u busy=%u ack@%06x=%02x", pr, c0, sdq_cnt(), b ? LD32(b + 0x15Cu) : 0, b ? LD32(b + 0x160u) : 0, ha, ha < 0x200000u ? ram_rd(ha, 1) : 0xFFu); } }
 #endif
 
 /* ============================================================================================================================ public API */
@@ -1201,8 +1326,10 @@ void snd_test_sh4_aram_wr(uint32_t a, int sz, uint32_t v) { sh4_aram_wr(a, sz, v
 void snd_test_sh4_reg_wr(uint32_t a, int sz, uint32_t v) { sh4_reg_wr(a, sz, v); }
 void snd_test_dma_to_aram(uint32_t a, const void *p, uint32_t len) { if ((a & 0x1FFFFF) + len <= ARAM_SIZE) memcpy(&aram[a & 0x1FFFFF], p, len); }
 uint64_t snd_test_samples(void) { return st_samples; }
+uint32_t snd_test_mon(int ch) { aregs[0x280C / 4] = (uint32_t)ch << 8; return reg_read(0x2810, 4, 1); }   /* what the ARM driver reads: LP | SGC | EG */
 void snd_test_set_pull(int on) { g_pull_mode = on; g_blk_lock = 0; /* single-threaded replay: no guest/audio thread exclusion needed (it would deadlock) */ }
 static void snd_atexit(void) {
+    snd_trace_close();
 #if !defined(__vita__) && !defined(SND_TEST)
     if (g_rec) { fclose(g_rec); g_rec = 0; }
 #endif
@@ -1213,6 +1340,7 @@ static void snd_atexit(void) {
     if (g_evlog) fprintf(stderr, "[ev] CATCHUP ticks=%lu extra_calls=%lu; guest start-cmds=%lu stop-cmds=%lu\n", g_sf_ticks, g_sf_extra, st_gstart, st_gstop);
 #endif
     if (g_evlog) { SndStats ms; snd_get_stats(&ms); fprintf(stderr, "[ev] MIXCOST calls=%llu avg=%u us max=%u us per block of 1024 frames (budget 21333 us at 48 kHz); arm_instr=%llu keyon=%llu keyon_ignored=%llu cmdblk_writes=%llu cmdblk_torn=%llu\n", (unsigned long long)ms.mix_calls, ms.mix_us_avg, ms.mix_us_max, (unsigned long long)ms.arm_instr, (unsigned long long)ms.keyon, (unsigned long long)st_keyon_ignored, (unsigned long long)g_blk_n, (unsigned long long)g_blk_torn); }
+    if (g_evlog) for (int i = 0; i < 0x8000 / 4; i++) if (g_armrd_hist[i] && (i * 4 >= 0x2000 || (i & 0x1F) < 0x14)) fprintf(stderr, "[ev] ARMRD %05x n=%llu\n", i * 4, (unsigned long long)g_armrd_hist[i]);
     if (g_evlog) for (int ch = 0; ch < 64; ch++) if (chn[ch].active) { fprintf(stderr, "[ev] ACTIVE_AT_EXIT ch%d eg=%d att=%.0f pos=%u", ch, chn[ch].eg, chn[ch].att, chn[ch].pos); for (int r = 0; r < 0x50; r += 4) fprintf(stderr, " %02x:%08x", r, aregs[(ch * 0x80 + r) >> 2]); fputc(10, stderr); } snd_wav_close(); { const char *d = getenv("R2_SND_DUMP"); if (d && *d) { FILE *f = fopen(d, "wb"); if (f) { fwrite(aram, 1, ARAM_SIZE, f); fclose(f); } } } if (TRACE) { for (int i = 0; i < 32; i++) if (g_sh4wr[i]) fprintf(stderr, "[snd] sh4 wrote %llu bytes to aram %06x..\n", (unsigned long long)g_sh4wr[i], i << 16); SndStats s; snd_get_stats(&s); fprintf(stderr, "[snd] ringcmds=%llu samples=%llu arm_instr=%llu idle_skips=%llu keyon=%llu undef=%u active=%d\n", (unsigned long long)s.ringcmds, (unsigned long long)s.samples, (unsigned long long)s.arm_instr, (unsigned long long)s.arm_idle_skips, (unsigned long long)s.keyon, s.undef_instr, s.active_channels); } }
 
 #if !defined(__vita__)
@@ -1247,6 +1375,11 @@ __attribute__((constructor)) static void snd_ctor(void) {
     { const char *bl = getenv("R2_SND_BLKLOCK"); g_blk_lock = !(bl && *bl == '0'); }      /* =0: no command-block exclusion (A/B) */
     { const char *sl = getenv("R2_SND_SLOW_NS"); g_slow_ns = sl ? (uint64_t)atoll(sl) : 0; }
     { const char *vd = getenv("R2_SND_VDUMP"); g_vdump_s = vd ? atoi(vd) : 0; }
+#if defined(__vita__)
+    g_tl_on = 1;                                                    /* Vita: always on -> ux0:data/rayman2/snd_trace.log */
+#else
+    { const char *tp = getenv("R2_SND_TRACELOG"); if (tp && *tp && strcmp(tp, "0")) { g_tl_path = tp; g_tl_on = 1; } }
+#endif
     { const char *e = getenv("R2_SND_EV"); g_evlog = e && *e && *e != '0'; }
     const char *tr = getenv("R2_SND_TRACE"); g_trace = tr && *tr && *tr != '0';
     static const uint32_t pfx[3] = {0x00000000u, 0x80000000u, 0xA0000000u};
@@ -1262,7 +1395,7 @@ __attribute__((constructor)) static void snd_ctor(void) {
     start_pull_test();
 #endif
 #ifndef SND_TEST
-    { const char *e = getenv("R2_STREAM_CATCHUP"); g_sf_on = !(e && *e == '0'); hle_hook(0x8C0625B8, sf_disp); hle_hook(0x8C062F60, sf_feed); hle_hook(0x8C0F06BC, sf_cmd_start); hle_hook(0x8C0F08E4, sf_cmd_stop); hle_hook(0x8C06262C, sf_open); hle_hook(0x8C0628A8, sf_stop); hle_hook(0x8C062960, sf_pause); hle_hook(0x8C0629B0, sf_resume); }
+    { const char *e = getenv("R2_STREAM_CATCHUP"); g_sf_on = !(e && *e == '0'); hle_hook(0x8C0625B8, sf_disp); hle_hook(0x8C062F60, sf_feed); hle_hook(0x8C0F06BC, sf_cmd_start); hle_hook(0x8C0F08E4, sf_cmd_stop); hle_hook(0x8C0D6FDC, sf_sdq_svc); hle_hook(0x8C098F20, sf_play_req); hle_hook(0x8C06262C, sf_open); hle_hook(0x8C0628A8, sf_stop); hle_hook(0x8C062960, sf_pause); hle_hook(0x8C0629B0, sf_resume); }
 #endif
 #if !defined(__vita__) && !defined(SND_TEST)
     { const char *rf = getenv("R2_SND_REC"); if (rf && *rf) { g_rec = fopen(rf, "wb"); if (g_rec) fwrite("SREC0001", 1, 8, g_rec); } }

@@ -156,6 +156,9 @@ static void t6(void) {
     chreg(1, 0, 1 << 9);                                            /* ch1 loops, ch0 one-shot (100 samples) */
     keyon(0); snd_test_advance(2000, NULL);
     SndStats s; snd_get_stats(&s); CHECK(s.active_channels == 0, "one-shot finished (active %d)", s.active_channels);
+    /* the MANATEE driver ends a voice (key-off + clears the playing status byte the game polls) only when it reads LP (bit15) set; hardware sets it at LEA of a non-looping sample too.
+     * Without it every finished one-shot stayed "playing" for the game until it was stolen: 8 stuck SFX slots -> new low-priority SFX (magic fist) dropped. */
+    { uint32_t m = snd_test_mon(0); CHECK((m & 0x8000) && ((m >> 13) & 3) == 3, "finished one-shot reads LP=1, SGC=3 on the monitor (0x%04x)", m); }
     snd_test_regwrite(1 * 0x80, snd_test_regs()[0x80 >> 2] | 0x4000 | 0x8000);        /* key on ch1 only; ch0 still has KYONB=1 latched */
     snd_test_advance(2000, NULL); snd_get_stats(&s);
     CHECK(s.active_channels == 1, "finished ch0 not restarted by KYONEX for ch1 (active %d, expect 1)", s.active_channels);
@@ -209,9 +212,47 @@ static void t7(void) {
     snd_test_sh4_aram_wr(0x14000, 4, 1); snd_mix(0, 0);
     uint64_t s1 = snd_test_samples(); static int16_t b[256 * 2]; snd_mix(b, 256); CHECK(snd_test_samples() - s1 >= 256, "interrupted block releases the AICA lock");
 }
+/* ---- T8: all 64 voices busy: stealing a looping SFX voice (new KYONB=1 + KYONEX, no key-off) restarts it, other voices stay up ---- */
+static void t8(void) {
+    printf("T8 voice stealing with 64 busy voices (steal = key-off + key-on of the same channel, as on hardware; a bare KYONB=1 rewrite of a playing voice is ignored, see T9)\n");
+    memset(snd_test_regs(), 0, 0x2000 * 4); snd_test_regs()[0x2800 / 4] = 0xF;
+    int16_t *w = (int16_t *)(snd_test_aram() + 0x1000); for (int i = 0; i < 441; i++) w[i] = (int16_t)(12000 * sin(2 * M_PI * i / 441.0));
+    for (int c = 0; c < 64; c++) { chreg(c, 0, 1 << 9); chreg(c, 4, 0x1000); chreg(c, 8, 0); chreg(c, 0xC, 441); chreg(c, 0x10, 31); chreg(c, 0x14, 31); chreg(c, 0x18, 0); chreg(c, 0x24, 0xF << 8); keyon(c); }
+    snd_test_advance(200, NULL); SndStats s, s2; snd_get_stats(&s);
+    CHECK(s.active_channels == 64, "64 voices active (%d)", s.active_channels);
+    for (int i = 0; i < 20; i++) { snd_get_stats(&s); keyon(7); snd_get_stats(&s2);
+        if (s2.keyon != s.keyon + 1) { CHECK(0, "steal #%d of ch7 restarted (keyon %llu -> %llu)", i, (unsigned long long)s.keyon, (unsigned long long)s2.keyon); break; } }
+    snd_test_advance(50, NULL); snd_get_stats(&s);
+    CHECK(s.active_channels == 64, "all 64 voices still active after 20 steals (%d)", s.active_channels);
+}
+/* ---- T9 (SFX swallowing): the driver rewrites reg0 (KYONB still 1) of voices that are already playing when it keys on another voice. Those playing voices must NOT restart;
+ *      a write that loads a different sound (voice steal without key-off) must restart; a one-shot that already finished and is re-keyed must restart ---- */
+static void t9(void) {
+    printf("T9 redundant KYONB rewrite of playing SFX voices must not restart them\n");
+    memset(snd_test_regs(), 0, 0x2000 * 4); snd_test_regs()[0x2800 / 4] = 0xF;
+    SndStats s0; snd_get_stats(&s0); int base_act = s0.active_channels;       /* leftovers from T8 stay active */
+    int16_t *w = (int16_t *)(snd_test_aram() + 0x1000); for (int i = 0; i < 4410; i++) w[i] = (int16_t)(12000 * sin(2 * M_PI * i / 441.0));
+    w = (int16_t *)(snd_test_aram() + 0x4000); for (int i = 0; i < 4410; i++) w[i] = (int16_t)(9000 * sin(2 * M_PI * i / 220.0));
+    for (int c = 0; c < 4; c++) { chreg(c, 0, 0); chreg(c, 4, 0x1000); chreg(c, 8, 0); chreg(c, 0xC, 4410); chreg(c, 0x10, 31); chreg(c, 0x14, 31); chreg(c, 0x18, 0); chreg(c, 0x24, 0xF << 8); }
+    keyon(0); keyon(1); keyon(2); snd_test_advance(200, NULL);
+    SndStats s, s2; snd_get_stats(&s);
+    CHECK(s.keyon - s0.keyon == 3, "3 SFX voices keyed on (%llu)", (unsigned long long)(s.keyon - s0.keyon)); (void)base_act;
+    /* lum pickup: ch3 keyed on, driver also rewrites reg0 of playing ch0..ch2 with KYONB=1 (same sound) */
+    for (int c = 0; c < 3; c++) snd_test_regwrite(c * 0x80, snd_test_regs()[(c * 0x80) >> 2] | 0x4000);
+    snd_test_regwrite(3 * 0x80, snd_test_regs()[(3 * 0x80) >> 2] | 0x4000 | 0x8000);
+    snd_get_stats(&s2);
+    CHECK(s2.keyon == s.keyon + 1, "only the new voice was keyed on (keyon %llu -> %llu)", (unsigned long long)s.keyon, (unsigned long long)s2.keyon);
+    for (int i = 0; i < 10; i++) { for (int c = 0; c < 3; c++) snd_test_regwrite(c * 0x80, snd_test_regs()[(c * 0x80) >> 2] | 0x4000 | 0x8000); }
+    snd_get_stats(&s2);
+    CHECK(s2.keyon == s.keyon + 1, "repeated redundant KYONEX does not restart playing voices (keyon %llu)", (unsigned long long)s2.keyon);
+    CHECK(s2.active_channels - base_act == 4 || s2.active_channels == 64, "all 4 voices still playing (%d)", s2.active_channels);
+    /* steal: ch1 reloaded with another sample, KYONB=1 + KYONEX, no key-off */
+    chreg(1, 4, 0x4000); snd_test_regwrite(1 * 0x80, snd_test_regs()[0x80 >> 2] | 0x4000 | 0x8000);
+    snd_get_stats(&s); CHECK(s.keyon == s2.keyon + 1, "stealing a playing voice with a different sound restarts it (keyon %llu)", (unsigned long long)s.keyon);
+}
 int main(void) {
     snd_init(44100);
-    t1(); t2(); t3(); t4(); t6(); t7();
+    t1(); t2(); t3(); t4(); t6(); t7(); t8(); t9();
     printf("%s (%d failure%s)\n", fails ? "FAILED" : "ALL PASSED", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
 }

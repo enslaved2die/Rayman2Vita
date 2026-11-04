@@ -330,6 +330,7 @@ static int game_main(void) {
     int rc = hle_run_main(&ctx);
     vita_log("[vita] hle_run_main exited with code %d (stop reason: %s)", rc, hle_stop_reason());
 
+    snd_trace_close();
     free(buf);
     return rc;
 }

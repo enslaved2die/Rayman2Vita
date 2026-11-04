@@ -1,4 +1,27 @@
 #include "recomp_decls.h"
+#include "r2_trace.h"
+
+/* ---- 16:9 HUD edge anchoring (shared policy; identical copy in recomp_01.c / recomp_02.c) ----
+ * Edge anchoring is only meaningful for the in-game HUD (health bar left, lums / air meter right).  Menu and hub
+ * ("Menu" = title/menus, "Mapmonde2" = Isle of Doors with its level-info card) are composed of widgets whose parts
+ * (card sprite vs. text) are placed by different layout routines with different reference points, so any per-element
+ * X classification there splits a widget.  There everything keeps the authentic centred squeeze.
+ * n = element X normalised to 0..1 of the layout space.  Returns 0 (left), 0.5 (centre) or 1 (right). */
+static inline int r2_lvl_is(const char *s) {
+  uint32_t a = 0x8c123b09u;
+  for (;; s++, a++) {
+    uint8_t ch = LD8(a);
+    if (ch >= 'A' && ch <= 'Z') ch = (uint8_t)(ch + 32);
+    if (ch != (uint8_t)*s) return 0;
+    if (!*s) return 1;
+  }
+}
+static inline float r2_hud_anchor(float n) {
+  if (LD8(0x8c123b09u) == 0 || r2_lvl_is("menu") || r2_lvl_is("mapmonde2") || r2_lvl_is("staff_10")) return 0.5f;
+  if (n < 0.4f) return 0.0f;
+  if (n > 0.6f) return 1.0f;
+  return 0.5f;
+}
 void f_8c01ac0a(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   R(4)=0x0u;
@@ -226,7 +249,7 @@ void f_8c01ade6(SH4Ctx *c) {
   R(15)+=0x4u;
   { {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;} return; }
 }
-void f_8c01aea0(SH4Ctx *c) {
+static void f_8c01aea0_o(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(12);R(15)-=4;ST32(R(15),v);}
@@ -305,9 +328,7 @@ L8c01aefa:;
     float sq;
     uint32_t sq_u = LD32(0x8c0c52e4u);
     memcpy(&sq, &sq_u, 4);
-    float anchor = 0.5f;
-    if (elem_x < 40.0f) anchor = 0.0f;
-    else if (elem_x > 60.0f) anchor = 1.0f;
+    float anchor = r2_hud_anchor(elem_x / 100.0f);
     float off = anchor * 100.0f * (1.0f - sq);
     uint32_t off_u;
     memcpy(&off_u, &off, 4);
@@ -373,9 +394,7 @@ L8c01af66:;
     float sq;
     uint32_t sq_u = LD32(0x8c0c52e4u);
     memcpy(&sq, &sq_u, 4);
-    float anchor = 0.5f;
-    if (elem_x < 40.0f) anchor = 0.0f;
-    else if (elem_x > 60.0f) anchor = 1.0f;
+    float anchor = r2_hud_anchor(elem_x / 100.0f);
     float off = anchor * 100.0f * (1.0f - sq);
     uint32_t off_u;
     memcpy(&off_u, &off, 4);
@@ -443,9 +462,7 @@ L8c01b020:;
     float sq;
     uint32_t sq_u = LD32(0x8c0c52e4u);
     memcpy(&sq, &sq_u, 4);
-    float anchor = 0.5f;
-    if (elem_x < 40.0f) anchor = 0.0f;
-    else if (elem_x > 60.0f) anchor = 1.0f;
+    float anchor = r2_hud_anchor(elem_x / 100.0f);
     float off = anchor * 100.0f * (1.0f - sq);
     uint32_t off_u;
     memcpy(&off_u, &off, 4);
@@ -511,9 +528,7 @@ L8c01b08c:;
     float sq;
     uint32_t sq_u = LD32(0x8c0c52e4u);
     memcpy(&sq, &sq_u, 4);
-    float anchor = 0.5f;
-    if (elem_x < 40.0f) anchor = 0.0f;
-    else if (elem_x > 60.0f) anchor = 1.0f;
+    float anchor = r2_hud_anchor(elem_x / 100.0f);
     float off = anchor * 100.0f * (1.0f - sq);
     uint32_t off_u;
     memcpy(&off_u, &off, 4);
@@ -608,6 +623,11 @@ L8c01b156:;
   {uint32_t v=LD32(R(15));R(15)+=4;R(12)=v;}
   {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
+}
+void f_8c01aea0(SH4Ctx *c) {
+  r2_tr_level_poll();
+  r2_tr_s_scan();
+  f_8c01aea0_o(c);
 }
 void f_8c01b180(SH4Ctx *c) {
   ST32(R(12)+R(0),R(3));
@@ -724,9 +744,7 @@ L8c01b200:;
     float sq;
     uint32_t sq_u = LD32(0x8c0c52e4u);
     memcpy(&sq, &sq_u, 4);
-    float anchor = 0.5f;
-    if (elem_x < 40.0f) anchor = 0.0f;
-    else if (elem_x > 60.0f) anchor = 1.0f;
+    float anchor = r2_hud_anchor(elem_x / 100.0f);
     float off = anchor * 100.0f * (1.0f - sq);
     uint32_t off_u;
     memcpy(&off_u, &off, 4);
@@ -876,9 +894,7 @@ L8c01b332:;
     float sq;
     uint32_t sq_u = LD32(0x8c0c52e4u);
     memcpy(&sq, &sq_u, 4);
-    float anchor = 0.5f;
-    if (elem_x < 40.0f) anchor = 0.0f;
-    else if (elem_x > 60.0f) anchor = 1.0f;
+    float anchor = r2_hud_anchor(elem_x / 100.0f);
     float off = anchor * 100.0f * (1.0f - sq);
     uint32_t off_u;
     memcpy(&off_u, &off, 4);
@@ -1028,9 +1044,7 @@ L8c01b4ac:;
     float sq;
     uint32_t sq_u = LD32(0x8c0c52e4u);
     memcpy(&sq, &sq_u, 4);
-    float anchor = 0.5f;
-    if (elem_x < 40.0f) anchor = 0.0f;
-    else if (elem_x > 60.0f) anchor = 1.0f;
+    float anchor = r2_hud_anchor(elem_x / 100.0f);
     float off = anchor * 100.0f * (1.0f - sq);
     uint32_t off_u;
     memcpy(&off_u, &off, 4);
@@ -1180,9 +1194,7 @@ L8c01b5ca:;
     float sq;
     uint32_t sq_u = LD32(0x8c0c52e4u);
     memcpy(&sq, &sq_u, 4);
-    float anchor = 0.5f;
-    if (elem_x < 40.0f) anchor = 0.0f;
-    else if (elem_x > 60.0f) anchor = 1.0f;
+    float anchor = r2_hud_anchor(elem_x / 100.0f);
     float off = anchor * 100.0f * (1.0f - sq);
     uint32_t off_u;
     memcpy(&off_u, &off, 4);
@@ -2026,12 +2038,7 @@ L8c01be8e:;
     memcpy(&x1, &u1, 4);
     memcpy(&x2, &u2, 4);
     float elem_x = (x1 + x2) * 0.5f;
-    float anchor = 0.5f;
-    if (elem_x < 40.0f) {
-      anchor = 0.0f; /* Left-anchored HUD (Health bar) */
-    } else if (elem_x > 60.0f) {
-      anchor = 1.0f; /* Right-anchored HUD (Lums counter, Air meter) */
-    }
+    float anchor = r2_hud_anchor(elem_x / 100.0f);
     float sq;
     uint32_t sq_u = LD32(R(3));
     memcpy(&sq, &sq_u, 4);
@@ -2155,12 +2162,7 @@ L8c01bf7a:;
     memcpy(&x1, &u1, 4);
     memcpy(&x2, &u2, 4);
     float elem_x = (x1 + x2) * 0.5f;
-    float anchor = 0.5f;
-    if (elem_x < 40.0f) {
-      anchor = 0.0f; /* Left-anchored HUD (Health bar) */
-    } else if (elem_x > 60.0f) {
-      anchor = 1.0f; /* Right-anchored HUD (Lums counter, Air meter) */
-    }
+    float anchor = r2_hud_anchor(elem_x / 100.0f);
     float sq;
     uint32_t sq_u = LD32(R(3));
     memcpy(&sq, &sq_u, 4);
@@ -17369,7 +17371,7 @@ L8c02552e:;
 L8c02555e:;
   {  return; }
 }
-void f_8c025562(SH4Ctx *c) {
+static void f_8c025562_o(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
   R(13)=0x0u;
@@ -17616,7 +17618,14 @@ L8c025740:;
   {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
-void f_8c025780(SH4Ctx *c) {
+void f_8c025562(SH4Ctx *c) {
+  uint32_t a4=R(4),a5=R(5),a6=R(6),a7=R(7); char p[20]; int u0;
+  r2_tr_level_poll(); u0=r2_tr_b_used();
+  f_8c025562_o(c);
+  r2_tr_pfx(a6,p);
+  r2_tr("[ui] f=%u B[--] CREATE r4=%08x r5=%08x r6=%08x('%s') r7=%08x ret=%08x used %d->%d", r2_tr_frame(), a4,a5,a6,p,a7,R(0), u0, r2_tr_b_used());
+}
+static void f_8c025780_o(SH4Ctx *c) {
   R(3)=0x32u;
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   c->t=(int32_t)R(4)>=(int32_t)R(3);
@@ -17780,6 +17789,14 @@ L8c025936:;
 L8c025948:;
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
 }
+void f_8c025780(SH4Ctx *c) {
+  int idx=(int32_t)R(4); uint32_t op=R(5); uint32_t fv=c->fr[4]; uint32_t s=0,a0=0,f0=0,p0=0,a1,f1,p1;
+  if (idx>=0&&idx<50) { s=R2_TR_B_BASE+(uint32_t)idx*R2_TR_B_STRIDE; a0=LD8(s+0x10); f0=LD8(s+0x13); p0=LD32(s); }
+  f_8c025780_o(c);
+  if (s) { a1=LD8(s+0x10); f1=LD8(s+0x13); p1=LD32(s);
+    if (r2_tr_gate(5, idx, op ^ (a1<<8) ^ (f1<<16) ^ fv ^ (a0<<20)) || a0!=a1 || f0!=f1 || p0!=p1)
+      r2_tr("[ui] f=%u B[%02d] SET op=%u val=%.3f alpha %u->%u flags %02x->%02x ptr %08x->%08x", r2_tr_frame(), idx, (unsigned)op, r2_tr_f(fv), (unsigned)a0,(unsigned)a1,(unsigned)f0,(unsigned)f1,p0,p1); }
+}
 void f_8c025900(SH4Ctx *c) {
   sh4_mac_l(c,R(0),R(14));R(0)+=4;R(14)+=4;
   
@@ -17827,7 +17844,7 @@ void f_8c02594c(SH4Ctx *c) {
 L8c025966:;
   {  return; }
 }
-void f_8c0259a0(SH4Ctx *c) {
+static void f_8c0259a0_o(SH4Ctx *c) {
   {uint32_t v=R(14);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(13);R(15)-=4;ST32(R(15),v);}
   {uint32_t v=R(12);R(15)-=4;ST32(R(15),v);}
@@ -18402,4 +18419,9 @@ L8c025eca:;
   {uint32_t v=LD32(R(15));R(15)+=4;R(12)=v;}
   {uint32_t v=LD32(R(15));R(15)+=4;R(13)=v;}
   { {uint32_t v=LD32(R(15));R(15)+=4;R(14)=v;} return; }
+}
+void f_8c0259a0(SH4Ctx *c) {
+  r2_tr_level_poll();
+  r2_tr_b_scan();
+  f_8c0259a0_o(c);
 }

@@ -1,4 +1,5 @@
 #include "recomp_decls.h"
+#include "r2_trace.h"
 void f_8c06f2a0(SH4Ctx *c) {
   R(7)=LD32(R(4));
   R(6)=LD32(R(5));
@@ -8696,7 +8697,7 @@ void f_8c072e96(SH4Ctx *c) {
   R(0)=R(2);
   { uint32_t tg=R(0); R(15)+=0x4u; sh4_call(c,tg); return; }
 }
-void f_8c072eae(SH4Ctx *c) {
+static void f_8c072eae_o(SH4Ctx *c) {
   {uint32_t v=c->pr;R(15)-=4;ST32(R(15),v);}
   R(15)+=0xfffffff4u;
   ST32(R(15)+4,R(6));
@@ -8728,6 +8729,11 @@ L8c072ede:;
   R(15)+=0xcu;
   {uint32_t v=LD32(R(15));R(15)+=4;c->pr=v;}
   { R(0)=R(5); return; }
+}
+void f_8c072eae(SH4Ctx *c) {
+  uint32_t node_=R(5), out_=R(6), obj_=R(4);
+  f_8c072eae_o(c);
+  r2_tr_cond(node_, obj_, LD32(out_) & 0xffu);
 }
 void f_8c072f20(SH4Ctx *c) {
   R(15)+=0xfffffffcu;
