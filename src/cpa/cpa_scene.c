@@ -1,5 +1,6 @@
 /* See cpa_scene.h. Logic re-stated from src/engine/r2_level_geo.c without GL or file-scope globals. */
 #include "cpa_scene.h"
+#include "cpa_anim.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -462,95 +463,32 @@ void cpa_scene_free(CpaScene *s) {
     memset(s, 0, sizeof *s);
 }
 
-/* ---------- Rayman pose (port of tools/dc_actor_pose.c; notes_pose.md) ---------- */
-/* Quaternion table H2: 4 x s16 / 32767 (VERIFIED, FUN_8c081200 literal 3.0518509e-05). */
-static void quat_get(const CpaImage *im, uint32_t H2, uint16_t idx, float q[4]) {
-    for (int i = 0; i < 4; i++) q[i] = (float)cpa_s16(im, H2 + 8u * idx + 2u * i) * (1.0f / 32767.0f);
-}
-/* Row-major, as stored by FUN_8c081660 (VERIFIED). */
-static void quat_to_m3(const float q[4], float m[9]) {
-    float x = q[0], y = q[1], z = q[2], w = q[3];
-    m[0] = 1 - 2 * (y * y + z * z); m[1] = 2 * (x * y - z * w);     m[2] = 2 * (x * z + y * w);
-    m[3] = 2 * (x * y + z * w);     m[4] = 1 - 2 * (x * x + z * z); m[5] = 2 * (y * z - x * w);
-    m[6] = 2 * (x * z - y * w);     m[7] = 2 * (y * z + x * w);     m[8] = 1 - 2 * (x * x + y * y);
-}
-static void m3_mul(const float a[9], const float b[9], float r[9]) {
-    float t[9];
-    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) {
-        float v = 0; for (int k = 0; k < 3; k++) v += a[i * 3 + k] * b[k * 3 + j]; t[i * 3 + j] = v;
-    }
-    memcpy(r, t, sizeof t);
-}
-static void slerp(const float a[4], const float b[4], float t, float o[4]) {   /* INFERRED interpolation (real engine has ease terms, UNRESOLVED) */
-    float d = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3], sg = 1.f, bb[4];
-    if (d < 0) { d = -d; sg = -1.f; }
-    for (int i = 0; i < 4; i++) bb[i] = sg * b[i];
-    float k0, k1;
-    if (d > 0.9995f) { k0 = 1 - t; k1 = t; }
-    else { float th = acosf(d), sn = sinf(th); k0 = sinf((1 - t) * th) / sn; k1 = sinf(t * th) / sn; }
-    float n = 0;
-    for (int i = 0; i < 4; i++) { o[i] = k0 * a[i] + k1 * bb[i]; n += o[i] * o[i]; }
-    n = n > 0 ? 1.f / sqrtf(n) : 1.f;
-    for (int i = 0; i < 4; i++) o[i] *= n;
-}
-
+/* ---------- Rayman pose: hierarchical, delegated to cpa_anim (notes_pose.md, notes_anim_parents.md) ---------- */
 void cpa_rig_pose(CpaScene *s, float ft) {
+    /* Hierarchical pose via cpa_anim_rig_pose (VERIFIED against guest RAM, notes_anim_parents.md): static parent pairs from H3/H5, mirror-vector wrapper,
+     * objM per part. The animation is evaluated at the integer frame floor(ft) (the guest steps whole frames; no sub-frame blend). */
     CpaRig *R = &s->rig;
     const CpaImage *im = &s->img;
-    if (!R->valid) return;
-    const uint32_t *H = R->H;
-    uint32_t ar = H[0] + 0x38u * (uint32_t)R->anim, b6 = cpa_u16(im, ar + 0x30);
+    if (!R->valid || im->nReg < 1) return;
     if (ft < (float)R->firstFrame) ft = (float)R->firstFrame;
     if (ft > (float)(R->firstFrame + R->nFrames - 1)) ft = (float)(R->firstFrame + R->nFrames - 1);
-    uint32_t f = (uint32_t)ft - R->firstFrame;
-    Mat W; memcpy(W.m, R->world, sizeof W.m);
-    Mat cm[CPA_RIG_MAXCH]; uint8_t have[CPA_RIG_MAXCH] = {0};
-    for (uint32_t ch = 0; ch < R->nCh; ch++) {
-        /* channel row (H6, 0x10 B): +8 u32 base into H8; H8[base+frame] = key index; key = H9 + 0x24*idx (VERIFIED) */
-        uint32_t r6 = H[6] + 0x10u * (b6 + ch), hbase = cpa_u32(im, r6 + 8);
-        uint32_t kidx = cpa_u32(im, H[8] + 4u * (hbase + f)), key = H[9] + 0x24u * kidx, nextkey = 0;
-        float t = 0, kfr = (float)cpa_u16(im, key + 0x10);
-        uint16_t flags = cpa_u16(im, key + 0x12);
-        if (!(flags & 0x80)) {   /* next key = key + 0x24 unless flag 0x80; t = (frame - key.frame)/(next.frame - key.frame) VERIFIED FUN_8c0823c0 */
-            uint32_t nk = key + 0x24; float nf = (float)cpa_u16(im, nk + 0x10);
-            if (nf > kfr && ft > kfr) { nextkey = nk; t = (ft - kfr) / (nf - kfr); if (t > 1.f) t = 1.f; }
-        }
-        float q[4] = { 0, 0, 0, 1 }, Rm[9], T[3];
-        if (!(flags & 0x10)) {
-            quat_get(im, H[2], cpa_u16(im, key + 0x14), q);
-            if (t > 0 && nextkey && !(cpa_u16(im, nextkey + 0x12) & 0x10)) { float q2[4]; quat_get(im, H[2], cpa_u16(im, nextkey + 0x14), q2); slerp(q, q2, t, q); }
-        }
-        quat_to_m3(q, Rm);
-        /* translation = H1[vecIdx] * key.len (key+0x1A vec index, key+0xC float). Absolute in actor space, not accumulated: INFERRED
-         * from physical plausibility (feet z -0.003..0.33 at Wait f0). */
-        uint16_t vt = cpa_u16(im, key + 0x1A); float len = cpa_f32(im, key + 0xC);
-        for (int i = 0; i < 3; i++) T[i] = cpa_f32(im, H[1] + 12u * vt + 4u * i) * len;
-        if (t > 0 && nextkey) for (int i = 0; i < 3; i++) {
-            float b = cpa_f32(im, H[1] + 12u * cpa_u16(im, nextkey + 0x1A) + 4u * i) * cpa_f32(im, nextkey + 0xC);
-            T[i] += (b - T[i]) * t;
-        }
-        float S[3]; uint16_t vs = cpa_u16(im, key + 0x18);
-        for (int i = 0; i < 3; i++) S[i] = cpa_f32(im, H[1] + 12u * vs + 4u * i);
-        if (fabsf(S[0] - 1) > 1e-4f || fabsf(S[1] - 1) > 1e-4f || fabsf(S[2] - 1) > 1e-4f) {   /* INFERRED, never hit for Wait */
-            float qb[4], Rb[9], RbT[9], D[9] = { S[0],0,0, 0,S[1],0, 0,0,S[2] }, t1[9], t2[9];
-            quat_get(im, H[2], cpa_u16(im, key + 0x16), qb); quat_to_m3(qb, Rb);
-            for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) RbT[i * 3 + j] = Rb[j * 3 + i];
-            m3_mul(Rb, D, t1); m3_mul(t1, RbT, t2); m3_mul(t2, Rm, Rm);
-        }
-        Mat pm; mat_ident(&pm);
-        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) pm.m[i * 4 + j] = Rm[i * 3 + j];
-        for (int j = 0; j < 3; j++) pm.m[12 + j] = T[j];
-        mat_mul(&pm, &W, &cm[ch]); have[ch] = 1;
-    }
+    unsigned frame = (unsigned)ft;
+    CpaAnimTables T; CpaAnimActor A;
+    if (!cpa_anim_tables_from_header(im->reg[0].p, im->reg[0].n, &T) || !cpa_anim_actor_open(&A, im, &T, R->soVa)) return;
+    CpaAnimRig *rg = (CpaAnimRig *)malloc(sizeof *rg);
+    if (!rg) return;
+    if (!cpa_anim_rig_pose(&A, (unsigned)R->anim, frame, CPA_ANIM_BEST, R->world, rg)) { free(rg); return; }
     for (int k = 0; k < 3; k++) { R->pmin[k] = 1e30f; R->pmax[k] = -1e30f; }
     for (uint32_t i = 0; i < R->nPart; i++) {
         CpaRigPart *r = &R->part[i];
-        if (!r->wpos || r->chan < 0 || r->chan >= CPA_RIG_MAXCH || !have[r->chan]) continue;
+        if (!r->wpos || r->chan < 0 || (unsigned)r->chan >= rg->pose.nCh || r->chan >= CPA_RIG_MAXCH) continue;
+        Mat cm; memcpy(cm.m, rg->objM[r->chan], sizeof cm.m);
         for (uint32_t v = 0; v < r->nTri * 3; v++) {
-            xform(&cm[r->chan], r->lpos + v * 3, r->wpos + v * 3);
+            xform(&cm, r->lpos + v * 3, r->wpos + v * 3);
             for (int k = 0; k < 3; k++) { float x = r->wpos[v * 3 + k]; if (x < R->pmin[k]) R->pmin[k] = x; if (x > R->pmax[k]) R->pmax[k] = x; }
         }
     }
+    free(rg);
 }
 
 

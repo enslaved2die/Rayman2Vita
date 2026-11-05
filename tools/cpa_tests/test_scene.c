@@ -3,6 +3,7 @@
  * DCDATA_DIR must contain FIX.DAT and LEARN_10/LEARN_10.DAT.
  * Every check prints expected vs actual; the process exits non-zero if any fail. Nothing is adjusted to make numbers pass. */
 #include "../../src/cpa/cpa_scene.h"
+#include "../../src/cpa/cpa_anim.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +89,64 @@ int main(int argc, char **argv) {
         float lo = s.rig.pmin[2] - wz, hi = s.rig.pmax[2] - wz;
         printf("  info: z relative to placement: %.3f .. %.3f\n", lo, hi);
         check_true("frame0 pose z rel. to placement plausible (feet ~0, head ~1.9)", lo > -0.5f && lo < 0.5f && hi > 1.5f && hi < 2.5f);
+    }
+
+    printf("Rayman hierarchical pose (cpa_rig_pose == cpa_anim_rig_pose; parents applied):\n");
+    {
+        CpaAnimTables T; CpaAnimActor A; static CpaAnimRig rg;
+        check_true("anim tables + actor open", cpa_anim_tables_from_header(img.reg[0].p, img.reg[0].n, &T) && cpa_anim_actor_open(&A, &img, &T, s.rig.soVa));
+        unsigned fr[3] = { s.rig.firstFrame, s.rig.firstFrame + s.rig.nFrames / 2, s.rig.firstFrame + s.rig.nFrames - 1 };
+        for (int k = 0; k < 3; k++) {
+            char nm[96];
+            cpa_rig_pose(&s, (float)fr[k]);
+            check_true("cpa_anim_rig_pose ok", cpa_anim_rig_pose(&A, (unsigned)s.rig.anim, fr[k], CPA_ANIM_BEST, s.rig.world, &rg));
+            if (k == 0) {
+                unsigned np = 0; int slotsWithParent[CPA_ANIM_MAXCH], nsp = 0;
+                for (unsigned i = 0; i < rg.pose.nCh; i++) { int p = rg.parentSlot[rg.pose.ch[i].slot]; if (p >= 0) { np++; slotsWithParent[nsp++] = rg.pose.ch[i].slot; } }
+                printf("  info: %u of %u channels have a parent; slots:", np, rg.pose.nCh);
+                for (int i = 0; i < nsp; i++) printf(" %d", slotsWithParent[i]);
+                printf("\n");
+                check_true("Wait channels in slots 1,4,5 have parents (notes_anim_parents)", rg.parentSlot[1] >= 0 && rg.parentSlot[4] >= 0 && rg.parentSlot[5] >= 0);
+            }
+            /* independent re-derivation: every part vertex = lpos * objM[chan] */
+            double maxd = 0; uint32_t nv = 0; float lo[CPA_RIG_MAXCH][3], hi[CPA_RIG_MAXCH][3];
+            for (int c = 0; c < CPA_RIG_MAXCH; c++) for (int a = 0; a < 3; a++) { lo[c][a] = 1e30f; hi[c][a] = -1e30f; }
+            for (uint32_t i = 0; i < s.rig.nPart; i++) {
+                const CpaRigPart *r = &s.rig.part[i]; const float *M = rg.objM[r->chan];
+                for (uint32_t v = 0; v < r->nTri * 3; v++, nv++) {
+                    const float *p = r->lpos + v * 3;
+                    for (int a = 0; a < 3; a++) {
+                        float w = p[0] * M[a] + p[1] * M[4 + a] + p[2] * M[8 + a] + M[12 + a];
+                        double d = fabs((double)w - r->wpos[v * 3 + a]); if (d > maxd) maxd = d;
+                        if (w < lo[r->chan][a]) lo[r->chan][a] = w;
+                        if (w > hi[r->chan][a]) hi[r->chan][a] = w;
+                    }
+                }
+            }
+            snprintf(nm, sizeof nm, "frame %u: wpos == lpos*objM (max |d| %.2e over %u verts)", fr[k], maxd, nv);
+            check_true(nm, nv == s.rig.nTris * 3 && maxd < 1e-4);
+            if (k == 0) for (unsigned i = 0; i < rg.pose.nCh; i++) {
+                int sl = rg.pose.ch[i].slot;
+                if (lo[i][2] <= hi[i][2]) printf("  info: frame0 channel %u slot %d parent %d obj %d wrapped %d  world z %.3f .. %.3f (rel. placement)\n",
+                    i, sl, rg.parentSlot[sl], rg.pose.ch[i].obj, rg.wrapped[i], lo[i][2] - s.rig.world[14], hi[i][2] - s.rig.world[14]);
+            }
+            if (k == 0) {   /* guest-RAM-derived world z ranges (notes_pose comparison) of the parented parts, relative to the placement */
+                float wz = s.rig.world[14];
+                check_true("frame0 slot 1 world z 1.05..1.30", fabsf(lo[1][2] - wz - 1.05f) < 0.01f && fabsf(hi[1][2] - wz - 1.30f) < 0.01f);
+                check_true("frame0 slot 4 world z 1.74..2.18", fabsf(lo[4][2] - wz - 1.74f) < 0.01f && fabsf(hi[4][2] - wz - 2.18f) < 0.01f);
+                check_true("frame0 slot 5 world z within the head range 1.85..2.11", fabsf(lo[5][2] - wz - 1.85f) < 0.01f && fabsf(hi[5][2] - wz - 2.10f) < 0.01f);
+            }
+            /* flat composition (the old behaviour) must differ for a channel that has a parent */
+            if (k == 0) {
+                double diff = 0;
+                for (unsigned i = 0; i < rg.pose.nCh; i++) if (rg.parentSlot[rg.pose.ch[i].slot] >= 0) {
+                    float m[16], f[16]; cpa_anim_chan_matrix(&rg.pose.ch[i], m); cpa_anim_mat_mul(m, s.rig.world, f);
+                    for (int e = 0; e < 16; e++) { double d = fabs((double)f[e] - rg.world[i][e]); if (d > diff) diff = d; }
+                }
+                printf("  info: max |flat - hierarchical| over channels with parents: %.3f\n", diff);
+                check_true("hierarchical differs from flat composition where a parent exists", diff > 1e-3);
+            }
+        }
     }
 
     printf("second texture layer (VisualMaterial+0x149 overlayMode) and sprites (element type 3):\n");

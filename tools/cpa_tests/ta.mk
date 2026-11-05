@@ -7,7 +7,7 @@ CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Wpedantic
 ASSETS  ?= $(abspath ../../assets/dc)
 SH4      = ../sh4recomp
 HLEOBJ   = $(filter-out $(SH4)/build_hle/run_game.o,$(wildcard $(SH4)/build_hle/*.o))
-SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c ../../src/cpa/cpa_vis.c
+SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c ../../src/cpa/cpa_anim.c ../../src/cpa/cpa_vis.c
 LEVEL   ?= Learn_10
 AT      ?= 1500
 NCAP    ?= 3

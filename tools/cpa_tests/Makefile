@@ -3,7 +3,7 @@
 # make test       runs it; pass DCDATA=/path/to/assets/dc/DCDATA (or set CPA_DC_DATA)
 CC      ?= cc
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Wpedantic
-SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c
+SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c ../../src/cpa/cpa_anim.c
 DCDATA  ?= $(CPA_DC_DATA)
 
 build/test_scene: test_scene.c $(SRC) ../../src/cpa/cpa_image.h ../../src/cpa/cpa_scene.h

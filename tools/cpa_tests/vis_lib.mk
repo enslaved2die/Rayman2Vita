@@ -4,7 +4,7 @@
 CC      ?= cc
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Wpedantic
 DCDATA  ?= $(CPA_DC_DATA)
-SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c ../../src/cpa/cpa_camera.c ../../src/cpa/cpa_drawlist.c ../../src/cpa/cpa_vis.c
+SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c ../../src/cpa/cpa_anim.c ../../src/cpa/cpa_camera.c ../../src/cpa/cpa_drawlist.c ../../src/cpa/cpa_vis.c
 HDR      = $(wildcard ../../src/cpa/*.h)
 
 build/test_vis: test_vis.c $(SRC) $(HDR)

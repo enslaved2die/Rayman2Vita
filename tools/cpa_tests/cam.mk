@@ -3,7 +3,7 @@
 CC      ?= cc
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Wpedantic
 ASSETS  ?= $(abspath ../../assets/dc)
-SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c ../../src/cpa/cpa_camera.c ../../src/cpa/cpa_drawlist.c
+SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c ../../src/cpa/cpa_anim.c ../../src/cpa/cpa_camera.c ../../src/cpa/cpa_drawlist.c
 HDR      = $(wildcard ../../src/cpa/*.h)
 
 build/test_camera: test_camera.c $(SRC) $(HDR)
