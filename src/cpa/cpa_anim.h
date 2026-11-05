@@ -74,12 +74,33 @@ int cpa_anim_eval(const CpaAnimActor *a, unsigned animIdx, unsigned frame, int m
 /* 4x4 row-vector matrix of one channel (rot in the upper 3x3, T in row 3). */
 void cpa_anim_chan_matrix(const CpaAnimChan *c, float m[16]);
 
-/* Parent table: parentSlot[slot] = parent slot or -1 (parent is the actor). RUNTIME ONLY (reads ChanList entry+0xC from a RAM image).
- * The static source of this topology is UNRESOLVED (not in H0..H9 or ObjectsTable as far as tested; see report). Returns number of slots read. */
+/* Parent table read from a RUNNING guest: parentSlot[slot] = parent slot or -1 (parent is the actor). Reads ChanList entry+0xC from a RAM image.
+ * Kept as the oracle for cpa_anim_static_parents (below), which needs no guest. Returns number of slots read. */
 int cpa_anim_read_parents(const CpaAnimActor *a, int16_t parentSlot[CPA_ANIM_MAXSLOT]);
+
+/* STATIC parent topology (VERIFIED, DAT data only; see re_analysis/dc/notes_anim_parents.md). The guest builds ChanList entry+0xC in the anim-switch
+ * function FUN_8c0544a0 from the current frame's H5 row (10 B, row = H5 + 10*(rec.u16@0x2E + f)): u16@4 = pair count N, u16@6 = first pair index into H3;
+ * H3 is an array of 4 B pairs {u16 child slot, u16 parent slot} (the global 0x8C2CFDD8 holds H3: the old note "H3 = event list" is wrong). The guest sets
+ * entry[child].parent = &entry[parent]. Pairs are per frame row, not per animation: the guest only re-applies them when the pair pointer changes, i.e. the
+ * ChanList holds the pairs of the most recently applied row. parentSlot[] is filled for every slot (-1 = child of the actor); *nPairs = N (may be NULL).
+ * Returns 1 on success, 0 if (animIdx, frame) is outside the record or the tables are unreadable. Also reports the row's root rotation/vector words
+ * (H5 u16@0/u16@2; 0xFFFF = none, always none in the 126 oracle dumps) through rootQ / rootV (may be NULL). */
+int cpa_anim_static_parents(const CpaAnimActor *a, unsigned animIdx, unsigned frame, int16_t parentSlot[CPA_ANIM_MAXSLOT], unsigned *nPairs, unsigned *rootQ, unsigned *rootV);
 /* world[i] (for pose channel i) = local_i * world(parent) ; actor = actor-to-world matrix (row-vector). Channels whose parent slot is not driven by this
  * animation use the actor matrix. Returns 1 on success. */
 int cpa_anim_compose(const CpaAnimPose *p, const int16_t parentSlot[CPA_ANIM_MAXSLOT], const float actor[16], float world[CPA_ANIM_MAXCH][16]);
+
+/* Hierarchical native rig pose: everything a renderer needs for one actor/animation/frame from DAT data only.
+ * world[i]  = 4x4 row-vector world matrix of pose channel i (the guest's channel SuperObject global, SO+0x24): local_i * world(parent) with the actor matrix as root.
+ * objM[i]   = matrix to apply to the vertices of ObjectsTable object ch[i].obj: diag(mirror vector) * world[i] when the object entry has a mirror vector (the guest then
+ *             wraps the PO in an inner node under the channel node; VERIFIED vertex-exact), else world[i]. v' = v * objM[i] (row vector, translation in row 3).
+ * parentSlot is the static table above. Channels whose parent slot is not driven by this animation hang off the actor matrix (INFERRED; the guest would use that
+ * node's stale global from an earlier animation; counted in test_anim as "undriven parent"). Returns 1 on success. */
+typedef struct CpaAnimRig {
+    CpaAnimPose pose; int16_t parentSlot[CPA_ANIM_MAXSLOT]; unsigned nPairs;
+    float world[CPA_ANIM_MAXCH][16]; float objM[CPA_ANIM_MAXCH][16]; int wrapped[CPA_ANIM_MAXCH]; int undrivenParent[CPA_ANIM_MAXCH];
+} CpaAnimRig;
+int cpa_anim_rig_pose(const CpaAnimActor *a, unsigned animIdx, unsigned frame, int mode, const float actor[16], CpaAnimRig *r);
 
 /* ObjectsTable access. geo = GeometricObject VA via entry+4 -> PO+0 -> VisualSet+4 (VERIFIED chain, notes_geometry.md). */
 uint32_t cpa_anim_obj_geo(const CpaAnimActor *a, int obj);

@@ -238,6 +238,26 @@ int cpa_anim_read_parents(const CpaAnimActor *a, int16_t ps[CPA_ANIM_MAXSLOT]) {
     return (int)a->nChanList;
 }
 
+int cpa_anim_static_parents(const CpaAnimActor *a, unsigned animIdx, unsigned frame, int16_t ps[CPA_ANIM_MAXSLOT], unsigned *nPairs, unsigned *rootQ, unsigned *rootV) {
+    const CpaImage *im = a->im; CpaAnimInfo I;
+    for (int i = 0; i < CPA_ANIM_MAXSLOT; i++) ps[i] = -1;
+    if (nPairs) *nPairs = 0;
+    if (rootQ) *rootQ = 0xFFFF;
+    if (rootV) *rootV = 0xFFFF;
+    if (!cpa_anim_info(a, animIdx, &I) || frame < I.firstFrame || frame >= I.firstFrame + I.nFrames) return 0;
+    uint32_t row = a->T.H[5] + 10u * (cpa_u16(im, I.rec + 0x2E) + (frame - I.firstFrame));
+    if (!cpa_ptr(im, row, 10)) return 0;
+    unsigned n = cpa_u16(im, row + 4), first = cpa_u16(im, row + 6);
+    if (rootQ) *rootQ = cpa_u16(im, row); if (rootV) *rootV = cpa_u16(im, row + 2);
+    if (nPairs) *nPairs = n;
+    if (n && !cpa_ptr(im, a->T.H[3] + 4u * first, 4u * n)) return 0;
+    for (unsigned k = 0; k < n; k++) {
+        unsigned ch = cpa_u16(im, a->T.H[3] + 4u * (first + k)), par = cpa_u16(im, a->T.H[3] + 4u * (first + k) + 2);
+        if (ch < CPA_ANIM_MAXSLOT && par < CPA_ANIM_MAXSLOT) ps[ch] = (int16_t)par;
+    }
+    return 1;
+}
+
 int cpa_anim_compose(const CpaAnimPose *P, const int16_t ps[CPA_ANIM_MAXSLOT], const float actor[16], float world[CPA_ANIM_MAXCH][16]) {
     int done[CPA_ANIM_MAXCH] = { 0 };
     for (unsigned pass = 0; pass <= P->nCh; pass++) {
@@ -283,4 +303,21 @@ const float *cpa_anim_geo_verts(const CpaImage *im, uint32_t geo, unsigned *nv) 
     if (!p || ((uintptr_t)p & 3)) return NULL;
     *nv = n;
     return (const float *)p;
+}
+
+int cpa_anim_rig_pose(const CpaAnimActor *a, unsigned animIdx, unsigned frame, int mode, const float actor[16], CpaAnimRig *R) {
+    memset(R, 0, sizeof *R);
+    if (!cpa_anim_eval(a, animIdx, frame, mode, &R->pose)) return 0;
+    if (!cpa_anim_static_parents(a, animIdx, frame, R->parentSlot, &R->nPairs, NULL, NULL)) return 0;
+    if (!cpa_anim_compose(&R->pose, R->parentSlot, actor, R->world)) return 0;
+    for (unsigned i = 0; i < R->pose.nCh; i++) {
+        const CpaAnimChan *C = &R->pose.ch[i]; float mir[3], Mn[16] = { 0 };
+        int par = C->slot < CPA_ANIM_MAXSLOT ? R->parentSlot[C->slot] : -1, drv = 0;
+        for (unsigned j = 0; j < R->pose.nCh; j++) if (R->pose.ch[j].slot == par) drv = 1;
+        R->undrivenParent[i] = par >= 0 && !drv;
+        R->wrapped[i] = C->obj >= 0 && cpa_anim_obj_mirror(a, C->obj, mir);
+        if (R->wrapped[i]) { Mn[0] = mir[0]; Mn[5] = mir[1]; Mn[10] = mir[2]; Mn[15] = 1; cpa_anim_mat_mul(Mn, R->world[i], R->objM[i]); }
+        else memcpy(R->objM[i], R->world[i], sizeof R->world[i]);
+    }
+    return 1;
 }

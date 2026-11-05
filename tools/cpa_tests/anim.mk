@@ -23,4 +23,10 @@ anim-levels: build/test_anim
 	@for d in $(ANIMDIRS); do l=$$(basename $$d | sed 's/^ta2_//' | tr a-z A-Z); \
 	  for r in $$(ls $$d/ram_*.bin | head -n 3); do echo "== $$r"; ./build/test_anim $$r $(ASSETS)/DCDATA/$$l/$$l.DAT $(TAARGS) | grep -E '^(SUMMARY|  )' | grep -v '^  ch' ; done; done
 
-.PHONY: anim-test anim-levels
+# Static-only evaluation: image = level DAT + FIX.DAT only; the RAM dump supplies just the guest's current (anim, frame) and the reference values.
+# Compares static parents (H5/H3) with the guest ChanList entry+0xC, local poses and hierarchical rig vertices; -a prints one ACTORSTAT line per actor.
+FIXDAT ?= $(ASSETS)/DCDATA/FIX.DAT
+anim-static: build/test_anim
+	./build/test_anim $(RAM) $(LEVELDAT) -s $(FIXDAT) -a $(TAARGS)
+
+.PHONY: anim-test anim-levels anim-static
