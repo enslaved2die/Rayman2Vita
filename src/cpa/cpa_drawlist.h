@@ -12,12 +12,15 @@
  *             resident global texture that is NOT in the scene (batch.texVa == 0, layerTexUnknown == 1): a renderer may skip layer-2 batches until that texture is recovered.
  *   INFERRED  ordering inside a pass = scene (submission) order; the optional translucent depth sort is OUR choice (back to front by batch centroid), not oracle behaviour.
  *   UNVERIFIED actors: CpaDrawItem.isActor geometry is an unposed pile in cpa_scene (PLACEHOLDER pose). Excluded by default.
- * Visibility (sector/IPO culling) is NOT modelled: the oracle skips whole IPOs/sectors by a rule that is not decoded (docs 'N1 gap closure' d), so the list is the superset of what the game draws. */
+ * Visibility: by default the list is the superset of everything in the level (no culling). Optional: opts.cull = keep masks from cpa_vis_cull_build, i.e. only the triangles/sprites of IPOs that the
+ * native predictor (cpa_vis, tools/cpa_tests/vis_predict.c: 1433/1433 IPOs vs the game's own submit trace) says the game submits for this camera. VERIFIED set, see cpa_vis.h for limits; the culled list
+ * is still a superset of what the game rasterises (52 of 1433 submitted IPOs lose all their triangles below the IPO level). Culling splits an item into runs of consecutive kept triangles (one batch each, same state). */
 #ifndef CPA_DRAWLIST_H
 #define CPA_DRAWLIST_H
 
 #include "cpa_scene.h"
 #include "cpa_camera.h"
+#include "cpa_vis.h"
 
 typedef enum { CPA_PASS_OPAQUE = 0, CPA_PASS_CUTOUT = 1, CPA_PASS_TRANSLUCENT = 2, CPA_PASS_COUNT = 3 } CpaPass;
 typedef enum { CPA_BLEND_NONE = 0, CPA_BLEND_ALPHA, CPA_BLEND_ADD } CpaBlendMode;
@@ -56,6 +59,7 @@ typedef struct CpaDrawListOpts {
     int includeActors;      /* default 0 */
     int includeLayer2;      /* default 1 */
     int includeSprites;     /* default 1 */
+    const CpaVisCull *cull; /* default NULL = no visibility culling; else tri[]/sprite[] keep masks (1 = keep) for this scene (cpa_vis_cull_build). Must outlive only the build call. */
 } CpaDrawListOpts;
 
 typedef struct CpaDrawList {

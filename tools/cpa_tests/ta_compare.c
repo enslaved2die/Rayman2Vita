@@ -18,6 +18,7 @@
  * (Zc < NEAR_ZC = 0.25, measured) are not projected (the game clips those, producing new vertices on the plane); unmatched oracle triangles are then tested as clip fragments (see below); the game's sector visibility/back-face culling is not modelled, so
  * native->oracle ("coverage") is informational only. The pass metric is oracle->native over oracle triangles that are static-UV candidates. */
 #include "../../src/cpa/cpa_scene.h"
+#include "../../src/cpa/cpa_vis.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +28,7 @@
 #include <ctype.h>
 
 typedef struct { int ok; uint32_t texUnexplActor; uint32_t cull[10]; uint32_t staticTotal, matched, frag, unmBad, unmClip, unverif, sub, subExpl, copOther, copOtherExpl, redraw, redrawSame, oracleTris, texUnexpl, texBoundTotal, vNative, vNear, vOther; double maxErr;
-    uint32_t l2Pair[4][6], l2RdExpl, l2RdUnpred, l2FragDis, l2Both, l2Only8, l2Only1, l2Mode0Multi, l2NatMode[4], sprTotal, sprFront, sprMatched, sprOracleTris; } Stats;
+    uint32_t l2Pair[4][6], l2RdExpl, l2RdUnpred, l2FragDis, l2Both, l2Only8, l2Only1, l2Mode0Multi, l2NatMode[4], sprTotal, sprFront, sprMatched, sprOracleTris; uint32_t v[16]; } Stats;
 
 #define RAM_BASE 0x8C000000u
 #define VA_HFOV 0x8C00F300u
@@ -39,6 +40,13 @@ typedef struct { int ok; uint32_t texUnexplActor; uint32_t cull[10]; uint32_t st
 /* Near plane: Zc = 0.25 (z_ta = 1.0). Measured over 7 levels / 50+ scenes: the smallest Zc of every oracle vertex of a near-clip fragment is exactly 0.2500 and the smallest Zc of any
  * unclipped matched vertex is 0.6457 (never between). Not read from game code; INFERRED from the TA stream. */
 #define NEAR_ZC 0.25
+/* native visibility prediction inputs in guest RAM (same addresses as vis_predict.c, notes_visibility.md) */
+#define VA_RAYMAN_PTR 0x8C123CF8u   /* SuperObject of the main actor (player table entry 1) */
+#define VA_VP_PTR     0x8C123C40u   /* **(VA_VP_PTR) = active viewport struct */
+#define VA_MASK       0x8C123B68u
+#define VA_FLAG_DBG   0x8C124740u
+/* indices into Stats.v / per-scene visibility tallies */
+enum { V_HAVE, V_FRONT, V_FRONT_CULLED, V_FRONT_PARTIAL, V_FRONT_UNDRAWNIPO, V_FRONT_UNOWNED, V_OLD, V_OLD_AGREE, V_OLD_DISAGREE, V_OLD_UNOWNED, V_DRAWN_OWNED, V_DRAWN_PRED, V_DRAWN_MISS, V_DRAWN_UNOWNED, V_POOLCULLED, V_IPO_SUBMITTED_UNDRAWN };
 
 typedef struct { float x, y, z, u, v, base[4], off[4]; } TaV;      /* == TaVertex in hle/ta.h */
 typedef struct { uint32_t ctl, isp, tsp, tcw, first, count, sprite, list; } TaS;
@@ -68,6 +76,19 @@ static int geom_perm(const PTri *p, const OTri *o, double tol, double ztol) {
     return -1;
 }
 static float rdf(const uint8_t *ram, uint32_t va) { float f; memcpy(&f, ram + (va - RAM_BASE), 4); return f; }
+static uint32_t rd32g(const uint8_t *ram, uint32_t va) { uint32_t v = 0; if (va >= RAM_BASE && va - RAM_BASE + 4 <= (16u << 20)) memcpy(&v, ram + (va - RAM_BASE), 4); return v; }
+/* cpa_vis for the guest state in `ram` (dynamic inputs: camera rows + position, viewport side planes, player position -> native sector lookup, draw mask). 1 on success. */
+static int vis_from_ram(const CpaScene *sc, const uint8_t *ram, CpaVis *V) {
+    uint32_t vp = rd32g(ram, rd32g(ram, VA_VP_PTR)); if (vp < RAM_BASE || vp + 0x100 > RAM_BASE + (16u << 20)) return 0;
+    float U[3], F[3], C[3], side[4][4]; static const uint32_t po[4] = { 0xAC, 0xBC, 0xCC, 0xDC };
+    for (int i = 0; i < 3; i++) { U[i] = rdf(ram, VA_ROW_U + 4 * i); F[i] = rdf(ram, VA_ROW_F + 4 * i); C[i] = rdf(ram, VA_POS + 4 * i); }
+    for (int k = 0; k < 4; k++) for (int j = 0; j < 4; j++) side[k][j] = rdf(ram, vp + po[k] + 4u * j);
+    uint32_t actor = rd32g(ram, VA_RAYMAN_PTR), gm = rd32g(ram, actor + 0x24); if (actor < RAM_BASE || gm < RAM_BASE || gm + 0x70 > RAM_BASE + (16u << 20)) return 0;
+    CpaVisFrustum fr; cpa_vis_frustum_from_planes(&fr, C, U, F, side, rdf(ram, vp + 0x80));
+    CpaVisInput in; memset(&in, 0, sizeof in); in.hasPos = 1; in.frustum = &fr; for (int i = 0; i < 3; i++) in.pos[i] = rdf(ram, gm + 0x58 + 4u * i);
+    CpaVisOpts o; cpa_vis_opts_default(&o); o.mask = rd32g(ram, VA_MASK); o.allowKind2 = (rd32g(ram, VA_FLAG_DBG) & 0xFF) == 1;
+    return cpa_vis_predict(V, &sc->img, &in, &o);
+}
 static int cmp_cx(const void *a, const void *b) { float x = ((const PTri *)a)->cx, y = ((const PTri *)b)->cx; return x < y ? -1 : x > y; }
 static uint8_t *slurp(const char *p, size_t *n) {
     FILE *f = fopen(p, "rb"); if (!f) return NULL; fseek(f, 0, SEEK_END); long l = ftell(f); fseek(f, 0, SEEK_SET);
@@ -154,7 +175,7 @@ static void prov_find(const PVTab *T, const float *P9, uint32_t *ipo, uint32_t *
     }
 }
 
-static int do_scene(const CpaScene *scp, const char *capdir, const char *level, long scene, long ramscene, double tol, double ztol, int verbose, Stats *st) {
+static int do_scene(const CpaScene *scp, const CpaVisTriMap *tm, int visCull, const char *capdir, const char *level, long scene, long ramscene, double tol, double ztol, int verbose, Stats *st) {
     CpaScene sc = *scp; char p[1100]; size_t n;
     if (ramscene < 0) {                        /* measured (Jail_10): scene N is projected with the camera in RAM at the end of the previous guest frame, ram_<N-1> */
         char q[1100]; snprintf(q, sizeof q, "%s/ram_%ld.bin", capdir, scene - 1); FILE *t = fopen(q, "rb"); if (t) { fclose(t); ramscene = scene - 1; } else ramscene = scene;
@@ -177,12 +198,18 @@ static int do_scene(const CpaScene *scp, const char *capdir, const char *level, 
            (fabsf(Lram[0]-L[0]) + fabsf(Lram[1]-L[1]) + fabsf(Lram[2]-L[2]) < 1e-3f) ? " [agrees]" : " [DISAGREES: row not valid in this snapshot]");
     if (!isfinite(hfov) || hfov < 0.1f || hfov > 3.0f || fabsf(F[0]*F[0] + F[1]*F[1] + F[2]*F[2] - 1.0f) > 1e-2f) { printf("RESULT: camera in RAM does not look like a camera; abort\n"); return 1; }
 
+    /* native visibility prediction (cpa_vis) for the guest frame this scene was built from (ram_<N-1>: camera, viewport planes, player position). visCull: native triangles of IPOs the predictor says
+     * are NOT submitted are removed from the pool the oracle triangles are matched against (a prediction miss then shows up as an unmatched / mismatching oracle triangle). */
+    CpaVis vis; CpaVisCull vcull; int haveVis = 0; uint32_t vt[16]; memset(&vis, 0, sizeof vis); memset(&vcull, 0, sizeof vcull); memset(vt, 0, sizeof vt);
+    if (tm && vis_from_ram(&sc, ram, &vis)) { haveVis = cpa_vis_cull_build(&vcull, &vis, tm, &sc); vt[V_HAVE] = haveVis; }
+    if (visCull && !haveVis) printf("WARNING: --vis-cull requested but no prediction available for this scene (pool unrestricted)\n");
+
     /* project native static triangles */
     uint32_t nt = sc.nVerts / 3; PTri *pt = calloc(nt, sizeof *pt); uint32_t *natTex = calloc(nt, 4); uint8_t *natStatic = calloc(nt, 1), *natBehind = calloc(nt, 1), *natOv = calloc(nt ? nt : 1, 1); uint32_t npt = 0, nStatic = 0, nBehind = 0;
     for (uint32_t it = 0; it < sc.nItems; it++) {
         const CpaDrawItem *d = &sc.items[it]; if (d->isActor) continue;
         for (uint32_t k = 0; k + 2 < d->vertCount + 0u; k += 3) {
-            uint32_t t = d->firstVert / 3 + k / 3; nStatic++; natTex[t] = d->texVa; natStatic[t] = 1; natOv[t] = d->overlayMode; PTri q; memset(&q, 0, sizeof q); int ok = 1;
+            uint32_t t = d->firstVert / 3 + k / 3; nStatic++; natTex[t] = d->texVa; natStatic[t] = 1; natOv[t] = d->overlayMode; if (visCull && haveVis && !vcull.tri[t]) { vt[V_POOLCULLED]++; continue; } PTri q; memset(&q, 0, sizeof q); int ok = 1;
             for (int j = 0; j < 3; j++) {
                 const float *P = &sc.pos[(t * 3 + j) * 3]; double r[3] = { P[0] - C[0], P[1] - C[1], P[2] - C[2] };
                 double zc = F[0]*r[0] + F[1]*r[1] + F[2]*r[2];
@@ -485,7 +512,7 @@ static int do_scene(const CpaScene *scp, const char *capdir, const char *level, 
         { uint32_t root = 0; if (sc.img.nReg > 0 && sc.img.reg[0].n >= 0x38) { const uint8_t *q = sc.img.reg[0].p + 13 * 4; root = (uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24; }
           if (root) prov_walk(&sc.img, root, &id, 0, 0, &T); }
         if (T.n) qsort(T.a, T.n, sizeof *T.a, pv_cmp);
-        uint32_t *tIpo = calloc(nt, 4), *tSec = calloc(nt, 4); uint8_t *drawn = calloc(nt, 1);
+        static uint32_t subU[4096]; uint32_t nSubU = 0; uint32_t *tIpo = calloc(nt, 4), *tSec = calloc(nt, 4); uint8_t *drawn = calloc(nt, 1);
         for (uint32_t t = 0; t < nt; t++) if (natStatic[t] && T.n) prov_find(&T, &sc.pos[t * 9], &tIpo[t], &tSec[t]);
         for (uint32_t m = 0; m < npt; m++) if (pt[m].used) drawn[pt[m].tri] = 1;
         for (uint32_t a = 0; a < no; a++) if (ot[a].fragT1) drawn[ot[a].fragT1 - 1] = 1;
@@ -528,6 +555,7 @@ static int do_scene(const CpaScene *scp, const char *capdir, const char *level, 
                   for (int pi = 0; pi < 6 && !twin; pi++) { int ok = 1;
                       for (int j = 0; j < 3 && ok; j++) { int k = perms[pi][j]; if (fabs(pt[q].sx[k] - pt[m].sx[j]) > tol || fabs(pt[q].sy[k] - pt[m].sy[j]) > tol || fabs(pt[q].w[k] - pt[m].w[j]) / (fabs(pt[m].w[j]) + 1e-9) > ztol) ok = 0; }
                       twin = ok; } } }
+            int front = !twin && fabs(ar) >= 1e-3 && ar <= 0;
             if (twin) cTwin++;
             else if (fabs(ar) < 1e-3) cDegen++;
             else if (ar > 0 && opaque) cBackOne++;
@@ -536,6 +564,22 @@ static int do_scene(const CpaScene *scp, const char *capdir, const char *level, 
             else if (iD[g] && !ipoItemD[(size_t)g * (sc.nItems + 1) + pt[m].item]) cFrontElemUndrawn++;
             else if (iD[g]) { cFrontPartIpo++; if (verbose) printf("  FRONT-UNDRAWN-PARTIAL-IPO native tri %u ipo %u (drawn %u) alpha %d area %.2f px^2 Zc %.1f %.1f %.1f centre (%.0f %.0f)\n", pt[m].tri, g, iD[g], sc.items[pt[m].item].alphaClass, fabs(ar) * 0.5, 0.25 / pt[m].w[0], 0.25 / pt[m].w[1], 0.25 / pt[m].w[2], pt[m].cx, (pt[m].sy[0]+pt[m].sy[1]+pt[m].sy[2])/3); }
             else if (sD[sec]) cFrontIpoCulled++; else cFrontSectorCulled++;
+            if (front && haveVis) {      /* native explanation of the front-facing, on-screen, undrawn triangle: is its IPO in the predicted submit set? */
+                uint32_t own[16], no = cpa_vis_trimap_owners(tm, &sc.pos[(size_t)pt[m].tri * 9], own, NULL, 16), anyVis = 0;
+                for (uint32_t q = 0; q < no; q++) anyVis |= (uint32_t)cpa_vis_ipo_visible(&vis, own[q]);
+                int oldIpo = g && !iD[g];       /* the oracle-side class "front-in-undrawn-ipo-or-sector" */
+                vt[V_FRONT]++;
+                if (!no) vt[V_FRONT_UNOWNED]++;
+                else if (!anyVis) vt[V_FRONT_CULLED]++;
+                else if (iD[g]) vt[V_FRONT_PARTIAL]++;
+                else { vt[V_FRONT_UNDRAWNIPO]++; if (no == 1) { uint32_t k = 0; while (k < nSubU && subU[k] != own[0]) k++; if (k == nSubU && nSubU < 4096) { subU[nSubU++] = own[0]; vt[V_IPO_SUBMITTED_UNDRAWN]++; } } }
+                if (oldIpo) { vt[V_OLD]++; if (!no) vt[V_OLD_UNOWNED]++; else if (!anyVis) vt[V_OLD_AGREE]++; else vt[V_OLD_DISAGREE]++; }
+            }
+        }
+        if (haveVis) for (uint32_t m = 0; m < npt; m++) if (pt[m].used) {       /* every native triangle the oracle drew must belong to a predicted-submitted IPO */
+            uint32_t own[16], no = cpa_vis_trimap_owners(tm, &sc.pos[(size_t)pt[m].tri * 9], own, NULL, 16), anyVis = 0;
+            for (uint32_t q = 0; q < no; q++) anyVis |= (uint32_t)cpa_vis_ipo_visible(&vis, own[q]);
+            if (!no) vt[V_DRAWN_UNOWNED]++; else { vt[V_DRAWN_OWNED]++; if (anyVis) vt[V_DRAWN_PRED]++; else vt[V_DRAWN_MISS]++; }
         }
         if (verbose) for (uint32_t m = 0; m < npt; m++) if (pt[m].used) printf("  NATPASS tri %u item %u tex %08x ipo %u sec %u redrawn %u oracleTcw %08x list %u\n", pt[m].tri, pt[m].item, sc.items[pt[m].item].texVa, tIpo[pt[m].tri], tSec[pt[m].tri], natRedr[pt[m].tri], ot[pt[m].by].tcw, ot[pt[m].by].list);
         for (uint32_t g = 1; g < ni; g++) { if (iD[g]) nIpoDrawn++; else if (iUnd[g]) nIpoCulled++; if (iPos[g] && iNeg[g]) { nIpoMixed++; nMixedMinority += iPos[g] < iNeg[g] ? iPos[g] : iNeg[g]; } if (iPos[g] + iNeg[g]) nIpoMatchedAny++; }
@@ -611,16 +655,19 @@ static int do_scene(const CpaScene *scp, const char *capdir, const char *level, 
     printf("  matched winding by TA list [positive/negative area]: opaque %u/%u, op-mod %u/%u, translucent %u/%u, tr-mod %u/%u, punch %u/%u\n", wList[0][0], wList[0][1], wList[1][0], wList[1][1], wList[2][0], wList[2][1], wList[3][0], wList[3][1], wList[4][0], wList[4][1]);
     printf("  undrawn fully on-screen native tris: duplicate (twin) of a drawn native polygon %u | degenerate %u | positive area (back face) in an OPAQUE-class material (back-face culled, one-sided rule) %u | positive area in a non-opaque (two-sided) material, undrawn %u | [unused] %u | FRONT-facing: in a drawn IPO but a texture/material group of it with no drawn triangle %u, in a drawn IPO and drawn material group %u, in an undrawn IPO of a drawn sector %u, in an entirely undrawn sector %u, provenance unknown %u\n", cTwin, cDegen, cBackOne, cBackTwo, cBackUnk, cFrontElemUndrawn, cFrontPartIpo, cFrontIpoCulled, cFrontSectorCulled, cFrontUnk);
     printf("  IPOs with a drawn triangle %u | IPOs with on-screen front-facing geometry and NO drawn triangle %u | sectors with a drawn triangle %u | sectors with on-screen front-facing geometry and NO drawn triangle %u | IPOs with matched tris of BOTH windings %u of %u (minority-winding matched tris %u)\n", nIpoDrawn, nIpoCulled, nSecDrawn, nSecCulled, nIpoMixed, nIpoMatchedAny, nMixedMinority);
+    if (haveVis) printf("  native visibility (cpa_vis, sector %08x, %u sectors, %u IPOs submitted; %u static tris culled, %u without owner): front-facing on-screen undrawn tris %u = predicted not submitted %u (explained) + predicted submitted: partially drawn IPO %u, wholly undrawn IPO %u (%u distinct IPOs) + no owner %u | oracle-side class 'front in undrawn IPO/sector' %u: predicted not submitted %u, predicted submitted %u, no owner %u | oracle-DRAWN native tris: owned %u, in predicted set %u, NOT in predicted set %u, no owner %u%s\n",
+        vis.sector, vis.nSectors, vis.nIpos, vcull.nTriCulled, vcull.nTriUnowned, vt[V_FRONT], vt[V_FRONT_CULLED], vt[V_FRONT_PARTIAL], vt[V_FRONT_UNDRAWNIPO], vt[V_IPO_SUBMITTED_UNDRAWN], vt[V_FRONT_UNOWNED], vt[V_OLD], vt[V_OLD_AGREE], vt[V_OLD_DISAGREE], vt[V_OLD_UNOWNED], vt[V_DRAWN_OWNED], vt[V_DRAWN_PRED], vt[V_DRAWN_MISS], vt[V_DRAWN_UNOWNED], visCull ? " | pool restricted to predicted-submitted IPOs" : "");
+    else if (tm) printf("  native visibility: prediction unavailable for this scene (no valid player/viewport in RAM)\n");
     printf("native->oracle (informational; game sector culling / backface culling not modelled): static tris with a vertex on screen %u, of which matched %u\n", natVisible, matched);
     printf("\nRESULT: scene %ld tol %.3f px: %u/%u static oracle triangles matched strictly (%.2f%%), +%u clip fragments => %.2f%% clip-aware; %u of all %u oracle triangles (rest: actors/HUD/particles).\n",
            scene, tol, matched, staticTotal, staticTotal ? 100.0 * matched / staticTotal : 0.0, nFrag, staticTotal ? 100.0 * (matched + nFrag) / staticTotal : 0.0, matched, no);
-    free(natOv); free(natRedr); free(pt); free(ot); free(fb); free(ram); free(natTex); free(natStatic); free(natBehind);
-    if (st) { st->staticTotal = staticTotal; st->matched = matched; st->frag = nFrag; st->unmBad = unmBad; st->unmClip = unmClip; st->sub = fragSub; st->cull[0] = cDegen; st->cull[1] = cBackOne; st->cull[2] = cBackTwo; st->cull[3] = cBackUnk; st->cull[4] = cFrontPartIpo; st->cull[5] = cFrontIpoCulled; st->cull[6] = cFrontSectorCulled; st->cull[7] = cFrontUnk; st->cull[8] = cFrontElemUndrawn; st->cull[9] = cTwin; st->subExpl = nAmbigExpl + nAmbigNonStatic; st->copOther = nCopOther; st->copOtherExpl = nCopOtherExpl; st->redraw = nRedraw; st->redrawSame = nRedrawSameTcw; st->unverif = unverif + unverifCoinc; st->oracleTris = no; st->vNative = vNative; st->vNear = vNear; st->vOther = vOther; st->texUnexpl = texUnexpl; st->texUnexplActor = texUnexplCand[1]; st->texBoundTotal = texBoundTotal; memcpy(st->l2Pair, l2Pair, sizeof l2Pair); st->l2RdExpl = l2RdExpl; st->l2RdUnpred = l2RdUnpred; st->l2FragDis = l2FragDis; st->l2Both = l2Both; st->l2Only8 = l2Only8; st->l2Only1 = l2Only1; st->l2Mode0Multi = l2Mode0Multi; memcpy(st->l2NatMode, l2NatMode, sizeof l2NatMode); st->sprTotal = sc.nSprites; st->sprFront = sprFront; st->sprMatched = sprMatched; st->sprOracleTris = sprOracleTris; st->ok = 1; st->maxErr = maxErr; }
+    cpa_vis_free(&vis); cpa_vis_cull_free(&vcull); free(natOv); free(natRedr); free(pt); free(ot); free(fb); free(ram); free(natTex); free(natStatic); free(natBehind);
+    if (st) { st->staticTotal = staticTotal; st->matched = matched; st->frag = nFrag; st->unmBad = unmBad; st->unmClip = unmClip; st->sub = fragSub; st->cull[0] = cDegen; st->cull[1] = cBackOne; st->cull[2] = cBackTwo; st->cull[3] = cBackUnk; st->cull[4] = cFrontPartIpo; st->cull[5] = cFrontIpoCulled; st->cull[6] = cFrontSectorCulled; st->cull[7] = cFrontUnk; st->cull[8] = cFrontElemUndrawn; st->cull[9] = cTwin; st->subExpl = nAmbigExpl + nAmbigNonStatic; st->copOther = nCopOther; st->copOtherExpl = nCopOtherExpl; st->redraw = nRedraw; st->redrawSame = nRedrawSameTcw; st->unverif = unverif + unverifCoinc; st->oracleTris = no; st->vNative = vNative; st->vNear = vNear; st->vOther = vOther; st->texUnexpl = texUnexpl; st->texUnexplActor = texUnexplCand[1]; st->texBoundTotal = texBoundTotal; memcpy(st->l2Pair, l2Pair, sizeof l2Pair); st->l2RdExpl = l2RdExpl; st->l2RdUnpred = l2RdUnpred; st->l2FragDis = l2FragDis; st->l2Both = l2Both; st->l2Only8 = l2Only8; st->l2Only1 = l2Only1; st->l2Mode0Multi = l2Mode0Multi; memcpy(st->l2NatMode, l2NatMode, sizeof l2NatMode); st->sprTotal = sc.nSprites; st->sprFront = sprFront; st->sprMatched = sprMatched; st->sprOracleTris = sprOracleTris; memcpy(st->v, vt, sizeof vt); st->ok = 1; st->maxErr = maxErr; }
     return 0;
 }
 
 int main(int argc, char **argv) {
-    const char *capdir = NULL, *dcdata = NULL, *level = "Learn_10"; long scene = -1, ramscene = -1; double tol = 0.1, ztol = 2e-3; int verbose = 0, all = 0;
+    const char *capdir = NULL, *dcdata = NULL, *level = "Learn_10"; long scene = -1, ramscene = -1; double tol = 0.1, ztol = 2e-3; int verbose = 0, all = 0, visCull = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--level") && i + 1 < argc) level = argv[++i];
         else if (!strcmp(argv[i], "--scene") && i + 1 < argc) scene = atol(argv[++i]);
@@ -628,10 +675,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--tol") && i + 1 < argc) tol = atof(argv[++i]);
         else if (!strcmp(argv[i], "--ztol") && i + 1 < argc) ztol = atof(argv[++i]);
         else if (!strcmp(argv[i], "--all")) all = 1;                                       /* every f<N> scene in CAPDIR: one SCENE summary line each + a LEVEL line */
+        else if (!strcmp(argv[i], "--vis-cull")) visCull = 1;     /* match oracle triangles only against native triangles of IPOs the cpa_vis predictor says are submitted */
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!capdir) capdir = argv[i]; else if (!dcdata) dcdata = argv[i];
     }
-    if (!capdir || !dcdata) { fprintf(stderr, "usage: %s CAPDIR DCDATA_DIR [--level L] [--scene N | --all] [--tol px] [--ztol rel] [-v]\n", argv[0]); return 2; }
+    if (!capdir || !dcdata) { fprintf(stderr, "usage: %s CAPDIR DCDATA_DIR [--level L] [--scene N | --all] [--tol px] [--ztol rel] [--vis-cull] [-v]\n", argv[0]); return 2; }
     long scenes[256]; int ns = 0;
     { DIR *d = opendir(capdir); struct dirent *e; while (d && (e = readdir(d))) { long n; if (sscanf(e->d_name, "f%ld", &n) == 1 && ns < 256) scenes[ns++] = n; } if (d) closedir(d); }
     for (int i = 0; i < ns; i++) for (int j = i + 1; j < ns; j++) if (scenes[j] < scenes[i]) { long t = scenes[i]; scenes[i] = scenes[j]; scenes[j] = t; }
@@ -642,22 +690,25 @@ int main(int argc, char **argv) {
     uint8_t *fix, *lvl; size_t fixN, lvlN; CpaImage img; CpaScene sc;
     if (!cpa_read_file(fixp, &fix, &fixN) || !cpa_read_file(lvlp, &lvl, &lvlN)) { fprintf(stderr, "cannot read %s / %s\n", fixp, lvlp); return 2; }
     if (!cpa_scene_load_dats(&sc, &img, fix, fixN, lvl, lvlN)) { fprintf(stderr, "scene load failed\n"); return 2; }
+    CpaVisTriMap tmap; int haveTm = cpa_vis_trimap_build(&tmap, &sc.img); uint64_t sV[16] = { 0 }, sVScenes = 0;
     uint64_t sL2E = 0, sL2U = 0, sL2B = 0, sL2O8 = 0, sL2O1 = 0, sL2M0 = 0, sL2FD = 0, sSprN = 0, sSprF = 0, sSprM = 0, sSprT = 0, sTUA = 0, sAmbE = 0, sCull[10] = { 0 }, sRd = 0, sSub = 0, sT = 0, sM = 0, sF = 0, sTB = 0, sTU = 0, sU = 0, sMis = 0, sVn = 0, sVz = 0, sVo = 0; int nOk = 0, nBad = 0;
     for (int i = 0; i < ns; i++) {
         Stats st; memset(&st, 0, sizeof st);
-        int rc = do_scene(&sc, capdir, level, scenes[i], all ? -1 : ramscene, tol, ztol, verbose, &st);
+        int rc = do_scene(&sc, haveTm ? &tmap : NULL, visCull, capdir, level, scenes[i], all ? -1 : ramscene, tol, ztol, verbose, &st);
         if (all) {
-            if (rc == 0 && st.ok) { nOk++; sT += st.staticTotal; sRd += st.redraw; sM += st.matched; sF += st.frag; sTB += st.texBoundTotal; sTU += st.texUnexpl; sTUA += st.texUnexplActor; sU += st.unverif; sMis += st.unmBad + st.unmClip; sSub += st.sub; sAmbE += st.subExpl; for (int k = 0; k < 10; k++) sCull[k] += st.cull[k]; sL2E += st.l2RdExpl; sL2U += st.l2RdUnpred; sL2B += st.l2Both; sL2O8 += st.l2Only8; sL2O1 += st.l2Only1; sL2M0 += st.l2Mode0Multi; sL2FD += st.l2FragDis; sSprN += st.sprTotal; sSprF += st.sprFront; sSprM += st.sprMatched; sSprT += st.sprOracleTris; sVn += st.vNative; sVz += st.vNear; sVo += st.vOther;
+            if (rc == 0 && st.ok) { nOk++; sT += st.staticTotal; sRd += st.redraw; sM += st.matched; sF += st.frag; sTB += st.texBoundTotal; sTU += st.texUnexpl; sTUA += st.texUnexplActor; sU += st.unverif; sMis += st.unmBad + st.unmClip; sSub += st.sub; sAmbE += st.subExpl; for (int k = 0; k < 10; k++) sCull[k] += st.cull[k]; sL2E += st.l2RdExpl; sL2U += st.l2RdUnpred; sL2B += st.l2Both; sL2O8 += st.l2Only8; sL2O1 += st.l2Only1; sL2M0 += st.l2Mode0Multi; sL2FD += st.l2FragDis; sSprN += st.sprTotal; sSprF += st.sprFront; sSprM += st.sprMatched; sSprT += st.sprOracleTris; for (int k = 0; k < 16; k++) sV[k] += st.v[k]; sVScenes += st.v[V_HAVE]; sVn += st.vNative; sVz += st.vNear; sVo += st.vOther;
                 printf("SCENE %s %ld static %u matched %u clipfrag %u mismatch %u coplanar-ambiguous %u (explained %u) redraw %u unverifiable %u static-texture-unexplained %u/%u strict %.2f%% clipaware %.2f%% conservative %.2f%%\n", level, scenes[i], st.staticTotal, st.matched, st.frag, st.unmBad + st.unmClip, st.sub, st.subExpl, st.redraw, st.unverif, st.texUnexpl, st.texBoundTotal,
                        st.staticTotal ? 100.0 * st.matched / st.staticTotal : 0.0, st.staticTotal ? 100.0 * (st.matched + st.frag) / st.staticTotal : 0.0, st.texBoundTotal ? 100.0 * (st.texBoundTotal - st.texUnexpl) / st.texBoundTotal : 0.0); }
             else { nBad++; printf("SCENE %s %ld SKIPPED (rc %d: no valid camera / capture)\n", level, scenes[i], rc); }
         }
     }
-    if (all) printf("LEVEL %s scenes %d (skipped %d) static %llu matched %llu clipfrag %llu mismatch %llu coplanar-ambiguous %llu (explained as non-level %llu) redraw %llu strict %.2f%% clipaware %.2f%% pessimistic(+unexplained ambiguous in denominator) %.2f%% | static-texture tris %llu unexplained %llu (UV-identical only to an actor-pile triangle: %llu) conservative %.2f%% (excluding those %.2f%%) | unverifiable %llu | frag verts native/near/other %llu/%llu/%llu | undrawn-onscreen twin %llu backface-opaque %llu degenerate %llu backface-nonopaque %llu front-in-drawn-ipo %llu front-in-undrawn-ipo-or-sector %llu | layer2 l2expl %llu l2unpred %llu l2both %llu l2only8 %llu l2only1 %llu l2mode0multi %llu l2fragdis %llu | sprites sprN %llu sprFront %llu sprAttr %llu sprTris %llu\n",
+    if (all) printf("LEVEL %s scenes %d (skipped %d) static %llu matched %llu clipfrag %llu mismatch %llu coplanar-ambiguous %llu (explained as non-level %llu) redraw %llu strict %.2f%% clipaware %.2f%% pessimistic(+unexplained ambiguous in denominator) %.2f%% | static-texture tris %llu unexplained %llu (UV-identical only to an actor-pile triangle: %llu) conservative %.2f%% (excluding those %.2f%%) | unverifiable %llu | frag verts native/near/other %llu/%llu/%llu | undrawn-onscreen twin %llu backface-opaque %llu degenerate %llu backface-nonopaque %llu front-in-drawn-ipo %llu front-in-undrawn-ipo-or-sector %llu | layer2 l2expl %llu l2unpred %llu l2both %llu l2only8 %llu l2only1 %llu l2mode0multi %llu l2fragdis %llu | sprites sprN %llu sprFront %llu sprAttr %llu sprTris %llu | cpa_vis scenes %llu vis_front %llu vis_front_culled %llu vis_front_partial %llu vis_front_undrawnipo %llu vis_front_unowned %llu vis_old %llu vis_old_agree %llu vis_old_disagree %llu vis_old_unowned %llu vis_drawn_owned %llu vis_drawn_pred %llu vis_drawn_miss %llu vis_drawn_unowned %llu vis_poolculled %llu vis_ipo_submitted_undrawn %llu\n",
                     level, nOk, nBad, (unsigned long long)sT, (unsigned long long)sM, (unsigned long long)sF, (unsigned long long)sMis, (unsigned long long)sSub, (unsigned long long)sAmbE, (unsigned long long)sRd, sT ? 100.0 * sM / sT : 0.0, sT ? 100.0 * (sM + sF) / sT : 0.0, (sT + sSub - sAmbE) ? 100.0 * (sM + sF) / (sT + sSub - sAmbE) : 0.0,
                     (unsigned long long)sTB, (unsigned long long)sTU, (unsigned long long)sTUA, sTB ? 100.0 * (sTB - sTU) / sTB : 0.0, sTB > sTUA ? 100.0 * (sTB - sTU) / (sTB - sTUA) : 0.0, (unsigned long long)sU, (unsigned long long)sVn, (unsigned long long)sVz, (unsigned long long)sVo,
                     (unsigned long long)sCull[9], (unsigned long long)sCull[1], (unsigned long long)sCull[0], (unsigned long long)sCull[2], (unsigned long long)(sCull[4] + sCull[8] + sCull[7] + sCull[3]), (unsigned long long)(sCull[5] + sCull[6]),
-                    (unsigned long long)sL2E, (unsigned long long)sL2U, (unsigned long long)sL2B, (unsigned long long)sL2O8, (unsigned long long)sL2O1, (unsigned long long)sL2M0, (unsigned long long)sL2FD, (unsigned long long)sSprN, (unsigned long long)sSprF, (unsigned long long)sSprM, (unsigned long long)sSprT);
+                    (unsigned long long)sL2E, (unsigned long long)sL2U, (unsigned long long)sL2B, (unsigned long long)sL2O8, (unsigned long long)sL2O1, (unsigned long long)sL2M0, (unsigned long long)sL2FD, (unsigned long long)sSprN, (unsigned long long)sSprF, (unsigned long long)sSprM, (unsigned long long)sSprT,
+                    (unsigned long long)sVScenes, (unsigned long long)sV[V_FRONT], (unsigned long long)sV[V_FRONT_CULLED], (unsigned long long)sV[V_FRONT_PARTIAL], (unsigned long long)sV[V_FRONT_UNDRAWNIPO], (unsigned long long)sV[V_FRONT_UNOWNED], (unsigned long long)sV[V_OLD], (unsigned long long)sV[V_OLD_AGREE], (unsigned long long)sV[V_OLD_DISAGREE], (unsigned long long)sV[V_OLD_UNOWNED], (unsigned long long)sV[V_DRAWN_OWNED], (unsigned long long)sV[V_DRAWN_PRED], (unsigned long long)sV[V_DRAWN_MISS], (unsigned long long)sV[V_DRAWN_UNOWNED], (unsigned long long)sV[V_POOLCULLED], (unsigned long long)sV[V_IPO_SUBMITTED_UNDRAWN]);
+    if (haveTm) cpa_vis_trimap_free(&tmap);
     cpa_scene_free(&sc); free(fix); free(lvl);
     return 0;
 }

@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-void cpa_drawlist_opts_default(CpaDrawListOpts *o) { o->includeActors = 0; o->includeLayer2 = 1; o->includeSprites = 1; }
+void cpa_drawlist_opts_default(CpaDrawListOpts *o) { o->includeActors = 0; o->includeLayer2 = 1; o->includeSprites = 1; o->cull = NULL; }
 
 static void classify(int8_t alphaClass, uint8_t *pass, uint8_t *blend, uint8_t *alphaTest, uint8_t *cullBack) {
     *alphaTest = 0;
@@ -22,6 +22,20 @@ static int layer2_rule(unsigned mode) {
     return mode == 3 ? CPA_UVRULE_OVERLAY_FLIPV : CPA_UVRULE_OVERLAY;
 }
 
+/* Next run of kept triangles of item `it` at or after item-relative triangle *k: returns its length (0 = none left), sets *start and advances *k past it. Without a cull mask (or for actor items,
+ * which have no prediction) the whole item is one run. Triangles beyond the mask are kept. */
+static int sprite_culled(const CpaDrawListOpts *o, uint32_t i) { return o->cull && i < o->cull->nSprite && !o->cull->sprite[i]; }
+
+static uint32_t next_run(const CpaVisCull *cull, const CpaDrawItem *it, uint32_t *k, uint32_t *start) {
+    uint32_t nt = it->vertCount / 3, base = it->firstVert / 3;
+    if (!cull || it->isActor) { if (*k) return 0; *k = nt; *start = 0; return nt; }
+    while (*k < nt && base + *k < cull->nTri && !cull->tri[base + *k]) (*k)++;
+    if (*k >= nt) return 0;
+    *start = *k;
+    while (*k < nt && (base + *k >= cull->nTri || cull->tri[base + *k])) (*k)++;
+    return *k - *start;
+}
+
 int cpa_drawlist_build(CpaDrawList *dl, const CpaScene *s, const CpaDrawListOpts *opts) {
     CpaDrawListOpts d; if (!opts) { cpa_drawlist_opts_default(&d); opts = &d; }
     memset(dl, 0, sizeof *dl); dl->scene = s;
@@ -30,9 +44,11 @@ int cpa_drawlist_build(CpaDrawList *dl, const CpaScene *s, const CpaDrawListOpts
         const CpaDrawItem *it = &s->items[i];
         if (it->isActor && !opts->includeActors) continue;
         if (!it->vertCount) continue;
-        cap += 1 + ((opts->includeLayer2 && layer2_rule(it->overlayMode) >= 0) ? 1 : 0);
+        uint32_t k = 0, st, len, runs = 0;
+        while ((len = next_run(opts->cull, it, &k, &st)) != 0) runs++;
+        cap += runs * (1 + ((opts->includeLayer2 && layer2_rule(it->overlayMode) >= 0) ? 1 : 0));
     }
-    if (opts->includeSprites) for (uint32_t i = 0; i < s->nSprites; i++) if (!s->sprites[i].isActor || opts->includeActors) nsp++;
+    if (opts->includeSprites) for (uint32_t i = 0; i < s->nSprites; i++) if ((!s->sprites[i].isActor || opts->includeActors) && !sprite_culled(opts, i)) nsp++;
     dl->batches = cap ? calloc(cap, sizeof *dl->batches) : NULL;
     dl->sprites = nsp ? calloc(nsp, sizeof *dl->sprites) : NULL;
     if ((cap && !dl->batches) || (nsp && !dl->sprites)) { cpa_drawlist_free(dl); return 0; }
@@ -44,19 +60,22 @@ int cpa_drawlist_build(CpaDrawList *dl, const CpaScene *s, const CpaDrawListOpts
     for (uint32_t i = 0; i < s->nItems; i++) {
         const CpaDrawItem *it = &s->items[i];
         if ((it->isActor && !opts->includeActors) || !it->vertCount) continue;
-        CpaBatch b; memset(&b, 0, sizeof b);
-        b.firstVert = it->firstVert; b.vertCount = it->vertCount; b.item = i; b.texVa = it->texVa;
-        classify(it->alphaClass, &b.pass, &b.blend, &b.alphaTest, &b.cullBack);
-        b.wrapU = it->tileU ? 1 : 0; b.wrapV = it->tileV ? 1 : 0;      /* wrapUnclear items already default to 1 in cpa_scene */
-        b.overlayMode = it->overlayMode; b.isActor = it->isActor; b.alphaClass = it->alphaClass; b.seq = seq++;
-        tmp[n++] = b;
-        int rule = opts->includeLayer2 ? layer2_rule(it->overlayMode) : -1;
-        if (rule >= 0) {
-            CpaBatch l = b;
-            l.layer = 1; l.uvRule = (uint8_t)rule; l.texVa = 0; l.layerTexUnknown = 1;
-            l.pass = CPA_PASS_TRANSLUCENT; l.blend = CPA_BLEND_ALPHA; l.alphaTest = 0;   /* cullBack inherited from the base (INFERRED) */
-            l.wrapU = l.wrapV = 1; l.seq = seq++;
-            tmp[n++] = l; dl->nLayer2++;
+        uint32_t k = 0, st = 0, len;
+        while ((len = next_run(opts->cull, it, &k, &st)) != 0) {
+            CpaBatch b; memset(&b, 0, sizeof b);
+            b.firstVert = it->firstVert + 3 * st; b.vertCount = 3 * len; b.item = i; b.texVa = it->texVa;
+            classify(it->alphaClass, &b.pass, &b.blend, &b.alphaTest, &b.cullBack);
+            b.wrapU = it->tileU ? 1 : 0; b.wrapV = it->tileV ? 1 : 0;      /* wrapUnclear items already default to 1 in cpa_scene */
+            b.overlayMode = it->overlayMode; b.isActor = it->isActor; b.alphaClass = it->alphaClass; b.seq = seq++;
+            tmp[n++] = b;
+            int rule = opts->includeLayer2 ? layer2_rule(it->overlayMode) : -1;
+            if (rule >= 0) {
+                CpaBatch l = b;
+                l.layer = 1; l.uvRule = (uint8_t)rule; l.texVa = 0; l.layerTexUnknown = 1;
+                l.pass = CPA_PASS_TRANSLUCENT; l.blend = CPA_BLEND_ALPHA; l.alphaTest = 0;   /* cullBack inherited from the base (INFERRED) */
+                l.wrapU = l.wrapV = 1; l.seq = seq++;
+                tmp[n++] = l; dl->nLayer2++;
+            }
         }
     }
     uint32_t w = 0;
@@ -70,7 +89,7 @@ int cpa_drawlist_build(CpaDrawList *dl, const CpaScene *s, const CpaDrawListOpts
 
     if (opts->includeSprites) for (uint32_t i = 0; i < s->nSprites; i++) {
         const CpaSprite *sp = &s->sprites[i];
-        if (sp->isActor && !opts->includeActors) continue;
+        if ((sp->isActor && !opts->includeActors) || sprite_culled(opts, i)) continue;
         CpaDrawSprite *o = &dl->sprites[dl->nSprites++]; uint8_t cull;
         o->src = i; memcpy(o->pos, sp->pos, 12); o->sizeX = sp->sizeX; o->sizeY = sp->sizeY; o->texVa = sp->texVa;
         classify(sp->alphaClass, &o->pass, &o->blend, &o->alphaTest, &cull);   /* sprite pass is INFERRED from the material class only */
