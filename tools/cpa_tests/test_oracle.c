@@ -259,6 +259,16 @@ int main(int argc, char **argv) {
             for (uint32_t v = sd.items[i].firstVert; v < sd.items[i].firstVert + sd.items[i].vertCount; v++)
                 vertStaticBad += (memcmp(sd.pos + 3 * v, sr.pos + 3 * v, 12) || memcmp(sd.uv + 2 * v, sr.uv + 2 * v, 8));
     }
+    {   /* second texture layer selector (VisualMaterial+0x149) and sprite elements: the DAT image and the guest's loaded copy must agree */
+        uint32_t ovBad = 0, ovNz = 0, sprBad = 0;
+        if (itemsEq) for (uint32_t i = 0; i < sd.nItems; i++) { ovBad += sd.items[i].overlayMode != sr.items[i].overlayMode; ovNz += sd.items[i].overlayMode != 0; }
+        check("A3 overlayMode (VisualMaterial+0x149) identical DAT vs guest RAM, per draw item", itemsEq && ovBad == 0, "items=%u nonzero=%u bad=%u", sd.nItems, ovNz, ovBad);
+        if (sd.nSprites == sr.nSprites) for (uint32_t i = 0; i < sd.nSprites; i++) {
+            const CpaSprite *x = &sd.sprites[i], *y = &sr.sprites[i];
+            sprBad += x->geoVa != y->geoVa || x->texVa != y->texVa || memcmp(&x->sizeX, &y->sizeX, 8) || memcmp(x->local, y->local, 12) || x->isActor != y->isActor;
+        }
+        check("A3 sprites (type 3) identical DAT vs guest RAM (count, geometry, texture, size, local vertex)", sd.nSprites == sr.nSprites && sprBad == 0, "sprites DAT=%u RAM=%u bad=%u", sd.nSprites, sr.nSprites, sprBad);
+    }
     check_rt("A3 draw items identical (count, vertex ranges, texture VA, isActor)", itemsEq && itemBad == 0, "items DAT=%u RAM=%u badItems=%u", sd.nItems, sr.nItems, itemBad);
     {   /* static items compared in order, independent of how many actor items each side produced (actor lists mutate at run time) */
         uint32_t i = 0, j = 0, nsd = 0, nsr = 0, sBad = 0, sVerts = 0;

@@ -37,6 +37,7 @@ static uint32_t le32(const uint8_t *p) {
 typedef struct {
     uint32_t tex;
     uint32_t nTri; int actor, chan; float *pos, *uv;
+    uint8_t overlay;
 } Elem;
 
 typedef struct {
@@ -47,6 +48,7 @@ typedef struct {
     uint32_t nodes;
     uint32_t *geoDone; uint32_t nGeoDone, capGeoDone;
     int curChan;   /* >= 0 while decoding a Rayman rig part */
+    CpaSprite *spr; uint32_t nSpr, capSpr;
 } Ctx;
 
 /* Decode texture-struct flags/wrap. Wrap evidence (INFERRED, notes_levels.md): UV extents of static batches: wrap 2 has U-only
@@ -67,9 +69,12 @@ static void tex_decode(const CpaImage *im, uint32_t texVa, uint32_t *flags, uint
 }
 
 /* GeometricObject (GeoObj.c) -- VERIFIED: +00 float3* verts, +10 u16* elementTypes, +14 ptr* elements, +2C s16 nVerts, s16 nElements.
- * Element type 1 (indexed triangles, 280/280 in LEARN_10): [0] GameMaterial*, [1] u16 nTri|u16 nUV<<16, [2] u16 vtxIdx[3n],
- * [3] u16 uvIdx[3n], [4] float3 faceNormal[n], [5] float2 uv[nUV]. Element types other than 1 are skipped (never seen). */
-static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor) {
+ * Element type 1 (indexed triangles; 280/280 static elements in LEARN_10, 235 of 288 actor elements in BAST_10): [0] GameMaterial*,
+ * [1] u16 nTri|u16 nUV<<16, [2] u16 vtxIdx[3n], [3] u16 uvIdx[3n], [4] float3 faceNormal[n], [5] float2 uv[nUV].
+ * Element type 3 (sprite; 53 in BAST_10, 32 in JAIL_10, 45 in LEARN_10, every one in an actor geometry with exactly 1 vertex and 1 element; decoded into
+ * CpaScene.sprites, layout in cpa_scene.h): [0] VisualMaterial*, [1] float sizeX, [2] float sizeY. Element types other than 1 and 3 are skipped (never
+ * seen in the 7 levels checked; counted in nElemSkipped). A type-3 element in any other shape than nVerts == 1 is counted in nSpriteBad and not exported. */
+static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor, uint32_t soVa) {
     const CpaImage *im = c->im;
     uint32_t pv, ptypes, pelems, cnt;
     if (!cpa_rd32(im, geo + 0x00, &pv) || !cpa_rd32(im, geo + 0x10, &ptypes) || !cpa_rd32(im, geo + 0x14, &pelems) ||
@@ -95,6 +100,20 @@ static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor) {
         uint16_t etype; uint32_t el, w[8];
         c->s->nElements++;
         if (!cpa_rd16(im, ptypes + 2 * e, &etype) || !cpa_rd32(im, pelems + 4 * e, &el) || !cpa_is_ptr(im, el)) { c->s->nElemSkipped++; continue; }
+        if (etype == 3) {
+            uint32_t w3[5], vm3 = 0, tex3 = 0; int ok3 = 1;
+            for (int i = 0; i < 5; i++) ok3 &= cpa_rd32(im, el + 4u * i, &w3[i]);
+            float sx, sy; memcpy(&sx, &w3[1], 4); memcpy(&sy, &w3[2], 4);
+            if (!ok3 || nv != 1 || ne != 1 || !cpa_is_ptr(im, w3[0]) || !isfinite(sx) || !isfinite(sy)) { c->s->nSpriteBad++; continue; }
+            if (c->curChan >= 0) { c->s->nSpriteRig++; continue; }
+            vm3 = w3[0]; cpa_rd32(im, vm3 + 0x4C, &tex3);
+            if (c->nSpr == c->capSpr) { c->capSpr = c->capSpr ? c->capSpr * 2 : 64; c->spr = (CpaSprite *)realloc(c->spr, sizeof(CpaSprite) * c->capSpr); if (!c->spr) { c->capSpr = c->nSpr = 0; free(vw); return 0; } }
+            CpaSprite *sp = &c->spr[c->nSpr++]; memset(sp, 0, sizeof *sp);
+            memcpy(sp->pos, vw[0], sizeof sp->pos); sp->sizeX = sx; sp->sizeY = sy; sp->texVa = tex3; sp->isActor = (uint8_t)isActor; sp->geoVa = geo; sp->soVa = soVa;
+            for (int k = 0; k < 3; k++) cpa_rdf(im, pv + 4u * k, &sp->local[k]);
+            { uint8_t wb; tex_decode(im, tex3, &sp->texFlags, &wb, &sp->texFlagsValid, &sp->tileU, &sp->tileV, &sp->wrapUnclear, &sp->alphaClass); }
+            continue;
+        }
         if (etype != 1) { c->s->nElemSkipped++; continue; }
         int ok = 1;
         for (int i = 0; i < 8; i++) ok &= cpa_rd32(im, el + 4u * i, &w[i]);
@@ -109,6 +128,7 @@ static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor) {
 
         Elem E; memset(&E, 0, sizeof E);
         E.tex = tex; E.actor = isActor; E.chan = c->curChan;
+        if (vm) cpa_rd8(im, vm + 0x149, &E.overlay);   /* VisualMaterial+0x149: second-pass selector, see cpa_scene.h */
         E.pos = (float *)malloc(sizeof(float) * 9 * ntri);
         E.uv  = (float *)malloc(sizeof(float) * 6 * ntri);
         if (!E.pos || !E.uv) { free(E.pos); free(E.uv); free(vw); return 0; }
@@ -184,7 +204,7 @@ static void rig_build(Ctx *c, uint32_t actorVa, uint32_t soVa, const Mat *soWorl
         R->geo[ch] = geo;
         Mat id; mat_ident(&id);
         c->curChan = (int)ch;
-        if (emit_geo(c, geo, &id, 1)) R->geoCount++;
+        if (emit_geo(c, geo, &id, 1, soVa)) R->geoCount++;
         c->curChan = -1;
     }
 
@@ -251,7 +271,7 @@ static void walk(Ctx *c, uint32_t va, uint32_t parent, int depth, const Mat *pg)
                     c->geoDone = (uint32_t *)realloc(c->geoDone, sizeof(uint32_t) * c->capGeoDone);
                 }
                 c->geoDone[c->nGeoDone++] = geo;
-                if (emit_geo(c, geo, &world, 1)) s->nActorGeos++;   /* PLACEHOLDER pose: whole actor at SO global matrix, no per-part pose */
+                if (emit_geo(c, geo, &world, 1, va)) s->nActorGeos++;   /* PLACEHOLDER pose: whole actor at SO global matrix, no per-part pose */
             }
         }
     }
@@ -260,7 +280,7 @@ static void walk(Ctx *c, uint32_t va, uint32_t parent, int depth, const Mat *pg)
         uint32_t po, vs, geo;
         s->nIpo++;
         if (cpa_is_ptr(im, w[1]) && cpa_rd32(im, w[1], &po) && cpa_is_ptr(im, po) && cpa_rd32(im, po, &vs) && cpa_is_ptr(im, vs) &&
-            cpa_rd32(im, vs + 4, &geo) && cpa_is_ptr(im, geo) && emit_geo(c, geo, &world, 0)) { s->nIpoMesh++; s->nStaticMeshes++; }
+            cpa_rd32(im, vs + 4, &geo) && cpa_is_ptr(im, geo) && emit_geo(c, geo, &world, 0, va)) { s->nIpoMesh++; s->nStaticMeshes++; }
     }
 
     uint32_t ch = w[2], n = 0;
@@ -331,14 +351,14 @@ int cpa_scene_load(CpaScene *out, const CpaImage *img, uint32_t rootVa) {
     out->items = (CpaDrawItem *)calloc(c.nEl ? c.nEl : 1, sizeof(CpaDrawItem));
     uint8_t *done = (uint8_t *)calloc(c.nEl ? c.nEl : 1, 1);
     uint32_t nv = 0;
-    /* merge elements with equal (texture, isActor) into one draw item (order = first occurrence) */
+    /* merge elements with equal (texture, isActor, overlayMode) into one draw item (order = first occurrence) */
     for (uint32_t i = 0; i < c.nEl && out->pos && out->uv && out->items && done; i++) {
         if (done[i]) continue;
         CpaDrawItem *b = &out->items[out->nItems++];
-        b->texVa = c.el[i].tex; b->firstVert = nv; b->isActor = (uint8_t)c.el[i].actor;
+        b->texVa = c.el[i].tex; b->firstVert = nv; b->isActor = (uint8_t)c.el[i].actor; b->overlayMode = c.el[i].overlay;
         tex_decode(img, b->texVa, &b->texFlags, &b->texWrapByte, &b->texFlagsValid, &b->tileU, &b->tileV, &b->wrapUnclear, &b->alphaClass);
         for (uint32_t j = i; j < c.nEl; j++) {
-            if (done[j] || c.el[j].tex != b->texVa || c.el[j].actor != b->isActor) continue;
+            if (done[j] || c.el[j].tex != b->texVa || c.el[j].actor != b->isActor || c.el[j].overlay != b->overlayMode) continue;
             memcpy(out->pos + nv * 3, c.el[j].pos, sizeof(float) * 9 * c.el[j].nTri);
             memcpy(out->uv + nv * 2, c.el[j].uv, sizeof(float) * 6 * c.el[j].nTri);
             nv += c.el[j].nTri * 3;
@@ -347,6 +367,9 @@ int cpa_scene_load(CpaScene *out, const CpaImage *img, uint32_t rootVa) {
         b->vertCount = nv - b->firstVert;
     }
     out->nVerts = nv;
+    out->sprites = c.spr; out->nSprites = c.nSpr;
+    for (uint32_t i = 0; i < c.nSpr; i++) out->nSpriteActor += c.spr[i].isActor;
+    c.spr = NULL;
 
     /* distinct texture statistics over draw items + rig parts */
     {
@@ -382,7 +405,7 @@ int cpa_scene_load_dats(CpaScene *out, CpaImage *img, const uint8_t *fix, size_t
 void cpa_scene_free(CpaScene *s) {
     for (uint32_t i = 0; i < s->rig.nPart; i++) { free(s->rig.part[i].lpos); free(s->rig.part[i].uv); free(s->rig.part[i].wpos); }
     free(s->rig.part);
-    free(s->pos); free(s->uv); free(s->items);
+    free(s->pos); free(s->uv); free(s->items); free(s->sprites);
     memset(s, 0, sizeof *s);
 }
 

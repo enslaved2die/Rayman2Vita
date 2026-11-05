@@ -16,7 +16,10 @@ Source comments tag every claim **VERIFIED** (decompile and/or data consistency 
 - `cpa_scene_load_dats(&scene, &img, fixBuf, fixN, lvlBuf, lvlN)` (root = level header word 13) or `cpa_scene_load(&scene, &img, rootVa)`.
   Buffers must outlive the scene.
 - `CpaScene.pos/uv/nVerts` + `items[]` (`CpaDrawItem`: vertex range, texture-struct VA, raw flags/wrap byte, decoded
-  alpha class and tile U/V, `isActor`). Triangle lists, world space, raw engine axes, raw UVs (no flip, no clamp).
+  alpha class and tile U/V, `isActor`, `overlayMode`). Triangle lists, world space, raw engine axes, raw UVs (no flip, no clamp).
+- `CpaDrawItem.overlayMode` = byte at VisualMaterial+0x149: non-zero means the item's polygons are drawn a second time (texture layer 2) with UV
+  `cpa_overlay_uv()` (x8; mode 3 also flips V). The layer-2 texture itself is not in the material and is not decoded (see below).
+- `CpaScene.sprites[]` (`CpaSprite`): GeometricObject element type 3, raw decode (VisualMaterial*, sizeX, sizeY, vertex through the SO matrix).
 - Walk stats (`nSO*`, mismatch/cycle counters), static AABB, `nStaticTris`, `nActorTris`, `nActorGeos`.
 - `CpaRig` (Rayman): per-channel local-space `parts[]` and `cpa_rig_pose(&scene, frame)` which fills `parts[i].wpos`.
 - `cpa_scene_free`.
@@ -30,7 +33,18 @@ Test: `make -C tools/cpa_tests test DCDATA=/path/to/assets/dc/DCDATA` (or `CPA_D
 - Actor chain to geometry: 183 unique actor GeometricObjects, 4817 triangles (exact reproduction).
 - Rayman rig: 9 channels, 675 triangles, Wait frame 0 stands on z ~ 0 (-0.003..1.931 relative to placement).
 
+- Second texture layer: `overlayMode != 0` <=> the game draws the polygon twice, 1836/1836 layer-2 draws in 4 levels explained, 0 polygons with
+  `overlayMode == 0` drawn twice (`tools/cpa_tests/ta_compare.c`, `docs/NATIVE_ENGINE.md` section N1). Layer-2 UV = 8x (mode 1, 2) or 8x with V flipped (mode 3).
+- Element type 3 layout: 130 elements (Learn_10 45, Jail_10 26 after loader de-duplication, Bast_10 53), all single-vertex single-element actor
+  geometries, `[0]` = VisualMaterial* directly (texture struct valid for all), `[1]`,`[2]` = floats. DAT vs guest RAM identical (`test_oracle` A3).
+
 ## Inferred / not done
+- Layer 2: the texture (its tcw has pixel-format field 4 = BUMP in the PVR2 TCW layout, VRAM address 0x282AC0 for modes 2/3 and 0 with the mip bit for mode 1, the
+  same in all four levels, so a resident global texture, not one the level lists), the blend/vertex-colour computation of the pass, and what distinguishes modes 1 and 2
+  (only seen: different TSP filter bits) are NOT decoded. The 4 DAT bytes next to `+0x149` are fill (0xCD) data.
+- Sprites: the meaning of `[3]`/`[4]` and the size semantic are INFERRED/UNVERIFIED. Only 3 oracle quads (2 distinct sprites, Helic_30, additive glow) could be attributed
+  (centre within 1 px of the projected SO position, depth within 2%, rectangle with unit UV); the measured half extent / (size*f/Zc) was 0.32, 0.41, 0.41, i.e. not a clean 0.5 or 1.
+  Most sprites sit on actors whose sub-object pose is unknown (the placeholder pile), so they cannot be verified.
 - Row-vector matrix convention (translation in row 3); only exercised by actors.
 - Alpha class from texture flags and tile U/V from the wrap byte: correlated with texture names / UV extents, not read from draw code.
   Flag-unclear or wrap-unclear textures are reported (`alphaClass == CPA_ALPHA_UNKNOWN`, `wrapUnclear`) so a renderer can fall back.

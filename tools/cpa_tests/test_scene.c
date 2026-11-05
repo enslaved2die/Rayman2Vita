@@ -90,6 +90,40 @@ int main(int argc, char **argv) {
         check_true("frame0 pose z rel. to placement plausible (feet ~0, head ~1.9)", lo > -0.5f && lo < 0.5f && hi > 1.5f && hi < 2.5f);
     }
 
+    printf("second texture layer (VisualMaterial+0x149 overlayMode) and sprites (element type 3):\n");
+    {   /* expected numbers counted independently by a Python walk of the same DAT (IPO -> PO -> VisualSet -> Geo -> type-1 elements -> GameMaterial -> VisualMaterial byte +0x149) */
+        uint32_t tri[4] = { 0, 0, 0, 0 }, items[4] = { 0, 0, 0, 0 }, bad = 0;
+        for (uint32_t i = 0; i < s.nItems; i++) { if (s.items[i].isActor) continue; if (s.items[i].overlayMode > 3) { bad++; continue; } tri[s.items[i].overlayMode] += s.items[i].vertCount / 3; items[s.items[i].overlayMode]++; }
+        check_u("static triangles, overlayMode 0", 2355, tri[0]);
+        check_u("static triangles, overlayMode 1", 248, tri[1]);
+        check_u("static triangles, overlayMode 2", 426, tri[2]);
+        check_u("static triangles, overlayMode 3", 203, tri[3]);
+        check_u("overlayMode > 3 (never seen)", 0, bad);
+        check_true("items with overlayMode != 0 exist and are distinct items", items[1] + items[2] + items[3] > 0);
+        float u2 = 0, v2 = 0;
+        check_true("overlay UV mode 1: (8u, 8v)", cpa_overlay_uv(1, 0.25f, 0.5f, &u2, &v2) && u2 == 2.0f && v2 == 4.0f);
+        check_true("overlay UV mode 2: (8u, 8v)", cpa_overlay_uv(2, 1.0f, -0.5f, &u2, &v2) && u2 == 8.0f && v2 == -4.0f);
+        check_true("overlay UV mode 3: (8u, 8(1-v))", cpa_overlay_uv(3, 0.25f, 0.75f, &u2, &v2) && u2 == 2.0f && v2 == 2.0f);
+        check_true("overlay UV mode 0 / unknown: no layer", !cpa_overlay_uv(0, 0, 0, &u2, &v2) && !cpa_overlay_uv(4, 0, 0, &u2, &v2));
+        uint32_t okTex = 0, okSize = 0, nonActor = 0, nanPos = 0;
+        for (uint32_t i = 0; i < s.nSprites; i++) {
+            const CpaSprite *sp = &s.sprites[i];
+            okTex += sp->texFlagsValid && sp->texVa != 0;
+            okSize += sp->sizeX >= 0.05f && sp->sizeX <= 1.2f && sp->sizeY >= 0.05f && sp->sizeY <= 1.2f;
+            nonActor += !sp->isActor;
+            for (int k = 0; k < 3; k++) nanPos += !isfinite(sp->pos[k]);
+        }
+        check_u("sprite elements (type 3)", 45, s.nSprites);
+        check_u("sprites in actor geometries", 45, s.nSpriteActor);
+        check_u("sprites in static IPOs", 0, nonActor);
+        check_u("type-3 elements not matching the layout", 0, s.nSpriteBad);
+        check_u("type-3 elements in Rayman's rig (not exported)", 0, s.nSpriteRig);
+        check_u("elements skipped (was 45 before type 3 was decoded)", 0, s.nElemSkipped);
+        check_u("sprites whose VisualMaterial -> texture struct is filled (bit31)", 45, okTex);
+        check_u("sprites with size in [0.05, 1.2]", 45, okSize);
+        check_u("sprite non-finite positions", 0, nanPos);
+    }
+
     printf("draw list consistency:\n");
     {
         uint32_t sum = 0, bad = 0;
