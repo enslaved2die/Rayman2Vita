@@ -216,7 +216,8 @@ $(BUILD_DIR)/variant.o: $(BUILD_DIR)/variant.c
 $(HOT_ORDER): $(HOT_LIST) $(HLE_DIR)/hotorder.py | $(BUILD_DIR)
 	$(CC) -x c /dev/null -Wl,--verbose -nostartfiles -nostdlib -o /dev/null 2>/dev/null | sed -n '/^======/,/^======/p' | sed '1d;$$d' | python3 $(HLE_DIR)/hotorder.py $(HOT_LIST) > $@
 
-$(BUILD_DIR)/rename.sed: $(HLE_DIR)/mkstubs.py $(HGEN)/recomp_decls.h | $(BUILD_DIR)
+# the hookable set is every guest address literal in hle/*.c|h (mkstubs.py): rename.sed must be regenerated when any of them changes, otherwise a newly added native hook is never routed through its stub
+$(BUILD_DIR)/rename.sed: $(HLE_DIR)/mkstubs.py $(HGEN)/recomp_decls.h $(wildcard $(HLE_DIR)/*.c) $(wildcard $(HLE_DIR)/*.h) | $(BUILD_DIR)
 	cd $(RECOMP_DIR) && python3 hle/mkstubs.py gen_fix
 	cp $(RECOMP_DIR)/build_hle/rename.sed $(BUILD_DIR)/rename.sed
 	cp $(RECOMP_DIR)/build_hle/hook_stubs.c $(BUILD_DIR)/hook_stubs.c
