@@ -120,11 +120,9 @@ def localise(addr, body, sq=False):
     reload = "".join("r%d=c->r[%d];" % (i, i) for i in sorted(used_r)) + "".join("fr%d=c->fr[%d];" % (i, i) for i in sorted(used_fr)) + "t_=c->t;pr_=c->pr;" + ("fpul_=c->fpul;" if uses_fpul else "")
     # --- calls out of the function: spill, call by address (hook-aware), reload; one pass so nothing is wrapped twice ---
     def call(m):
-        if m.group(3) is not None:
-            return "{%s GEOM_PREF(c,%s);%s}" % (spill, m.group(3), reload)
         tgt = "0x%su" % m.group(1) if m.group(1) else m.group(2)
         return "{%s sh4_call(c,%s);%s}" % (spill, tgt, reload)
-    body = re.sub(r"\b(?:f_([0-9a-f]{8})\(c\)|sh4_call\(c,([^;]*)\)|sh4_pref\(c,([^;]*)\));", call, body)
+    body = re.sub(r"\b(?:f_([0-9a-f]{8})\(c\)|sh4_call\(c,([^;]*)\));", call, body)
     body = re.sub(r"\breturn;", lambda m: "{%s return; }" % spill, body)
     decl = "".join("    uint32_t r%d=c->r[%d];\n" % (i, i) for i in sorted(used_r))
     decl += "".join("    uint32_t fr%d=c->fr[%d];\n" % (i, i) for i in sorted(used_fr))
