@@ -14,7 +14,7 @@
 #include <math.h>
 
 #define RS (808 + 0x800 + 0x400)
-typedef struct { uint32_t fr, rel, inp; float cmat[32], pmat[32], T[3], L[3], Cd[3]; } Rec;
+typedef struct { uint32_t fr, rel, inp; float cmat[32], pmat[32], T[3], L[3], Cd[3], S1, S2, u1[3], u2[3]; } Rec;
 
 static float f32(const uint8_t *p) { float v; memcpy(&v, p, 4); return v; }
 static float dist3(const float *a, const float *b) { float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2]; return sqrtf(x * x + y * y + z * z); }
@@ -32,7 +32,8 @@ int main(int argc, char **argv) {
         const uint8_t *r = buf + (size_t)i * RS; uint32_t h[4]; memcpy(h, r, 16);
         R[i].fr = h[1]; R[i].rel = h[2]; R[i].inp = h[3];
         for (int k = 0; k < 32; k++) { R[i].cmat[k] = f32(r + 40 + 0x80 + 4 * k); R[i].pmat[k] = f32(r + 40 + 0x180 + 4 * k); }
-        for (int k = 0; k < 3; k++) { R[i].T[k] = f32(r + 808 + 0x3c4 + 4 * k); R[i].L[k] = f32(r + 808 + 0x690 + 4 * k); R[i].Cd[k] = f32(r + 808 + 0x680 + 4 * k); }
+        for (int k = 0; k < 3; k++) { R[i].T[k] = f32(r + 808 + 0x3c4 + 4 * k); R[i].L[k] = f32(r + 808 + 0x690 + 4 * k); R[i].Cd[k] = f32(r + 808 + 0x680 + 4 * k); R[i].u1[k] = f32(r + 808 + 0x60c + 4 * k); R[i].u2[k] = f32(r + 808 + 0x644 + 4 * k); }
+        R[i].S1 = f32(r + 808 + 0x3dc); R[i].S2 = f32(r + 808 + 0x3f8);
     }
     int start = argc > 3 ? atoi(argv[2]) : 0, end = argc > 3 ? atoi(argv[3]) : n - 1; if (end > n - 2) end = n - 2;
     int fails = 0;
@@ -64,6 +65,24 @@ int main(int argc, char **argv) {
             if (e1 + e2 + e3 + e4 + e5 > 1e-3f) { printf("check2 FAIL\n"); fails++; }
         }
         free(ram);
+    }
+
+    /* 4/5. downstream integrators found by probing the lifted code (notes_camera.md section 5). Both use oracle-produced upstream values (T, S1, per-frame displacement u1 at actor+0x60c). */
+    if (end - start >= 10) {
+        double sL = 0, sLfree = 0; float mL = 0, mLfree = 0; int cnt = 0;
+        float Lf[3]; memcpy(Lf, R[start].L, 12);
+        double sC = 0; float mC = 0; int nC = 0, nCbad = 0;
+        for (int i = start + 1; i <= end; i++) {
+            float Lt[3]; memcpy(Lt, R[i - 1].L, 12);
+            cpa_follow_aim_step(Lt, R[i].T, R[i].S1, 0.016f, NULL);          /* teacher forced */
+            float e = dist3(Lt, R[i].L); sL += e; if (e > mL) mL = e;
+            cpa_follow_aim_step(Lf, R[i].T, R[i].S1, 0.016f, NULL);          /* free run of L on oracle T,S1 */
+            float ef = dist3(Lf, R[i].L); sLfree += ef; if (ef > mLfree) mLfree = ef; cnt++;
+            float Cn[3] = { R[i - 1].Cd[0] + R[i].u1[0], R[i - 1].Cd[1] + R[i].u1[1], R[i - 1].Cd[2] + R[i].u1[2] };   /* C = C + u1 */
+            float ec = dist3(Cn, R[i].Cd); sC += ec; if (ec > mC) mC = ec; nC++; if (ec > 1e-3f) nCbad++;
+        }
+        printf("check4 L = L + min(S1*dt, |T-L|/2)*unit(T-L), window %d..%d: teacher-forced err mean %.2e max %.2e | free run on oracle T,S1: mean %.2e max %.2e (%d frames)\n", start, end, sL / cnt, mL, sLfree / cnt, mLfree, cnt);
+        printf("check5 C = C_prev + u1 (u1 = oracle displacement, actor+0x60c): err mean %.2e max %.2e, %d of %d frames differ by > 1e-3 (collision pull-in, not decoded)\n", sC / nC, mC, nCbad, nC);
     }
 
     /* 3. model */

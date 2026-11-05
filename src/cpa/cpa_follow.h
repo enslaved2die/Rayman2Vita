@@ -60,6 +60,11 @@ int cpa_follow_read_ram(const uint8_t *ram, CpaFollowRam *out);
 /* Orientation rows from C and L: VERIFIED. rows[0..8] = R0,R1,R2. Returns 0, or -1 if C == L (rows untouched). */
 int cpa_follow_rows(const float C[3], const float L[3], float rows[9]);
 
+/* Aim-point integrator (VERIFIED against the oracle, test_follow check 4; found by running the lifted f_8c08cd74 on RAM dumps, see notes_camera.md section 5).
+ * Per guest frame, with T and the speed S1 (actor+0x3dc, camData+0x248) as produced by the upstream camera director: step = min(S1*dt, 0.5*|T-L|) along (T-L)/|T-L|; L += step.
+ * dt = 0.016 (the engine passes counter(16 ms)/1000 in fr4 to the behaviour). Returns |step|; outStep may be NULL. The speed S1 itself is NOT decoded (UNKNOWN). */
+float cpa_follow_aim_step(float L[3], const float T[3], float speed, float dt, float outStep[3]);
+
 typedef struct CpaFollowCfg {
     float targetOffsetZ;   /* 1.4   (INFERRED: T - Rayman in z when Rayman stands/runs on level ground) */
     float kTarget;         /* 0.222 (INFERRED) */

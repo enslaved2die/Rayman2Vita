@@ -35,6 +35,19 @@ int cpa_follow_rows(const float C[3], const float L[3], float rows[9]) {
     return 0;
 }
 
+float cpa_follow_aim_step(float L[3], const float T[3], float speed, float dt, float outStep[3]) {
+    float d[3] = { T[0] - L[0], T[1] - L[1], T[2] - L[2] };
+    float n = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    float st[3] = { 0.f, 0.f, 0.f }, m = 0.f;
+    if (n > 1e-9f) {
+        m = speed * dt; if (m > 0.5f * n) m = 0.5f * n;
+        for (int i = 0; i < 3; i++) st[i] = d[i] / n * m;
+    }
+    for (int i = 0; i < 3; i++) L[i] += st[i];
+    if (outStep) memcpy(outStep, st, 12);
+    return m;
+}
+
 void cpa_follow_cfg_default(CpaFollowCfg *c) {
     c->targetOffsetZ = 1.4f; c->kTarget = 0.222f; c->kAim = 0.17f;
     c->distMin = 7.5f; c->distMax = 9.3f; c->kDist = 0.09f; c->height = 2.8f; c->kHeight = 0.025f;

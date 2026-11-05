@@ -38,3 +38,9 @@ START ?= 2815
 END   ?= 4400
 follow-test: build/test_follow
 	./build/test_follow $(LOG) $(START) $(END) $(RAM) $(REL)
+
+# camprobe_*: run lifted guest camera code on RAM dumps (oracle side research tools, like vis_frustum)
+build/camprobe_%: camprobe_%.c $(SH4)/build_hle/run_game
+	@mkdir -p build
+	$(CC) -O1 -std=gnu11 -I$(SH4) -I$(SH4)/hle -I$(SH4)/gen_fix -c camprobe_$*.c -o build/camprobe_$*.o
+	$(CC) -o $@ build/camprobe_$*.o $(HLEOBJ) -lm
