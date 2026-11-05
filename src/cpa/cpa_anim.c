@@ -100,22 +100,30 @@ static void slerp(const float a[4], const float b[4], float t, float o[4]) {
 static short g_sin[8192]; static int g_sinInit;
 static void sin_init(void) { if (g_sinInit) return; for (int i = 0; i < 8192; i++) g_sin[i] = (short)lrint(32767.0 * sin(2.0 * 3.14159265358979323846 * i / 8192.0)); g_sinInit = 1; }
 static int slerp_tab(const float cur[4], const float next[4], float t, int theta, float o[4]) {
+    /* Port of FUN_8c0817c0: theta is the sign-extended s16; cos<0 negates next and mirrors theta; no renormalisation; fused multiply-add for the second term. */
     sin_init();
-    int th = theta & 0xFFFF, sg = 1;
-    int c = g_sin[(th + 2048) & 8191];
-    if (c < 0) { sg = -1; th = 4096 - th; c = -c; }
-    int sn = g_sin[th & 8191];
-    if (c <= -32766 || sn == 0) { for (int i = 0; i < 4; i++) o[i] = (1 - t) * cur[i] + t * sg * next[i]; return 0; }
-    int u = (int)((float)th * t) & 0xFFFF;
-    float inv = 1.0f / (float)sn, c1 = (float)g_sin[(th - u) & 8191] * inv, c2 = (float)g_sin[u & 8191] * inv;
-    for (int i = 0; i < 4; i++) o[i] = c1 * cur[i] + c2 * sg * next[i];
-    return 1;
+    int th = (int16_t)theta; float nb[4];
+    for (int i = 0; i < 4; i++) nb[i] = next[i];
+    int c = g_sin[(th + 0x800) & 0x1FFF];
+    if (c < 0) { for (int i = 0; i < 4; i++) nb[i] = -nb[i]; th = 0x1000 - th; }
+    th = (int16_t)th;
+    int sn = g_sin[th & 0x1FFF];
+    float c1, c2;
+    if (sn == 0) { c1 = 1.0f - t; c2 = t; }
+    else {
+        float inv = 1.0f / (float)sn;
+        int u = (int)((double)(float)th * (double)t), us = (int16_t)u;   /* guest FPSCR.RM=1 (round toward zero): trunc of the exact product */
+        c1 = (float)g_sin[(th - us) & 0x1FFF] * inv; c2 = (float)g_sin[us & 0x1FFF] * inv;
+    }
+    for (int i = 0; i < 4; i++) o[i] = fmaf(c2, nb[i], cur[i] * c1);
+    return sn != 0;
 }
 
 /* Key (H9, 0x24 B): +0 float3 cached T, +0xC |T|, +0x10 u16 frame, +0x12 u16 flags, +0x14 qA (H2 idx), +0x16 qB, +0x18 scale vec (H1 idx), +0x1A dir vec (H1 idx),
- * +0x1C s16 = rotation slerp angle theta (see slerp_tab; VERIFIED by oracle), +0x1E s16 = same for the qB axes slerp (INFERRED, not isolated), +0x20 s16 = unknown (only
+ * +0x1C s16 = rotation slerp angle theta (see slerp_tab; VERIFIED by oracle), +0x1E s16 = same for the qB axes slerp (VERIFIED: exact for 0x23/0x33/0x61 keys), +0x20 s16 = direction angle used only by the R14!=0 tail of FUN_8c0819c0, which FUN_8c0823c0 never takes (it passes 0): dead for actors (was INFERRED live; only
  * seen non-zero together with scale flags), +0x22 s16 = the ease test in FUN_8c0823c0: ZERO in all 7557 channel evaluations of the oracle set, so that branch is dead in this data.
- * T = H1[+0x1A] * f@0xC (VERIFIED equal to the cached float3 on sampled keys). */
+ * T = H1[+0x1A] * f@0xC (the key at t==0); the cached float3 is that plus pivot*F (pivot = H1[H6 row u16@4]), so interpolated T = lerp(cached) - pivot*F (VERIFIED, N2 exit).
+ * The guest FPU runs with FPSCR.RM=1 (round toward zero): the slerp angle u = trunc(theta*t) is taken from the exact product. */
 /* t = a/b. rz != 0: quotient rounded toward zero (INFERRED: with it the guest's integer angle u = trunc(theta*t) is reproduced where the nearest-rounded
  * quotient is off by one, e.g. theta 114, t = 2/3 -> guest u = 75, not 76; 71 of 7557 channels remain above 1e-4 with it, 163 without, see report). */
 static float divq(float a, float b, int rz) {
@@ -164,40 +172,59 @@ int cpa_anim_eval(const CpaAnimActor *a, unsigned animIdx, unsigned frame, int m
         }
         C->t = t;
         if (nk) { C->nflags = cpa_u16(im, nk + 0x12); C->nframe = cpa_u16(im, nk + 0x10); for (int e = 0; e < 4; e++) C->nease[e] = cpa_u16(im, nk + 0x1C + 2 * e); }
-        /* Rotation (VERIFIED by oracle): at the key (t == 0) or with flag 0x01 the key's own rotation (identity when flag 0x10); otherwise the engine blends
-         * the key rotation with the next key's, where a key with flag 0x10 contributes the identity quaternion (decompile: the 0x10 test sits only in the non-blend branch). */
-        float q[4] = { 0, 0, 0, 1 }, T[3], S[3];
-        if (t > 0 && nk && !(flags & 1)) {
-            float q2[4] = { 0, 0, 0, 1 };
-            if (!(flags & 0x10)) quat_get(im, H[2], cpa_u16(im, key + 0x14), q);
-            if (!(cpa_u16(im, nk + 0x12) & 0x10)) quat_get(im, H[2], cpa_u16(im, nk + 0x14), q2);
-            if (mode & 1) slerp_tab(q, q2, t, (int)(int16_t)cpa_u16(im, key + 0x1C), q); else slerp(q, q2, t, q);
-        } else if (!(flags & 0x10)) quat_get(im, H[2], cpa_u16(im, key + 0x14), q);
-        key_T(im, H[1], key, T);
-        if (t > 0 && nk && !(flags & 8)) { float T2[3]; key_T(im, H[1], nk, T2); for (int i = 0; i < 3; i++) T[i] += (T2[i] - T[i]) * t; }
-        /* Scale (INFERRED from FUN_8c0819c0 structure + oracle fit): active iff (flags & 0x44) != 0x44 and (t != 0 || !(flags & 0x40));
-         * vector = lerp(H1[key+0x18], H1[next+0x18], t); axes quaternion qB = H2[key+0x16] (slerped to the next key's when t != 0 and !(flags & 2)). */
-        S[0] = S[1] = S[2] = 1.f;
+        /* Faithful port of FUN_8c0819c0 as called by FUN_8c0823c0 (mode argument 0).
+         * Rotation: t == 0 or flag 0x01 -> own qA (identity when flag 0x10); else table slerp qA(key)->qA(next) with theta = key+0x1C (flag 0x10 is NOT tested in the blend).
+         * Scale (active iff (flags & 0x44) != 0x44 and (t != 0 || !(flags & 0x40))): S = lerp(H1[key+0x18], H1[next+0x18], t).
+         *   (t == 0 or flag 0x02): flag 0x20 -> no axes quaternion; else qB = H2[key+0x16]; (t != 0 and no flag 0x02): qB = table slerp(key+0x16, next+0x16, theta key+0x1E).
+         *   If |S0-S1| < 0.01 and |S0-S2| < 0.01 the scale is UNIFORM s = S0 (rows of the rotation multiplied by s: FUN_8c016264), else
+         *   F = diag(S) * R (no axes quaternion) or F = (Rb diag(S) Rb^T) * R.
+         * Translation: t == 0 or flag 0x08 -> H1[key+0x1A]*|T|; else cached float3 lerp (fmaf) minus pivot*F with pivot = H1[H6row u16@4] (mode argument 0 path). */
+        float q[4] = { 0, 0, 0, 1 }, T[3], S[3] = { 1, 1, 1 }, Rm[9] = { 1,0,0, 0,1,0, 0,0,1 }, F[9];
+        int blend = t > 0 && nk && !(flags & 1);
+        if (blend) {
+            float qa[4], q2[4];
+            quat_get(im, H[2], cpa_u16(im, key + 0x14), qa); quat_get(im, H[2], cpa_u16(im, nk + 0x14), q2);
+            if (mode & 1) slerp_tab(qa, q2, t, (int)(int16_t)cpa_u16(im, key + 0x1C), q); else slerp(qa, q2, t, q);
+            quat_to_m3(q, Rm);
+        } else if (!(flags & 0x10)) { quat_get(im, H[2], cpa_u16(im, key + 0x14), q); quat_to_m3(q, Rm); }
+        memcpy(F, Rm, sizeof F);
         float qb[4] = { 0, 0, 0, 1 };
         int scaleOn = (flags & 0x44) != 0x44 && (t != 0 || !(flags & 0x40));
         if (scaleOn) {
-            uint16_t vs = cpa_u16(im, key + 0x18);
-            for (int i = 0; i < 3; i++) S[i] = cpa_f32(im, H[1] + 12u * vs + 4u * i);
-            if (t > 0 && nk) {
-                uint16_t vn = cpa_u16(im, nk + 0x18);
-                for (int i = 0; i < 3; i++) S[i] += (cpa_f32(im, H[1] + 12u * vn + 4u * i) - S[i]) * t;
+            uint16_t vs = cpa_u16(im, key + 0x18), vn = nk ? cpa_u16(im, nk + 0x18) : vs;
+            for (int i = 0; i < 3; i++) {
+                float a0 = cpa_f32(im, H[1] + 12u * vs + 4u * i), b0 = cpa_f32(im, H[1] + 12u * vn + 4u * i);
+                S[i] = fmaf(t, b0 - a0, a0);
             }
-            quat_get(im, H[2], cpa_u16(im, key + 0x16), qb);
-            if (t > 0 && nk && !(flags & 2)) { float qn[4]; quat_get(im, H[2], cpa_u16(im, nk + 0x16), qn); slerp(qb, qn, t, qb); }
+            int useQb = 0;
+            if (t != 0 && nk && !(flags & 2)) {
+                float qa[4], qn[4];
+                quat_get(im, H[2], cpa_u16(im, key + 0x16), qa); quat_get(im, H[2], cpa_u16(im, nk + 0x16), qn);
+                if (mode & 1) slerp_tab(qa, qn, t, (int)(int16_t)cpa_u16(im, key + 0x1E), qb); else slerp(qa, qn, t, qb);
+                useQb = 1;
+            } else if (!(flags & 0x20)) { quat_get(im, H[2], cpa_u16(im, key + 0x16), qb); useQb = 1; }
+            int uniform = (mode & 4) ? 0 : (fabsf(S[0] - S[1]) < 0.01f && fabsf(S[0] - S[2]) < 0.01f);
+            if (uniform) { for (int i = 0; i < 9; i++) F[i] = Rm[i] * S[0]; }
+            else if (!useQb) { for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) F[i * 3 + j] = Rm[i * 3 + j] * S[i]; }
+            else {
+                float Rb[9], Tm[9], Mt[9];
+                quat_to_m3(qb, Rb);
+                for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) Tm[i * 3 + j] = Rb[i * 3 + j] * S[j];
+                for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { float v = 0; for (int k = 0; k < 3; k++) v += Tm[i * 3 + k] * Rb[j * 3 + k]; Mt[i * 3 + j] = v; }
+                Mt[8] = ((S[1] + S[2]) - Mt[4] - Mt[0]) + S[0];
+                m3_mul(Mt, Rm, F);
+            }
         }
-        quat_to_m3(q, C->rot);
-        C->hasScale = fabsf(S[0] - 1) > 1e-6f || fabsf(S[1] - 1) > 1e-6f || fabsf(S[2] - 1) > 1e-6f;
-        if (C->hasScale) {   /* INFERRED order: R = (Rb diag(S) Rb^T) R */
-            float Rb[9], RbT[9], D[9] = { S[0],0,0, 0,S[1],0, 0,0,S[2] }, t1[9], t2[9];
-            quat_to_m3(qb, Rb);
-            for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) RbT[i * 3 + j] = Rb[j * 3 + i];
-            m3_mul(Rb, D, t1); m3_mul(t1, RbT, t2); m3_mul(t2, C->rot, C->rot);
+        key_T(im, H[1], key, T);
+        if (t > 0 && nk && !(flags & 8)) {
+            /* FUN_8c0819c0 with its mode argument 0 (as called by FUN_8c0823c0): the cached float3 of the keys is the pivot-compensated translation, so
+             * T = lerp(cached T) - pivot * F, pivot = H1[H6 row u16@4] (a zero vector for most channels), F = the final scaled/rotated 3x3 (row-vector product). */
+            float piv[3]; uint16_t pi = cpa_u16(im, r6 + 4);
+            for (int i = 0; i < 3; i++) { float a0 = cpa_f32(im, key + 4u * i), b0 = cpa_f32(im, nk + 4u * i); T[i] = fmaf(t, b0 - a0, a0); piv[i] = cpa_f32(im, H[1] + 12u * pi + 4u * i); }
+            for (int j = 0; j < 3; j++) T[j] -= piv[0] * F[j] + piv[1] * F[3 + j] + piv[2] * F[6 + j];
         }
+        memcpy(C->rot, F, sizeof F);
+        C->hasScale = scaleOn;
         memcpy(C->q, q, sizeof q); memcpy(C->T, T, sizeof T); memcpy(C->S, S, sizeof S);
     }
     return 1;

@@ -84,6 +84,11 @@ int main(int argc, char **argv) {
                 if (eR > fRot) fRot = eR; if (eT > fT) fT = eT; if (eW > fW) fW = eW; if (eO > fO) fO = eO;
                 double m = eR > eT ? eR : eT; if (eW > m) m = eW; if (eO > m) m = eO;
                 if (m > worstVal) { worstVal = m; worstCh = (int)k; }
+                if (vso == a.so && (eR > tol || eT > tol)) {   /* diagnostic: does the guest local match the native pose of a neighbouring frame (one-frame lag / lead)? */
+                    for (int d = -2; d <= 2; d++) { if (!d) continue; CpaAnimPose Pq; if (!cpa_anim_eval(&A, a.animIdx, (unsigned)((int)a.frame + d), CPA_ANIM_BEST, &Pq)) continue;
+                        for (unsigned q = 0; q < Pq.nCh; q++) if (Pq.ch[q].slot == g->slot) { float Lq[16]; cpa_anim_chan_matrix(&Pq.ch[q], Lq); float b9q[9]; for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) b9q[i * 3 + j] = Lq[i * 4 + j];
+                            printf("  ALT f%u slot %u frame%+d: rot %.2e T %.2e\n", h[1], g->slot, d, mdiff(a9, b9q, 9), mdiff(g->L + 12, Lq + 12, 3)); } }
+                }
                 if (vso == a.so && m > tol) printf("  VERBOSE f%u anim %u/%u ch%u slot %u kf %04X t %.3f lock %u stale %u parent guest %d native %d | rot %.2e T %.2e world %.2e objM %.2e\n", h[1], a.animIdx, a.frame, k, g->slot, C->kflags, C->t, g->lock, g->stale, g->parent, Rs.parentSlot[C->slot], eR, eT, eW, eO);
             }
             if (lockAny) S->lockFrames++;
