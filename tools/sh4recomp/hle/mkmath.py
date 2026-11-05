@@ -13,11 +13,8 @@ usage: python3 hle/mkmath.py [gen_fix|gen] ADDR [ADDR ...]   (writes hle/mathhoo
 import re, sys, os, glob
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-args_ = sys.argv[1:]
 gen = "gen_fix"
-if args_ and args_[0] in ("gen", "gen_fix"):
-    gen = args_.pop(0)
-addrs = args_ or ["8c07be60"]
+addrs = []
 
 
 def find_fn(addr):
@@ -63,7 +60,8 @@ class Unsupported(Exception):
     pass
 
 
-def localise(addr, body):
+def localise(addr, body, sq=False):
+    """sq=True (hle/mkgeom.py): ST32 -> STQ (store-queue window written straight into sh4_sq_buf, same bytes as sh4_io_write), sh4_pref / fp_cmp supported"""
     used_r, used_fr = set(), set()
     uses_fpul = False
     for m in re.finditer(r"c->([a-z_]+)", body):
@@ -75,11 +73,11 @@ def localise(addr, body):
         raise Unsupported("gbr write")
     for m in re.finditer(r"\b(sh4_\w+|fp_\w+|f_[0-9a-f]{8})\(c[,)]", body):
         n = m.group(1)
-        if n not in ("sh4_call", "fp_ld", "fp_st", "fp_arith", "fp_fmac", "fp_mov", "fp_ftrc", "fp_float", "fp_sz") and not re.match(r"f_[0-9a-f]{8}$", n):
+        if n not in ("sh4_call", "fp_ld", "fp_st", "fp_arith", "fp_fmac", "fp_mov", "fp_ftrc", "fp_float", "fp_sz") and not (sq and n in ("sh4_pref", "fp_cmp")) and not re.match(r"f_[0-9a-f]{8}$", n):
             raise Unsupported(n)
     # --- fp helper calls (balanced) ---
     out, i = "", 0
-    pat = re.compile(r"\b(fp_ld|fp_st|fp_arith|fp_fmac|fp_mov|fp_ftrc|fp_float)\(c,")
+    pat = re.compile(r"\b(fp_ld|fp_st|fp_arith|fp_fmac|fp_mov|fp_ftrc|fp_float|fp_cmp)\(c,")
     while True:
         m = pat.search(body, i)
         if not m:
@@ -104,11 +102,16 @@ def localise(addr, body):
             n, mm = int(args[0]), int(args[1]); used_fr.update((n, mm)); out += "fr%d=fr%d" % (n, mm)
         elif k == "fp_ftrc":
             n = int(args[0]); used_fr.add(n); uses_fpul = True; out += "fpul_=fp_sat((double)fin(c,fr%d))" % n
+        elif k == "fp_cmp":
+            op, n, mm = int(args[0]), int(args[1]), int(args[2]); used_fr.update((n, mm))
+            out += "t_=(fin(c,fr%d) %s fin(c,fr%d))" % (n, ">" if op else "==", mm)
         elif k == "fp_float":
             n = int(args[0]); used_fr.add(n); uses_fpul = True; out += "fr%d=fout(c,(float)(int32_t)fpul_)" % n
         i = e
     body = re.sub(r"c->fr\[(\d+)\]", lambda m: (used_fr.add(int(m.group(1))), "fr%s" % m.group(1))[1], out)
     body = body.replace("fp_sz(c)", "4u")
+    if sq:
+        body = body.replace("ST32(", "STQ(")
     body = re.sub(r"\bR\((\d+)\)", lambda m: (used_r.add(int(m.group(1))), "r%s" % m.group(1))[1], body)
     body = body.replace("c->t", "t_").replace("c->pr", "pr_").replace("c->gbr", "gbr_").replace("c->fpul", "fpul_")
     if "fpul_" in body:
@@ -117,9 +120,11 @@ def localise(addr, body):
     reload = "".join("r%d=c->r[%d];" % (i, i) for i in sorted(used_r)) + "".join("fr%d=c->fr[%d];" % (i, i) for i in sorted(used_fr)) + "t_=c->t;pr_=c->pr;" + ("fpul_=c->fpul;" if uses_fpul else "")
     # --- calls out of the function: spill, call by address (hook-aware), reload; one pass so nothing is wrapped twice ---
     def call(m):
+        if m.group(3) is not None:
+            return "{%s GEOM_PREF(c,%s);%s}" % (spill, m.group(3), reload)
         tgt = "0x%su" % m.group(1) if m.group(1) else m.group(2)
         return "{%s sh4_call(c,%s);%s}" % (spill, tgt, reload)
-    body = re.sub(r"\b(?:f_([0-9a-f]{8})\(c\)|sh4_call\(c,([^;]*)\));", call, body)
+    body = re.sub(r"\b(?:f_([0-9a-f]{8})\(c\)|sh4_call\(c,([^;]*)\)|sh4_pref\(c,([^;]*)\));", call, body)
     body = re.sub(r"\breturn;", lambda m: "{%s return; }" % spill, body)
     decl = "".join("    uint32_t r%d=c->r[%d];\n" % (i, i) for i in sorted(used_r))
     decl += "".join("    uint32_t fr%d=c->fr[%d];\n" % (i, i) for i in sorted(used_fr))
@@ -206,6 +211,11 @@ static void chk_run(SH4Ctx *c, int idx, void (*fast)(SH4Ctx *)) {
 
 
 def main():
+    global gen, addrs
+    args_ = sys.argv[1:]
+    if args_ and args_[0] in ("gen", "gen_fix"):
+        gen = args_.pop(0)
+    addrs = args_ or ["8c07be60"]
     fns, skipped = [], []
     for a in addrs:
         a = a.lower().replace("0x", "")
@@ -236,4 +246,5 @@ def main():
     sys.stderr.write("generated hle/mathhooks.c: %s\n" % ", ".join("f_" + a for a, _, _ in fns))
 
 
-main()
+if __name__ == "__main__":
+    main()

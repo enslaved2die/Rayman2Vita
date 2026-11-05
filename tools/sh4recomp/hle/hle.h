@@ -53,6 +53,7 @@ void     hle_reg_set(uint32_t addr, uint32_t v);
 /* `pref @Rn` handler. Default (boot.c): ignore. ta.c installs its own: it gets the guest address in Rn (0xE0000000..0xE3FFFFFF for SQ). */
 typedef void (*hle_pref_fn)(SH4Ctx *c, uint32_t addr);
 void hle_set_pref_handler(hle_pref_fn fn);
+hle_pref_fn hle_get_pref_handler(void);
 
 /* ---- frame / time services provided by boot.c ---- */
 extern unsigned long hle_frame_count;          /* number of kamui end-of-frame (flip) events seen */

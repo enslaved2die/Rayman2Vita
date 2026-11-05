@@ -156,6 +156,7 @@ HLE_SRCS        := $(HLE_DIR)/boot.c \
                    $(HLE_DIR)/dbg.c \
                    $(HLE_DIR)/io.c \
                    $(HLE_DIR)/mathhooks.c \
+                   $(HLE_DIR)/geomhooks.c \
                    $(HLE_DIR)/pad.c \
                    $(HLE_DIR)/perf.c \
                    $(HLE_DIR)/r2prof.c \
