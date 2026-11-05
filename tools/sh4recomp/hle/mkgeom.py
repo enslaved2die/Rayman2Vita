@@ -42,6 +42,16 @@ static inline uint32_t L_fmac(SH4Ctx *c, uint32_t f0, uint32_t m, uint32_t n) { 
 static inline uint32_t L_fmac(SH4Ctx *c, uint32_t f0, uint32_t m, uint32_t n) { return fout(c, fmaf(fin(c, f0), fin(c, m), fin(c, n))); }
 #endif
 
+/* host diagnostic -DR2_GEOM_STATS: per hook, entries and fallbacks to the original body (by FPSCR.SZ / FPSCR.PR), printed at exit */
+#ifdef R2_GEOM_STATS
+static struct { unsigned long n, fb_sz, fb_pr; } geom_st[%(n)d];
+static const char *geom_nm[%(n)d] = { %(names)s };
+static void geom_stat_report(void) { for (int i = 0; i < %(n)d; i++) fprintf(stderr, "[geom-stats] %%s: %%lu entries, fallbacks to original: SZ=1 %%lu, PR=1 %%lu\n", geom_nm[i], geom_st[i].n, geom_st[i].fb_sz, geom_st[i].fb_pr); }
+static void GEOM_STAT_ENTER(int i, SH4Ctx *c) { static int init; if (!init) { init = 1; atexit(geom_stat_report); } geom_st[i].n++; if (c->fpscr & SH4_FPSCR_SZ) geom_st[i].fb_sz++; else if (c->fpscr & SH4_FPSCR_PR) geom_st[i].fb_pr++; }
+#else
+#define GEOM_STAT_ENTER(i, c) ((void)0)
+#endif
+
 /* 32-bit guest store: SQ window straight into the SQ buffer (== runtime.c sh4_io_write for 0xE0..), everything else as ST32 */
 static inline void STQ(uint32_t a, uint32_t v) {
     if (SH4_LIKELY((a & 0xFC000000u) == 0xE0000000u)) memcpy(sh4_sq_buf + (a & 0x3F), &v, 4);
@@ -171,11 +181,12 @@ def main():
         fns.append((a, decl, code))
     for a, why in skipped:
         sys.stderr.write("skipped f_%s: unsupported construct %s\n" % (a, why))
-    o = [HEAD]
+    o = [HEAD % dict(n=len(fns), names=", ".join('"f_%s"' % a for a, _, _ in fns))]
     for a, decl, code in fns:
         o.append("static void h_geom_%s(SH4Ctx *c) {\n"
+                 "    GEOM_STAT_ENTER(%d, c);\n"
                  "    if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x%s); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */\n"
-                 "    HLE_ENTER(0x%s);\n%s%s}\n\n" % (a, a.upper(), a.upper(), decl, code))
+                 "    HLE_ENTER(0x%s);\n%s%s}\n\n" % (a, [x[0] for x in fns].index(a), a.upper(), a.upper(), decl, code))
     n = len(fns)
     o.append(CHK % dict(n=n, names=", ".join('"f_%s"' % a for a, _, _ in fns), addrs=", ".join("0x%sU" % a.upper() for a, _, _ in fns)))
     o.append("#ifdef R2_CHK_GEOM\n")

@@ -22,6 +22,16 @@ static inline uint32_t L_fmac(SH4Ctx *c, uint32_t f0, uint32_t m, uint32_t n) { 
 static inline uint32_t L_fmac(SH4Ctx *c, uint32_t f0, uint32_t m, uint32_t n) { return fout(c, fmaf(fin(c, f0), fin(c, m), fin(c, n))); }
 #endif
 
+/* host diagnostic -DR2_GEOM_STATS: per hook, entries and fallbacks to the original body (by FPSCR.SZ / FPSCR.PR), printed at exit */
+#ifdef R2_GEOM_STATS
+static struct { unsigned long n, fb_sz, fb_pr; } geom_st[10];
+static const char *geom_nm[10] = { "f_8c0352d6", "f_8c035228", "f_8c03525e", "f_8c035780", "f_8c035f40", "f_8c035920", "f_8c0353c0", "f_8c035be0", "f_8c034480", "f_8c0e3e90" };
+static void geom_stat_report(void) { for (int i = 0; i < 10; i++) fprintf(stderr, "[geom-stats] %s: %lu entries, fallbacks to original: SZ=1 %lu, PR=1 %lu\n", geom_nm[i], geom_st[i].n, geom_st[i].fb_sz, geom_st[i].fb_pr); }
+static void GEOM_STAT_ENTER(int i, SH4Ctx *c) { static int init; if (!init) { init = 1; atexit(geom_stat_report); } geom_st[i].n++; if (c->fpscr & SH4_FPSCR_SZ) geom_st[i].fb_sz++; else if (c->fpscr & SH4_FPSCR_PR) geom_st[i].fb_pr++; }
+#else
+#define GEOM_STAT_ENTER(i, c) ((void)0)
+#endif
+
 /* 32-bit guest store: SQ window straight into the SQ buffer (== runtime.c sh4_io_write for 0xE0..), everything else as ST32 */
 static inline void STQ(uint32_t a, uint32_t v) {
     if (SH4_LIKELY((a & 0xFC000000u) == 0xE0000000u)) memcpy(sh4_sq_buf + (a & 0x3F), &v, 4);
@@ -29,6 +39,7 @@ static inline void STQ(uint32_t a, uint32_t v) {
 }
 
 static void h_geom_8c0352d6(SH4Ctx *c) {
+    GEOM_STAT_ENTER(0, c);
     if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C0352D6); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
     HLE_ENTER(0x8C0352D6);
     uint32_t r0=c->r[0];
@@ -131,7 +142,125 @@ static void h_geom_8c0352d6(SH4Ctx *c) {
   { {uint32_t v=LD32(r15);r15+=4;r13=v;} {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[12]=r12;c->r[13]=r13;c->r[15]=r15;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; return; } }
 }
 
+static void h_geom_8c035228(SH4Ctx *c) {
+    GEOM_STAT_ENTER(1, c);
+    if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C035228); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
+    HLE_ENTER(0x8C035228);
+    uint32_t r0=c->r[0];
+    uint32_t r2=c->r[2];
+    uint32_t r3=c->r[3];
+    uint32_t r4=c->r[4];
+    uint32_t r5=c->r[5];
+    uint32_t r6=c->r[6];
+    uint32_t r7=c->r[7];
+    uint32_t t_=c->t, pr_=c->pr; const uint32_t gbr_=c->gbr;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+48);
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r5=r0;
+  r3<<=2;
+  r6=r0;
+  r5+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r6+=r3;
+  r3=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d04u;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r7+=r3;
+  STQ(r4,r7);
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  { {uint32_t v=r5;r4-=4;STQ(r4,v);} {c->r[0]=r0;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->t=t_;c->pr=pr_; return; } }
+}
+
+static void h_geom_8c03525e(SH4Ctx *c) {
+    GEOM_STAT_ENTER(2, c);
+    if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C03525E); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
+    HLE_ENTER(0x8C03525E);
+    uint32_t r0=c->r[0];
+    uint32_t r1=c->r[1];
+    uint32_t r2=c->r[2];
+    uint32_t r3=c->r[3];
+    uint32_t r4=c->r[4];
+    uint32_t r5=c->r[5];
+    uint32_t r6=c->r[6];
+    uint32_t r7=c->r[7];
+    uint32_t r12=c->r[12];
+    uint32_t r14=c->r[14];
+    uint32_t r15=c->r[15];
+    uint32_t t_=c->t, pr_=c->pr; const uint32_t gbr_=c->gbr;
+  {uint32_t v=r14;r15-=4;STQ(r15,v);}
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r15+=0xfffffffcu;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+0);
+  r3<<=2;
+  t_=r3>>31;r3<<=1;
+  r6=r0;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r14=r0;
+  r2=(int32_t)(int16_t)LD16(r5);
+  r3<<=2;
+  r5=0x8c140d34u;
+  t_=r3>>31;r3<<=1;
+  r2<<=2;
+  t_=r2>>31;r2<<=1;
+  r7+=r2;
+  STQ(r5,r7);
+  r14+=r3;
+  {uint32_t v=r14;r5-=4;STQ(r5,v);}
+  {uint32_t v=r6;r5-=4;STQ(r5,v);}
+  r0=LD32(gbr_+52);
+  r3=(int32_t)(int16_t)LD16(r4);
+  r5=r0;
+  r1=r0;
+  r3<<=2;
+  r7=r0;
+  r5+=r3;
+  r0=LD32(gbr_+56);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r12=r0;
+  r14=r0;
+  r6=r0;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r3<<=2;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r2<<=2;
+  r7+=r2;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d14u;
+  r3<<=2;
+  r2<<=2;
+  r1+=r2;
+  STQ(r15,r2);
+  STQ(r4,r1);
+  r12+=r2;
+  {uint32_t v=r7;r4-=4;STQ(r4,v);}
+  r14+=r3;
+  {uint32_t v=r5;r4-=4;STQ(r4,v);}
+  r4=0x8c140d24u;
+  STQ(r4,r12);
+  {uint32_t v=r14;r4-=4;STQ(r4,v);}
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  r15+=0x4u;
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;} {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[12]=r12;c->r[14]=r14;c->r[15]=r15;c->t=t_;c->pr=pr_; return; } }
+}
+
 static void h_geom_8c035780(SH4Ctx *c) {
+    GEOM_STAT_ENTER(3, c);
     if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C035780); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
     HLE_ENTER(0x8C035780);
     uint32_t r0=c->r[0];
@@ -319,122 +448,8 @@ L8c0358d8:;
   { {uint32_t v=LD32(r15);r15+=4;r14=v;} {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; return; } }
 }
 
-static void h_geom_8c035228(SH4Ctx *c) {
-    if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C035228); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
-    HLE_ENTER(0x8C035228);
-    uint32_t r0=c->r[0];
-    uint32_t r2=c->r[2];
-    uint32_t r3=c->r[3];
-    uint32_t r4=c->r[4];
-    uint32_t r5=c->r[5];
-    uint32_t r6=c->r[6];
-    uint32_t r7=c->r[7];
-    uint32_t t_=c->t, pr_=c->pr; const uint32_t gbr_=c->gbr;
-  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
-  r0=LD32(gbr_+48);
-  r2=r3;
-  t_=r3>>31;r3<<=1;
-  r3+=r2;
-  r5=r0;
-  r3<<=2;
-  r6=r0;
-  r5+=r3;
-  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
-  r7=r0;
-  r2=r3;
-  t_=r3>>31;r3<<=1;
-  r3+=r2;
-  r3<<=2;
-  r6+=r3;
-  r3=(int32_t)(int16_t)LD16(r4);
-  r4=0x8c140d04u;
-  r2=r3;
-  t_=r3>>31;r3<<=1;
-  r3+=r2;
-  r3<<=2;
-  r7+=r3;
-  STQ(r4,r7);
-  {uint32_t v=r6;r4-=4;STQ(r4,v);}
-  { {uint32_t v=r5;r4-=4;STQ(r4,v);} {c->r[0]=r0;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->t=t_;c->pr=pr_; return; } }
-}
-
-static void h_geom_8c03525e(SH4Ctx *c) {
-    if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C03525E); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
-    HLE_ENTER(0x8C03525E);
-    uint32_t r0=c->r[0];
-    uint32_t r1=c->r[1];
-    uint32_t r2=c->r[2];
-    uint32_t r3=c->r[3];
-    uint32_t r4=c->r[4];
-    uint32_t r5=c->r[5];
-    uint32_t r6=c->r[6];
-    uint32_t r7=c->r[7];
-    uint32_t r12=c->r[12];
-    uint32_t r14=c->r[14];
-    uint32_t r15=c->r[15];
-    uint32_t t_=c->t, pr_=c->pr; const uint32_t gbr_=c->gbr;
-  {uint32_t v=r14;r15-=4;STQ(r15,v);}
-  {uint32_t v=r12;r15-=4;STQ(r15,v);}
-  r15+=0xfffffffcu;
-  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
-  r0=LD32(gbr_+0);
-  r3<<=2;
-  t_=r3>>31;r3<<=1;
-  r6=r0;
-  r6+=r3;
-  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
-  r7=r0;
-  r14=r0;
-  r2=(int32_t)(int16_t)LD16(r5);
-  r3<<=2;
-  r5=0x8c140d34u;
-  t_=r3>>31;r3<<=1;
-  r2<<=2;
-  t_=r2>>31;r2<<=1;
-  r7+=r2;
-  STQ(r5,r7);
-  r14+=r3;
-  {uint32_t v=r14;r5-=4;STQ(r5,v);}
-  {uint32_t v=r6;r5-=4;STQ(r5,v);}
-  r0=LD32(gbr_+52);
-  r3=(int32_t)(int16_t)LD16(r4);
-  r5=r0;
-  r1=r0;
-  r3<<=2;
-  r7=r0;
-  r5+=r3;
-  r0=LD32(gbr_+56);
-  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
-  r12=r0;
-  r14=r0;
-  r6=r0;
-  r2=(int32_t)(int16_t)LD16(r4);
-  r3<<=2;
-  r6+=r3;
-  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
-  r2<<=2;
-  r7+=r2;
-  r2=(int32_t)(int16_t)LD16(r4);
-  r4=0x8c140d14u;
-  r3<<=2;
-  r2<<=2;
-  r1+=r2;
-  STQ(r15,r2);
-  STQ(r4,r1);
-  r12+=r2;
-  {uint32_t v=r7;r4-=4;STQ(r4,v);}
-  r14+=r3;
-  {uint32_t v=r5;r4-=4;STQ(r4,v);}
-  r4=0x8c140d24u;
-  STQ(r4,r12);
-  {uint32_t v=r14;r4-=4;STQ(r4,v);}
-  {uint32_t v=r6;r4-=4;STQ(r4,v);}
-  r15+=0x4u;
-  {uint32_t v=LD32(r15);r15+=4;r12=v;}
-  { {uint32_t v=LD32(r15);r15+=4;r14=v;} {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[12]=r12;c->r[14]=r14;c->r[15]=r15;c->t=t_;c->pr=pr_; return; } }
-}
-
 static void h_geom_8c035f40(SH4Ctx *c) {
+    GEOM_STAT_ENTER(4, c);
     if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C035F40); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
     HLE_ENTER(0x8C035F40);
     uint32_t r0=c->r[0];
@@ -629,6 +644,7 @@ L8c036082:;
 }
 
 static void h_geom_8c035920(SH4Ctx *c) {
+    GEOM_STAT_ENTER(5, c);
     if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C035920); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
     HLE_ENTER(0x8C035920);
     uint32_t r0=c->r[0];
@@ -957,6 +973,7 @@ L8c035ba0:;
 }
 
 static void h_geom_8c0353c0(SH4Ctx *c) {
+    GEOM_STAT_ENTER(6, c);
     if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C0353C0); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
     HLE_ENTER(0x8C0353C0);
     uint32_t r0=c->r[0];
@@ -1351,6 +1368,7 @@ L8c035726:;
 }
 
 static void h_geom_8c035be0(SH4Ctx *c) {
+    GEOM_STAT_ENTER(7, c);
     if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C035BE0); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
     HLE_ENTER(0x8C035BE0);
     uint32_t r0=c->r[0];
@@ -1651,6 +1669,7 @@ L8c035e10:;
 }
 
 static void h_geom_8c034480(SH4Ctx *c) {
+    GEOM_STAT_ENTER(8, c);
     if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C034480); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
     HLE_ENTER(0x8C034480);
     uint32_t r0=c->r[0];
@@ -2331,6 +2350,7 @@ L8c034a76:;
 }
 
 static void h_geom_8c0e3e90(SH4Ctx *c) {
+    GEOM_STAT_ENTER(9, c);
     if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C0E3E90); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
     HLE_ENTER(0x8C0E3E90);
     uint32_t r0=c->r[0];
@@ -2372,8 +2392,8 @@ static uint8_t chk_dirty[CHK_NPG];
 static ChkPref chk_logA[CHK_MAXPREF], chk_logB[CHK_MAXPREF];
 static unsigned chk_nA, chk_nB, chk_over;
 static struct { unsigned long calls, nested, bad_ctx, bad_ram, bad_sq, bad_pref; double t_orig, t_fast; } chk_st[10];
-static const char *chk_names[10] = { "f_8c0352d6", "f_8c035780", "f_8c035228", "f_8c03525e", "f_8c035f40", "f_8c035920", "f_8c0353c0", "f_8c035be0", "f_8c034480", "f_8c0e3e90" };
-static const uint32_t chk_addrs[10] = { 0x8C0352D6U, 0x8C035780U, 0x8C035228U, 0x8C03525EU, 0x8C035F40U, 0x8C035920U, 0x8C0353C0U, 0x8C035BE0U, 0x8C034480U, 0x8C0E3E90U };
+static const char *chk_names[10] = { "f_8c0352d6", "f_8c035228", "f_8c03525e", "f_8c035780", "f_8c035f40", "f_8c035920", "f_8c0353c0", "f_8c035be0", "f_8c034480", "f_8c0e3e90" };
+static const uint32_t chk_addrs[10] = { 0x8C0352D6U, 0x8C035228U, 0x8C03525EU, 0x8C035780U, 0x8C035F40U, 0x8C035920U, 0x8C0353C0U, 0x8C035BE0U, 0x8C034480U, 0x8C0E3E90U };
 static unsigned long chk_every, chk_seq;
 static int chk_mode;                 /* 0 = top level, 1 = running the original (nested hooked calls take their original too), 2 = running the hooks */
 static unsigned long chk_pref_total;
@@ -2464,9 +2484,9 @@ static void chk_run(SH4Ctx *c, int idx, void (*fast)(SH4Ctx *)) {
 #endif
 #ifdef R2_CHK_GEOM
 static void chk_8c0352d6(SH4Ctx *c) { chk_run(c, 0, h_geom_8c0352d6); }
-static void chk_8c035780(SH4Ctx *c) { chk_run(c, 1, h_geom_8c035780); }
-static void chk_8c035228(SH4Ctx *c) { chk_run(c, 2, h_geom_8c035228); }
-static void chk_8c03525e(SH4Ctx *c) { chk_run(c, 3, h_geom_8c03525e); }
+static void chk_8c035228(SH4Ctx *c) { chk_run(c, 1, h_geom_8c035228); }
+static void chk_8c03525e(SH4Ctx *c) { chk_run(c, 2, h_geom_8c03525e); }
+static void chk_8c035780(SH4Ctx *c) { chk_run(c, 3, h_geom_8c035780); }
 static void chk_8c035f40(SH4Ctx *c) { chk_run(c, 4, h_geom_8c035f40); }
 static void chk_8c035920(SH4Ctx *c) { chk_run(c, 5, h_geom_8c035920); }
 static void chk_8c0353c0(SH4Ctx *c) { chk_run(c, 6, h_geom_8c0353c0); }
@@ -2484,11 +2504,6 @@ void hle_geomhooks_init(void) {
     hle_hook(0x8C0352D6, h_geom_8c0352d6);
 #endif
 #ifdef R2_CHK_GEOM
-    hle_hook(0x8C035780, chk_8c035780);
-#else
-    hle_hook(0x8C035780, h_geom_8c035780);
-#endif
-#ifdef R2_CHK_GEOM
     hle_hook(0x8C035228, chk_8c035228);
 #else
     hle_hook(0x8C035228, h_geom_8c035228);
@@ -2497,6 +2512,11 @@ void hle_geomhooks_init(void) {
     hle_hook(0x8C03525E, chk_8c03525e);
 #else
     hle_hook(0x8C03525E, h_geom_8c03525e);
+#endif
+#ifdef R2_CHK_GEOM
+    hle_hook(0x8C035780, chk_8c035780);
+#else
+    hle_hook(0x8C035780, h_geom_8c035780);
 #endif
 #ifdef R2_CHK_GEOM
     hle_hook(0x8C035F40, chk_8c035f40);
