@@ -198,6 +198,48 @@ static void test_handle_exhaustion(void) {
     call(0x8C012ACC, SLOT(0), 0, 0);
 }
 
+/* host fd cache + lazy open: more live handles than cache entries, shared files, close/reopen, handles that are never read */
+static void test_fd_cache(void) {
+    static const char *const names[] = { "DCDATA\\FIX.DAT", "DCDATA\\FIX.TMP", "DCDATA\\FIX.TEX", "DCDATA\\LEARN_10\\LEARN_10.DAT", "DCDATA\\LEARN_10\\LEARN_10.TMP",
+        "DCDATA\\LEARN_10\\LEARN_10.TEX", "DCDATA\\Sound\\Banks\\BNK_0.DAT", "DCDATA\\Sound\\Banks\\BNK_0.OSB", "DCDATA\\Sound\\Drivers\\MANATEE.DRV", "DCDATA\\TEXTS\\ENGLISH.LNG" };
+    enum { NF = 10 };
+    uint32_t h[NF], lba[NF]; uint8_t *ref[NF]; size_t sz[NF]; int n = 0;
+    for (int i = 0; i < NF; i++) {                                          /* resolve + reference data, skip files absent from this asset tree */
+        char host[1024]; put_str(0x8C100000, names[i]); call(0x8C042B96, 0x8C100000, 0, 0);
+        if (!C.r[0] || hle_io_resolve(NULL, names[i], host, sizeof host)) continue;
+        lba[n] = LD32(C.r[0]); ref[n] = slurp(host, &sz[n]); n++;
+    }
+    CHECK(n >= 9);                                                          /* the cache holds 8 fds: needs more live handles than that */
+    uint32_t dst = 0x8C700000;
+    for (int round = 0; round < 3; round++) {
+        for (int i = 0; i < n; i++) { call(0x8C0CEFE8, lba[i] + 150, (int32_t)((sz[i] + 2047) >> 11), 0); h[i] = C.r[0]; CHECK(h[i] != 0); }
+        for (int i = 0; i < n; i++) {                                       /* read the first sector of every live handle (each opens its own fd lazily) */
+            if (!h[i]) continue; memset(hle_ptr(dst), 0xCC, 2048);
+            call(0x8C0CE802, h[i], 1, dst); CHECK(memcmp(hle_ptr(dst), ref[i], sz[i] < 2048 ? sz[i] : 2048) == 0);
+        }
+        for (int i = n - 1; i >= 0; i--) if (h[i]) call(0x8C0CE6D8, h[i], 0, 0);   /* close in reverse order */
+    }
+    /* two handles on one file share the cached fd; closing one must not break the other */
+    call(0x8C0CEFE8, lba[0] + 150, (int32_t)((sz[0] + 2047) >> 11), 0); uint32_t a = C.r[0];
+    call(0x8C0CEFE8, lba[0] + 150, (int32_t)((sz[0] + 2047) >> 11), 0); uint32_t b = C.r[0]; CHECK(a && b && a != b);
+    call(0x8C0CE802, a, 1, dst); call(0x8C0CE6D8, a, 0, 0);
+    memset(hle_ptr(dst), 0xCC, 2048); call(0x8C0CE802, b, 2, dst); CHECK(memcmp(hle_ptr(dst), ref[0], 4096 < sz[0] ? 4096 : sz[0]) == 0);
+    call(0x8C0CE6D8, b, 0, 0);
+    /* per-frame read ring ([slow] log line): reads are attributed to the first 3 distinct files (bytes summed, first sector), the rest are counted */
+    {   char buf[400]; extern void hle_io_note_reset(void); extern size_t hle_io_note_fmt(char *, size_t);
+        hle_io_note_reset(); CHECK(hle_io_note_fmt(buf, sizeof buf) == 0 && buf[0] == 0);
+        for (int i = 0; i < 5 && i < n; i++) { call(0x8C0CEFE8, lba[i] + 150, (int32_t)((sz[i] + 2047) >> 11), 0); uint32_t hh = C.r[0]; CHECK(hh != 0); call(0x8C0CE802, hh, 1, dst); if (i == 0) call(0x8C0CE802, hh, 1, dst); call(0x8C0CE6D8, hh, 0, 0); }
+        size_t len = hle_io_note_fmt(buf, sizeof buf); CHECK(len > 0 && len == strlen(buf));
+        CHECK(strstr(buf, " KB @sector ") != NULL); CHECK(n >= 5 ? strstr(buf, "+2 more reads") != NULL : 1);
+        char tiny[12]; size_t tl = hle_io_note_fmt(tiny, sizeof tiny); CHECK(tl < sizeof tiny && tl == strlen(tiny));       /* truncation never overruns */
+        hle_io_note_reset(); CHECK(hle_io_note_fmt(buf, sizeof buf) == 0);
+        printf("  note ring: %s\n", len ? "ok" : "empty");
+    }
+    /* handles opened and closed without a read (existence probes) leave nothing behind */
+    for (int i = 0; i < 200; i++) { call(0x8C0CEFE8, lba[i % n] + 150, 1, 0); CHECK(C.r[0] != 0); call(0x8C0CE6D8, C.r[0], 0, 0); }
+    for (int i = 0; i < n; i++) free(ref[i]);
+}
+
 static void test_legit_probes_and_scratch(void) {
     /* The game probes JINGLE8.wav under Banks then Music, and MM01..10.wav under Banks, Music, Music\English (+ full-path dir lookup).
      * Disc listing (ISO9660 track03) has JINGLE8.WAV only under SOUND/MUSIC and no MM*.WAV at all (MM.DCZ only): these failures are real. */
@@ -228,7 +270,7 @@ int main(void) {
     hle_io_init(ROOT);
     CHECK(nh >= 13);
     test_paths(); test_async_whole_file(); test_async_chunks_and_unaligned(); test_blocking(); test_open_failure();
-    test_dirmng_and_gdfs(); test_handle_exhaustion(); test_legit_probes_and_scratch();
+    test_dirmng_and_gdfs(); test_handle_exhaustion(); test_fd_cache(); test_legit_probes_and_scratch();
     printf("%d checks, %d failures\n", checks, fails);
     return fails != 0;
 }

@@ -33,7 +33,7 @@ extern "C" {
  * the AICA MMIO ranges are mapped from a constructor in snd.c, so the guest can always reach them. */
 int  snd_init(int out_rate);
 void snd_shutdown(void);
-/* Flush + close snd_trace.log (Vita: ux0:data/rayman2/snd_trace.log, always on; host: R2_SND_TRACELOG=<file>). Also runs atexit. */
+/* Flush + close snd_trace.log (Vita: ux0:data/rayman2/snd_trace.log, off by default, enable with an empty file ux0:data/rayman2/SND_TRACE; host: R2_SND_TRACELOG=<file>). Also runs atexit. */
 void snd_trace_close(void);
 
 /* Pull `frames` stereo frames (interleaved L,R int16) at the rate given to snd_init(); advances the emulated sound CPU/AICA in real

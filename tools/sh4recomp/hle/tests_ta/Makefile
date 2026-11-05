@@ -30,6 +30,10 @@ test-glcount: test_glcount.c ../vita_gl_render.c ../ta.c ../texmap.c
 	cc $(GLC_FLAGS) -c ../texmap.c -Dhle_ta_background=tm_bg -Dhle_ta_pvr_snapshot=tm_snap -Dhle_ta_fog_table=tm_fog -o texmap_glc.o
 	cc $(GLC_FLAGS) test_glcount.c fakegl/fakegl.c ../ta.c ../perf.c texmap_glc.o -lm -lpthread -o test_glcount
 	./test_glcount $(FRAMEDIR)/frame.bin $(FRAMEDIR)/vram.bin $(FRAMEDIR)/pvrregs.bin $(FRAMEDIR)/pvrfog.bin 6
+test-fogdefer: test_glcount.c ../vita_gl_render.c ../ta.c ../texmap.c
+	cc $(GLC_FLAGS) -c ../texmap.c -Dhle_ta_background=tm_bg -Dhle_ta_pvr_snapshot=tm_snap -Dhle_ta_fog_table=tm_fog -o texmap_glc.o
+	DUMPS="$(DUMPS)" REF="$(REF)" ./test_fogdefer.sh
+# make test-fogdefer DUMPS="dir1 dir2" [REF=<test_glcount built from the pre-change source>]: deferred fog passes vs interleaved (software rasteriser, byte-identical) + draw digest vs reference
 clean:
 	rm -f bench_ta bench_ta_vmath ta_ref.o test_ta test_ta_real test_tex test_glpath test_stamp test_glcount texmap_glc.o
 # make bench DUMPS="dir1 dir2 ...": micro-benchmark + bit-exactness of parse / build / depth cut / clip conversion vs the previous implementation (ta_ref.c); dump dirs come from R2_FRAMES=n1,n2 R2_DUMP_DIR=dir run_game (frame.bin + tastream.bin)

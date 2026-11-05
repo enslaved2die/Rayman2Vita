@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 FakeGl fg; FakeGlRec fgr;
+void (*fgr_draw_cb)(int, int); void (*fgr_clear_cb)(unsigned);
 void fgr_end_frame(void)
 {
     if (!fgr.out_open) { fgr.out_open = 1; fgr.trace = getenv("R2_GLTRACE") != NULL; const char *p = getenv("R2_GLDIGEST"); fgr.out = p && *p ? fopen(p, "w") : NULL; }

@@ -32,6 +32,7 @@ __attribute__((weak)) uint32_t r2_tr_last[8][64];
 __attribute__((weak)) uint32_t r2_tr_nlines;
 __attribute__((weak)) FILE *r2_tr_fp;
 __attribute__((weak)) int r2_tr_fp_tried;
+__attribute__((weak)) int r2_tr_off;     /* Vita: file ux0:data/rayman2/UI_TRACE absent (checked on the first call) -> r2_tr() returns at once; host: env R2_NO_UI_TRACE */
 __attribute__((weak)) char r2_tr_lvl[16];
 __attribute__((weak)) uint32_t r2_tr_gatefl = 0xffu;
 
@@ -40,22 +41,30 @@ static inline uint32_t r2_tr_frame(void) { return hle_time_us ? (uint32_t)(hle_t
 static inline void r2_tr(const char *fmt, ...) {
   char buf[400];
   va_list ap;
+  if (r2_tr_off) return;
+  if (!r2_tr_fp_tried) {
+    const char *p =
+#if defined(__vita__)
+        "ux0:data/rayman2/ui_trace.log";
+    { FILE *nf = fopen("ux0:data/rayman2/UI_TRACE", "rb"); if (nf) fclose(nf); else r2_tr_off = 1; }   /* Vita: OFF by default (one flushed SD write per line stalls the game thread); an empty file UI_TRACE turns it on */
+#else
+        getenv("R2_UI_TRACE");
+    if (getenv("R2_NO_UI_TRACE")) r2_tr_off = 1;
+#endif
+    r2_tr_fp_tried = 1;
+    {   extern void (*r2_perf_sink)(const char *) __attribute__((weak)); char sl[160];            /* hle_log is the debug console only on the Vita: also write the status into rayman2.log */
+        snprintf(sl, sizeof sl, "[vita] ui_trace: %s", r2_tr_off ? "OFF (default; create ux0:data/rayman2/UI_TRACE to enable)" : "ON (one write+flush per line)");
+        if (hle_log) hle_log("%s", sl);
+        if (&r2_perf_sink && r2_perf_sink) r2_perf_sink(sl); }
+    if (r2_tr_off) return;
+    if (p) r2_tr_fp = fopen(p, "a");
+  }
   if (r2_tr_nlines > R2_TR_MAXLINES) return;
   r2_tr_nlines++;
   va_start(ap, fmt);
   vsnprintf(buf, sizeof buf, fmt, ap);
   va_end(ap);
   if (hle_log) hle_log("%s", buf); else fprintf(stderr, "%s\n", buf);
-  if (!r2_tr_fp_tried) {
-    const char *p =
-#if defined(__vita__)
-        "ux0:data/rayman2/ui_trace.log";
-#else
-        getenv("R2_UI_TRACE");
-#endif
-    r2_tr_fp_tried = 1;
-    if (p) r2_tr_fp = fopen(p, "a");
-  }
   if (r2_tr_fp) { fputs(buf, r2_tr_fp); fputc('\n', r2_tr_fp); fflush(r2_tr_fp); }
   if (r2_tr_nlines > R2_TR_MAXLINES) r2_tr_nlines = R2_TR_MAXLINES + 1;
 }

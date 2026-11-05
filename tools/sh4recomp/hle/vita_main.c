@@ -23,6 +23,8 @@
 #include "texmap.h"
 #include "snd.h"
 #include "perf.h"
+#include "swflag.h"
+#include "r2prof.h"
 #include <psp2/power.h>
 #include <psp2/kernel/cpu.h>
 #include <psp2/audioout.h>
@@ -84,11 +86,18 @@ static void vita_log_aud(const char *fmt, ...) __attribute__((format(printf, 1, 
 static void vita_log_aud(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vita_log_ring(2, fmt, ap); va_end(ap); }
 static void vita_log_rt(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void vita_log_rt(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vita_log_ring(1, fmt, ap); va_end(ap); }
+uint32_t r2_perf_post_dbg[4];   /* us in perf_post: switch check / mailbox copy / NO_PERF_LOG value / calls ([rstall] in vita_gl_render.c) */
 static void perf_post(const R2Perf *snap, unsigned long frame) {     /* render thread: wait-free copy of ~500 bytes */
+    const uint64_t p0 = sceKernelGetProcessTimeWide();
+    static int s_nolog = -1; if (s_nolog < 0) s_nolog = hle_switch("NO_PERF_LOG");
+    const uint64_t p1 = sceKernelGetProcessTimeWide();
+    r2_perf_post_dbg[0] = (uint32_t)(p1 - p0); r2_perf_post_dbg[2] = (uint32_t)s_nolog; r2_perf_post_dbg[3]++;
+    if (s_nolog) return;
     unsigned h = s_pm_head;
     if (h - s_pm_tail >= PERF_MAILBOX) { s_pm_dropped++; return; }
     s_pm[h % PERF_MAILBOX] = *snap; s_pm_frame[h % PERF_MAILBOX] = frame;
     __sync_synchronize(); s_pm_head = h + 1;
+    r2_perf_post_dbg[1] = (uint32_t)(sceKernelGetProcessTimeWide() - p1);
 }
 static char s_wchunk[24 * 1024]; static unsigned s_wn;
 static void writer_flush(void) {
@@ -184,7 +193,12 @@ static void vita_frame_end(SH4Ctx *c) {
     uint64_t now = sceKernelGetProcessTimeWide();
     acc_build += now - t_begin; if (t_last_end) acc_period += now - t_last_end; t_last_end = now;
     if (++acc_n == 300) {
-        struct mallinfo mi = mallinfo();
+        /* A/B switches for the periodic ~10 s (every 300 frames) stall in swap/vsync seen in the [rstall] lines: NO_PERF_LOG = no 300-frame report lines at all (and no mallinfo);
+         * NO_MALLINFO = keep the lines but skip mallinfo() (it walks the whole malloc heap under the malloc lock, which the render thread also takes). */
+        static int s_nolog = -1, s_nomi = -1;
+        if (s_nolog < 0) { s_nolog = hle_switch("NO_PERF_LOG") || !hle_switch("PERF_REPORT"); s_nomi = hle_switch("NO_MALLINFO"); }   /* 300-frame lines (incl. mallinfo) are opt-in: empty file PERF_REPORT */
+        if (s_nolog) { acc_n = 0; acc_build = acc_period = acc_render = acc_swap = acc_ta = acc_ta_n = 0; return; }
+        struct mallinfo mi; if (s_nomi) memset(&mi, 0, sizeof mi); else mi = mallinfo();
         vita_log("[vita] frames %lu: avg period %.2f ms (%.1f fps), begin->end %.2f ms (kmBeginScene .. kmRender return = scene build + TA parse + GL render + swap; the game logic between frames is period - this; see the [perf] block for the split), [PROFILE=1 builds only:] gl_render_frame %.2f ms, gl_swap %.2f ms, TA SQ parse %.2f ms (%llu writes/frame), heap in use %d KB (arena %d KB), io lookups %lu (%lu misses, answered from the in-memory index)",
                 hle_frame_count, acc_period / 299000.0, 299000000.0 / (acc_period ? acc_period : 1), acc_build / 300000.0,
                 acc_render / 300000.0, acc_swap / 300000.0, acc_ta / 300000.0, (unsigned long long)(acc_ta_n / 300), mi.uordblks >> 10, mi.arena >> 10, hle_io_lookups, hle_io_misses);
@@ -249,6 +263,9 @@ static int game_main(void) {
     hle_verbose = R2_VITA_VERBOSE;
     r2_perf_sink = perf_sink;
     vita_log_start_async();
+#ifdef R2_PROF
+    r2p_start();
+#endif
     vita_set_clocks();
     { extern const char r2_variant_name[], r2_variant_flags[]; vita_log("[vita] variant: %s | %s | game cpu mask 0x%x audio cpu mask 0x%x", r2_variant_name, r2_variant_flags, (unsigned)R2_GAME_CPU, (unsigned)R2_AUDIO_CPU); }   /* Makefile.vita VARIANT: pasted logs identify themselves */
 

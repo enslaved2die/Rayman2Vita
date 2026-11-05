@@ -1,6 +1,8 @@
 /* hle/io.c - host file IO replacements. See io.h for the design. All addresses are guest VAs of assets/dc/1ST_READ.BIN. */
 #define _GNU_SOURCE
 #include "io.h"
+#include "swflag.h"
+#include "r2prof.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -27,7 +29,7 @@ enum {
 
 /* ---------------------------------------------------------------- state */
 typedef struct { char path[1024]; uint32_t size; } RegFile;
-typedef struct { int used; int fd; int reg; uint32_t base; } GdEnt;   /* base = first sector of the range inside the host file (DCZ members) */
+typedef struct { int used; int fd; int cslot; int reg; uint32_t base; } GdEnt;   /* fd < 0 until the first read (lazy open); cslot = fd-cache entry holding a reference, or -1 for a private fd */   /* base = first sector of the range inside the host file (DCZ members) */
 typedef struct { int used; int reg; uint32_t base; uint32_t size; char name[32]; } DirEnt;
 #define MAX_REG 16384
 #define MAX_GD  64
@@ -43,9 +45,11 @@ void hle_io_set_scratch(uint32_t gd_base, unsigned n_gd, uint32_t dirent_base, u
     g_gd_base = gd_base; g_ngd = n_gd > MAX_GD ? MAX_GD : n_gd;
     g_dir_base = dirent_base; g_ndir = n_dirent > MAX_DIRENT ? MAX_DIRENT : n_dirent;
 }
-void hle_io_set_root(const char *root) { g_idx_ready = 0; snprintf(g_root, sizeof g_root, "%s", root ? root : "."); size_t n = strlen(g_root); while (n > 1 && g_root[n - 1] == '/') g_root[--n] = 0; }
+static void fdc_flush(void);
+void hle_io_set_root(const char *root) { fdc_flush(); g_idx_ready = 0; snprintf(g_root, sizeof g_root, "%s", root ? root : "."); size_t n = strlen(g_root); while (n > 1 && g_root[n - 1] == '/') g_root[--n] = 0; }
 void hle_io_reset(void) {
-    for (unsigned i = 0; i < MAX_GD; i++) { if (g_gd[i].used && g_gd[i].fd >= 0) close(g_gd[i].fd); g_gd[i].used = 0; g_gd[i].fd = -1; }
+    for (unsigned i = 0; i < MAX_GD; i++) { if (g_gd[i].used && g_gd[i].fd >= 0 && g_gd[i].cslot < 0) close(g_gd[i].fd); g_gd[i].used = 0; g_gd[i].fd = -1; g_gd[i].cslot = -1; }
+    fdc_flush();
     free(g_reg); g_reg = 0; g_nreg = 0; memset(g_dir, 0, sizeof g_dir); g_ndir_used = 0; g_idx_ready = 0;
 }
 
@@ -77,8 +81,17 @@ static inline uint64_t io_now_us(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000;
 #endif
 }
-#define IO_T0() uint64_t io_t0_ = io_now_us()
-#define IO_T1(bytes) do { hle_io_t_us += io_now_us() - io_t0_; hle_io_calls++; hle_io_bytes += (bytes); } while (0)
+#define IO_T0() uint64_t io_t0_ = io_now_us(); int io_p_ = R2P_SET(4)
+#define IO_T1(bytes) do { R2P_RESTORE(io_p_); hle_io_t_us += io_now_us() - io_t0_; hle_io_calls++; hle_io_bytes += (bytes); } while (0)
+
+/* per-guest-frame read ring for the [slow] hang breakdown (vita_gl_render.c): the first IO_NOTE_N distinct files read since the last reset, with bytes and the first sector. Guest thread only. */
+#define IO_NOTE_N 3
+static struct { int reg; uint32_t sector, bytes; } g_note[IO_NOTE_N]; static int g_note_n; static unsigned g_note_more;
+static void io_note(int reg, uint32_t sector, uint32_t bytes) {
+    for (int i = 0; i < g_note_n; i++) if (g_note[i].reg == reg) { g_note[i].bytes += bytes; return; }
+    if (g_note_n < IO_NOTE_N) { g_note[g_note_n].reg = reg; g_note[g_note_n].sector = sector; g_note[g_note_n].bytes = bytes; g_note_n++; } else g_note_more++;
+}
+void hle_io_note_reset(void) { g_note_n = 0; g_note_more = 0; }
 
 static int is_sep(char ch) { return ch == '\\' || ch == '/'; }
 
@@ -322,6 +335,63 @@ void hle_io_debug_slot_trace(uint32_t slot) {
     hle_log("[prison-trace] file-slot=%08x path=%s base_sector=%u member=%s size=%u pos=%u",
             slot, g_reg[g->reg].path, g->base, member, LD32(slot + O_SIZE), LD32(slot + O_POS));
 }
+/* Host fd cache.  The game opens the same host file over and over (the music container MM.DCZ once per ~67 frames of the intro, BNK_*.OSB several times in a row, ...) and about
+ * two thirds of all opens are closed again without a single read (existence / size probes).  An open + close on the Vita's FAT memory card costs milliseconds, a pread does not
+ * depend on the fd's offset, so: the host fd is opened lazily on the first read of a handle and kept in a small cache keyed by file (reg id) that outlives the guest handle.
+ * Guest-visible state (the fake gdFs handle, the FileMng slot, read data, zero-fill past EOF) is untouched. */
+#define FDC_N 8
+static struct { int reg; int fd; int refs; unsigned long stamp; } g_fdc[FDC_N] = { { -1, -1, 0, 0 }, { -1, -1, 0, 0 }, { -1, -1, 0, 0 }, { -1, -1, 0, 0 }, { -1, -1, 0, 0 }, { -1, -1, 0, 0 }, { -1, -1, 0, 0 }, { -1, -1, 0, 0 } };
+static unsigned long g_fdc_clock;
+static int g_fdc_off = -1;                       /* run-time A/B switch: file ux0:data/rayman2/NO_FD_CACHE (host: env R2_NO_FD_CACHE) = old behaviour: open at handle creation, close with the handle */
+static int fdc_is_off(void) { if (g_fdc_off < 0) g_fdc_off = hle_switch("NO_FD_CACHE") ? 1 : 0; return g_fdc_off; }
+int hle_io_fdcache_enabled(void) { return !fdc_is_off(); }
+static void fdc_flush(void) {
+    for (int i = 0; i < FDC_N; i++) { if (g_fdc[i].fd >= 0) { IO_T0(); close(g_fdc[i].fd); IO_T1(0); } g_fdc[i].reg = -1; g_fdc[i].fd = -1; g_fdc[i].refs = 0; }
+}
+/* returns a host fd for register entry reg (<0 on failure); *cslot = cache entry holding one reference, or -1 when the fd is private (cache full of live handles) */
+static int fdc_acquire(int reg, int *cslot) {
+    int victim = -1;
+    if (fdc_is_off()) {
+        IO_T0(); int pfd = open(g_reg[reg].path, O_RDONLY); IO_T1(0);
+        if (pfd < 0) hle_log("[io] open(%s): %s", g_reg[reg].path, strerror(errno));
+        *cslot = -1; return pfd;
+    }
+    for (int i = 0; i < FDC_N; i++) {
+        if (g_fdc[i].fd >= 0 && g_fdc[i].reg == reg) { g_fdc[i].refs++; g_fdc[i].stamp = ++g_fdc_clock; *cslot = i; return g_fdc[i].fd; }
+        if (g_fdc[i].refs == 0 && (victim < 0 || g_fdc[i].fd < 0 || (g_fdc[victim].fd >= 0 && g_fdc[i].stamp < g_fdc[victim].stamp))) victim = i;
+    }
+    IO_T0(); int fd = open(g_reg[reg].path, O_RDONLY); IO_T1(0);
+    if (fd < 0) { hle_log("[io] open(%s): %s", g_reg[reg].path, strerror(errno)); *cslot = -1; return -1; }
+    if (victim < 0) { *cslot = -1; return fd; }                        /* every cache entry is in use by a live handle: private fd, closed with the handle */
+    if (g_fdc[victim].fd >= 0) { IO_T0(); close(g_fdc[victim].fd); IO_T1(0); }
+    g_fdc[victim].reg = reg; g_fdc[victim].fd = fd; g_fdc[victim].refs = 1; g_fdc[victim].stamp = ++g_fdc_clock; *cslot = victim;
+    return fd;
+}
+/* the host fd of a fake gdFs handle, opened on first use */
+static int gd_fd(GdEnt *g) {
+    if (g->fd < 0 && g->reg >= 0 && g->reg < g_nreg) g->fd = fdc_acquire(g->reg, &g->cslot);
+    return g->fd;
+}
+static void gd_release_fd(GdEnt *g) {
+    if (g->fd < 0) return;
+    if (g->cslot >= 0) { if (g_fdc[g->cslot].refs > 0) g_fdc[g->cslot].refs--; }      /* stays open in the cache */
+    else { IO_T0(); close(g->fd); IO_T1(0); }
+    g->fd = -1; g->cslot = -1;
+}
+
+/* "name 12 KB @sector 345, name2 ..., +N more" for the files read since the last reset (basename of the host path); returns the length written */
+size_t hle_io_note_fmt(char *o, size_t cap) {
+    size_t n = 0; if (cap) o[0] = 0;
+    for (int i = 0; i < g_note_n && n + 1 < cap; i++) {
+        const char *p = g_reg[g_note[i].reg].path, *b = strrchr(p, '/'); b = b ? b + 1 : p;
+        int w = snprintf(o + n, cap - n, "%s%s %u KB @sector %u", i ? ", " : "", b, (unsigned)(g_note[i].bytes / 1024u), (unsigned)g_note[i].sector);
+        if (w < 0) break;
+        n += (size_t)w;
+        if (n >= cap) { n = cap - 1; break; }
+    }
+    if (g_note_more && n + 1 < cap) { int w = snprintf(o + n, cap - n, ", +%u more reads", g_note_more); if (w > 0) n += (size_t)w; if (n >= cap) n = cap - 1; }
+    return n;
+}
 /* fad = disc fad (lba + 150); nsect = range length. Returns fake gd handle address or 0. */
 static uint32_t gd_open_range(uint32_t fad, int32_t nsect) {
     if (fad < FAD_BIAS) return 0;
@@ -329,9 +399,8 @@ static uint32_t gd_open_range(uint32_t fad, int32_t nsect) {
     if (id < 0 || id >= g_nreg) { hle_log("[io] gd_open_range: fad %u does not map to a registered file", fad); return 0; }
     unsigned i; for (i = 0; i < g_ngd; i++) if (!g_gd[i].used) break;
     if (i == g_ngd) { hle_log("[io] out of fake gdFs handles (%u)", g_ngd); return 0; }
-    IO_T0(); int fd = open(g_reg[id].path, O_RDONLY); IO_T1(0);
-    if (fd < 0) { hle_log("[io] open(%s): %s", g_reg[id].path, strerror(errno)); return 0; }
-    g_gd[i].used = 1; g_gd[i].fd = fd; g_gd[i].reg = id; g_gd[i].base = lba & ((1u << LBA_SHIFT) - 1);
+    g_gd[i].used = 1; g_gd[i].fd = -1; g_gd[i].cslot = -1; g_gd[i].reg = id;     /* host fd is opened lazily on the first read */ g_gd[i].base = lba & ((1u << LBA_SHIFT) - 1);
+    if (fdc_is_off()) gd_fd(&g_gd[i]);               /* NO_FD_CACHE: open eagerly like the original code */
     uint32_t h = gd_addr(i);
     for (uint32_t o = 0; o < HLE_IO_GD_STRIDE; o += 4) put32(h + o, 0);
     put32(h + G_FAD, fad); put32(h + G_NSECT, (uint32_t)nsect); put32(h + G_CUR, 0);                                  /* cursor is relative to the range start; g->base is the range's first sector in the host file */
@@ -341,7 +410,7 @@ static uint32_t gd_open_range(uint32_t fad, int32_t nsect) {
 }
 static void gd_close(uint32_t h) {
     GdEnt *g = gd_lookup(h); if (!g) return;
-    { IO_T0(); close(g->fd); IO_T1(0); } g->fd = -1; g->used = 0; put16(h + G_VALID, 0);
+    gd_release_fd(g); g->used = 0; put16(h + G_VALID, 0);
 }
 /* read n sectors at the handle's current sector offset into guest buf; zero-fill past EOF like the padded last disc sector */
 /* read up to n bytes at file offset off into dst in large (1 MiB) chunks; returns bytes read */
@@ -355,12 +424,13 @@ static size_t read_chunks(int fd, uint8_t *dst, size_t n, off_t off) {
 static void gd_do_read(uint32_t h, GdEnt *g, uint32_t cur, int32_t n, uint32_t buf) {
     uint32_t bytes = (uint32_t)n * SECTOR;
     uint64_t off = ((uint64_t)g->base + cur) * SECTOR;
+    io_note(g->reg, g->base + cur, bytes);
     if (ram_range_ok(buf, bytes)) {                        /* fast path: straight into guest RAM, no bounce buffer */
-        uint8_t *d = hle_ptr(buf); size_t got = read_chunks(g->fd, d, bytes, (off_t)off);
+        uint8_t *d = hle_ptr(buf); size_t got = read_chunks(gd_fd(g), d, bytes, (off_t)off);
         if (got < bytes) memset(d + got, 0, bytes - got);
     } else {
         uint8_t *tmp = malloc(bytes); if (!tmp) { hle_log("[io] OOM %u", bytes); return; }
-        size_t got = read_chunks(g->fd, tmp, bytes, (off_t)off);
+        size_t got = read_chunks(gd_fd(g), tmp, bytes, (off_t)off);
         if (got < bytes) memset(tmp + got, 0, bytes - got);
         guest_write(buf, tmp, bytes); free(tmp);
     }
@@ -437,11 +507,11 @@ void hle_io_h_read_block(SH4Ctx *c) {
     if (!(pos < size) || want == 0 || !g) { R(0) = 0; return; }
     int32_t n = size - pos; if (want < n) n = want;
     if (ram_range_ok(buf, (uint32_t)n)) {
-        uint8_t *d = hle_ptr(buf); size_t got = read_chunks(g->fd, d, (size_t)n, (off_t)((uint64_t)g->base * SECTOR + (uint32_t)pos));
+        uint8_t *d = hle_ptr(buf); size_t got = read_chunks(gd_fd(g), d, (size_t)n, (off_t)((uint64_t)g->base * SECTOR + (uint32_t)pos));
         if (got < (size_t)n) memset(d + got, 0, (size_t)n - got);
     } else {
         uint8_t *tmp = malloc((size_t)n); if (!tmp) { R(0) = 0; return; }
-        size_t got = read_chunks(g->fd, tmp, (size_t)n, (off_t)((uint64_t)g->base * SECTOR + (uint32_t)pos));
+        size_t got = read_chunks(gd_fd(g), tmp, (size_t)n, (off_t)((uint64_t)g->base * SECTOR + (uint32_t)pos));
         if (got < (size_t)n) memset(tmp + got, 0, (size_t)n - got);
         guest_write(buf, tmp, (uint32_t)n); free(tmp);
     }
@@ -537,7 +607,7 @@ void hle_io_h_dirmng_init_noop(SH4Ctx *c) { (void)c; }
 /* ---------------------------------------------------------------- registration */
 void hle_io_init(const char *dcdata_root) {
     hle_io_set_root(dcdata_root);
-    for (int i = 0; i < MAX_GD; i++) g_gd[i].fd = -1;
+    for (int i = 0; i < MAX_GD; i++) { g_gd[i].fd = -1; g_gd[i].cslot = -1; }
     hle_hook(0x8C0128BE, hle_io_h_open);
     hle_hook(0x8C012B02, hle_io_h_read_async);
     hle_hook(0x8C012B60, hle_io_h_poll);

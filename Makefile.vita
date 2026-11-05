@@ -71,6 +71,8 @@ V_OPT_COLD      := $(OS_COLD)
 V_ORDER         := 1
 else ifeq ($(VARIANT),v4_subcheck)
 V_DEFS          := -DR2_FASTCHK_SUB
+else ifeq ($(VARIANT),v9_prof)
+V_DEFS          := -DR2_PROF=1
 else ifeq ($(VARIANT),v5_scale75)
 V_DEFS          := -DR2_INTERNAL_SCALE=75
 else
@@ -153,8 +155,10 @@ RECOMP_OBJS     := $(patsubst $(HGEN)/recomp_%.c,$(BUILD_DIR)/recomp_%.o,$(RECOM
 HLE_SRCS        := $(HLE_DIR)/boot.c \
                    $(HLE_DIR)/dbg.c \
                    $(HLE_DIR)/io.c \
+                   $(HLE_DIR)/mathhooks.c \
                    $(HLE_DIR)/pad.c \
                    $(HLE_DIR)/perf.c \
+                   $(HLE_DIR)/r2prof.c \
                    $(HLE_DIR)/ta.c \
                    $(HLE_DIR)/ta_hle.c \
                    $(SND_SRC) \

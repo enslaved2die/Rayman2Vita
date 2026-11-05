@@ -29,6 +29,7 @@ static inline void fgr_mix(uint64_t v) { fgr.h = (fgr.h ^ v) * 0x100000001B3ull;
 static inline void fgr_mixf(float f) { uint32_t u; memcpy(&u, &f, 4); fgr_mix(u); }
 static inline uint64_t fgr_hash_bytes(const void *p, size_t n) { const uint8_t *b = (const uint8_t *)p; uint64_t h = 0xcbf29ce484222325ull; size_t i = 0; for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, b + i, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 31; } for (; i < n; i++) h = (h ^ b[i]) * 0x100000001B3ull; return h; }
 static inline int fgr_capidx(GLenum c) { switch (c) { case 0xB71: return 0; case 0xBE2: return 1; case 0xBC0: return 2; case 0xDE1: return 3; case 0xB44: return 4; case 0xC11: return 5; case 0xB90: return 6; default: return 7; } }
+extern void (*fgr_draw_cb)(int first, int count); extern void (*fgr_clear_cb)(unsigned bits);   /* optional rasteriser hooks (test_glcount GLC_RASTER) */
 typedef struct FakeGl { unsigned long draws, enables, disables, depth_func, depth_mask, blend_func, alpha_func, texenv, bind, colptr, ptrs, texparam, teximage, clears, other, gen, state_total; } FakeGl;
 extern FakeGl fg;
 #define FGC(f) (fg.f++, fg.state_total++)
@@ -41,7 +42,7 @@ static inline void glDepthMask(GLboolean m) { fgr.depth_mask = m; FGC(depth_mask
 static inline void glDepthRangef(float a, float b) { (void)a; (void)b; fg.other++; }
 static inline void glStencilMask(GLuint m) { fgr.st_mask = m; fg.other++; }
 static inline void glClearStencil(int s) { (void)s; fg.other++; }
-static inline void glClear(GLbitfield b) { fg.clears++; fgr_mix(0xC1EA4ull ^ b); for (int i = 0; i < 4; i++) fgr_mixf(fgr.cc[i]); fgr_mixf(fgr.cd); fgr_mix(fgr.cap[5]); for (int i = 0; i < 4; i++) fgr_mix((uint32_t)fgr.sc[i]); for (int i = 0; i < 4; i++) fgr_mix((uint32_t)fgr.vp[i]); fgr_mix(fgr.depth_mask); fgr_mix(fgr.st_mask); if (fgr.trace) fprintf(stderr, "[gltrace] clear bits=%x cc=%g,%g,%g cd=%g sc=%d,%d,%d,%d vp=%d,%d,%d,%d h=%016llx\n", b, fgr.cc[0], fgr.cc[1], fgr.cc[2], fgr.cd, fgr.sc[0], fgr.sc[1], fgr.sc[2], fgr.sc[3], fgr.vp[0], fgr.vp[1], fgr.vp[2], fgr.vp[3], (unsigned long long)fgr.h); }
+static inline void glClear(GLbitfield b) { if (fgr_clear_cb) fgr_clear_cb(b); fg.clears++; fgr_mix(0xC1EA4ull ^ b); for (int i = 0; i < 4; i++) fgr_mixf(fgr.cc[i]); fgr_mixf(fgr.cd); fgr_mix(fgr.cap[5]); for (int i = 0; i < 4; i++) fgr_mix((uint32_t)fgr.sc[i]); for (int i = 0; i < 4; i++) fgr_mix((uint32_t)fgr.vp[i]); fgr_mix(fgr.depth_mask); fgr_mix(fgr.st_mask); if (fgr.trace) fprintf(stderr, "[gltrace] clear bits=%x cc=%g,%g,%g cd=%g sc=%d,%d,%d,%d vp=%d,%d,%d,%d h=%016llx\n", b, fgr.cc[0], fgr.cc[1], fgr.cc[2], fgr.cd, fgr.sc[0], fgr.sc[1], fgr.sc[2], fgr.sc[3], fgr.vp[0], fgr.vp[1], fgr.vp[2], fgr.vp[3], (unsigned long long)fgr.h); }
 static inline void glScissor(int a, int b, int c, int d) { fgr.sc[0] = a; fgr.sc[1] = b; fgr.sc[2] = c; fgr.sc[3] = d; fg.other++; }
 static inline void glMatrixMode(GLenum m) { fgr.mmode = m; fg.other++; }
 static inline void glLoadMatrixf(const float *m) { memcpy(fgr.mmode == GL_PROJECTION ? fgr.proj : fgr.mv, m, 64); fg.other++; }
@@ -88,6 +89,7 @@ static inline void glDrawArrays(GLenum m, int first, int count)
     if (fgr.trace) fprintf(stderr, "[gltrace] cap=%u%u%u%u%u%u%u df=%x dm=%u bl=%x/%x af=%x/%g te=%d proj0=%g,%g,%g,%g,%g texh=%016llx %d,%d cs=%x\n", fgr.cap[0], fgr.cap[1], fgr.cap[2], fgr.cap[3], fgr.cap[4], fgr.cap[5], fgr.cap[6], fgr.depth_func, fgr.depth_mask, fgr.bsrc, fgr.bdst, fgr.afunc, fgr.aref, fgr.texenv, fgr.proj[0], fgr.proj[5], fgr.proj[10], fgr.proj[14], fgr.proj[11], (unsigned long long)fgr.tex[fgr.bound].pix, fgr.tex[fgr.bound].w, fgr.tex[fgr.bound].h, fgr.cs_bits);
     if (fgr.trace) fprintf(stderr, "[gltrace] proj=%g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g vp=%d,%d,%d,%d sc=%d,%d,%d,%d stm=%x tex minf=%x magf=%x ws=%x wt=%x has=%d\n", fgr.proj[0],fgr.proj[1],fgr.proj[2],fgr.proj[3],fgr.proj[4],fgr.proj[5],fgr.proj[6],fgr.proj[7],fgr.proj[8],fgr.proj[9],fgr.proj[10],fgr.proj[11],fgr.proj[12],fgr.proj[13],fgr.proj[14],fgr.proj[15], fgr.vp[0], fgr.vp[1], fgr.vp[2], fgr.vp[3], fgr.sc[0], fgr.sc[1], fgr.sc[2], fgr.sc[3], fgr.st_mask, fgr.tex[fgr.bound].minf, fgr.tex[fgr.bound].magf, fgr.tex[fgr.bound].ws, fgr.tex[fgr.bound].wt, fgr.tex[fgr.bound].has);
     if (fgr.trace) fprintf(stderr, "[gltrace] hstart=%016llx f%lu d%lu first=%d count=%d state=%016llx total=%016llx tex=%d\n", (unsigned long long)h_start, fgr.frame_no, fgr.draws_in_frame, first, count, (unsigned long long)h_state, (unsigned long long)fgr.h, fgr.bound);
+    if (fgr_draw_cb) fgr_draw_cb(first, count);
 }
 static inline void glStencilFunc(GLenum f, int r, GLuint m) { fgr.st_func = f; fgr.st_ref = (uint32_t)r; fgr.st_fmask = m; fg.other++; }
 static inline void glStencilOp(GLenum a, GLenum b, GLenum c) { fgr.st_op[0] = a; fgr.st_op[1] = b; fgr.st_op[2] = c; fg.other++; }

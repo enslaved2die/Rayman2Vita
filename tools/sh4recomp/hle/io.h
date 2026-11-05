@@ -33,6 +33,10 @@ void hle_io_rescan(void);                       /* drop the directory index; it 
 extern unsigned long hle_io_lookups, hle_io_misses; /* path lookups / lookups that found no file (all served from memory) */
 extern int hle_io_stat_calls;                   /* host stat() calls made by io.c (the index scan on non-Vita hosts, then ~0) */
 
+/* per-guest-frame read ring (the first 3 distinct files read, bytes + first sector) for the [slow] log line: reset every hand-off, formatted only for slow frames */
+void hle_io_note_reset(void);
+size_t hle_io_note_fmt(char *out, size_t cap);
+
 /* ---- path mapping ---- */
 /* dir may be NULL. Backslash or slash separated, case-insensitive, leading separator ignored, ".;1" version suffix ignored.
  * Returns 0 and fills out (host path) for an existing regular file (symlinks followed); -1 otherwise. */

@@ -4,6 +4,8 @@
  * ARM-side behaviour that is NOT modelled: DSP (reverb/effects), LFO, filter, key-rate-scaling, MIDI in/out, SCSP "stereo ADPCM", RTC,
  * AICA->SH4 interrupts (MCIPD), exact bus-wait timing of the ARM7 (it runs at a fixed ARM_CYCLES_PER_INSN cycles/instruction).
  */
+#include "swflag.h"
+#include "r2prof.h"
 #include "hle.h"
 /* sd library entry points called by the game's ACP sound engine (documentation + makes them `run_game --spy 8c0xxxxx`-able, because
  * hle/mkstubs.py scans this file for literals): sdLibInit 0x8C0F0A48, sdDrvInit 0x8C0F0948, 0x8C0EFB60 0x8C0EFBBC 0x8C0EFC44 0x8C0EFCB0 0x8C0EFF7C
@@ -52,7 +54,7 @@ static inline void lk_unlock(void) { pthread_mutex_unlock(&g_lk); }
 /* guest-thread acquisition of the AICA lock, timed (the audio thread holds it for up to MIX_CHUNK samples while it generates them): counted in g_perf.t_snd_lock / snd_lock_n */
 static inline void glk_lock(void) {
 #ifndef SND_TEST
-    uint64_t t = r2_now_us(); lk_lock(); g_perf.t_snd_lock += r2_now_us() - t; g_perf.snd_lock_n++;
+    uint64_t t = r2_now_us(); int p_ = R2P_SET(2); lk_lock(); R2P_RESTORE(p_); g_perf.t_snd_lock += r2_now_us() - t; g_perf.snd_lock_n++;
 #else
     lk_lock();
 #endif
@@ -63,7 +65,7 @@ static int g_evlog;                                     /* R2_SND_EV=1: per-voic
 static uint64_t st_samples_fwd(void);
 #define EV(...) do { if (g_evlog) { fprintf(stderr, "[ev] t=%.4f f=%lu ", (double)st_samples_fwd() / 44100.0, hle_frame_count); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
-/* ---- snd_trace.log: always-on (Vita) / R2_SND_TRACELOG=<file> (host) buffered key-on diagnostics for swallowed-SFX hunting. No behaviour change: only reads emulator state.
+/* ---- snd_trace.log: off by default, file ux0:data/rayman2/SND_TRACE enables (Vita) / R2_SND_TRACELOG=<file> (host) buffered key-on diagnostics for swallowed-SFX hunting. No behaviour change: only reads emulator state.
  * Text lines "f=<guest frame> t=<aica s> EVENT ...", buffered in RAM, written (no fflush per event) when 32 KiB are pending, every 30 guest frames, and at exit. Capped at 4 MiB (then stops). */
 #define TL_CAP_BYTES (4u << 20)
 #define TL_BUF 65536
@@ -1066,7 +1068,7 @@ static void stream_watchdog(uint32_t ctx) {
 }
 static void slots_snapshot(void);
 static void sf_disp_body(SH4Ctx *c);
-static void sf_disp(SH4Ctx *c) { uint64_t t0 = r2_now_us(); sf_disp_body(c); g_perf.t_snd_tick += r2_now_us() - t0; g_perf.snd_tick_n++; }
+static void sf_disp(SH4Ctx *c) { uint64_t t0 = r2_now_us(); int p_ = R2P_SET(3); sf_disp_body(c); R2P_RESTORE(p_); g_perf.t_snd_tick += r2_now_us() - t0; g_perf.snd_tick_n++; }
 static void sf_disp_body(SH4Ctx *c) {
     const uint32_t ctx = 0x8C2D4968u; uint32_t pr = c->pr; int maxn = (g_sf_on && LD32(ctx) == 3) ? 8 : 1; uint32_t fade = 0;
     for (int i = 0; i < maxn; i++) {
@@ -1376,7 +1378,7 @@ __attribute__((constructor)) static void snd_ctor(void) {
     { const char *sl = getenv("R2_SND_SLOW_NS"); g_slow_ns = sl ? (uint64_t)atoll(sl) : 0; }
     { const char *vd = getenv("R2_SND_VDUMP"); g_vdump_s = vd ? atoi(vd) : 0; }
 #if defined(__vita__)
-    g_tl_on = 1;                                                    /* Vita: always on -> ux0:data/rayman2/snd_trace.log */
+    g_tl_on = hle_switch("SND_TRACE");                              /* Vita: OFF by default; an empty file ux0:data/rayman2/SND_TRACE turns it on -> ux0:data/rayman2/snd_trace.log */
 #else
     { const char *tp = getenv("R2_SND_TRACELOG"); if (tp && *tp && strcmp(tp, "0")) { g_tl_path = tp; g_tl_on = 1; } }
 #endif

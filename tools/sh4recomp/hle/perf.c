@@ -75,10 +75,16 @@ void r2_perf_format(const R2Perf *pp, unsigned long guest_frame, void (*sink)(co
 void (*r2_perf_post)(const R2Perf *snap, unsigned long guest_frame);
 /* Cheap part (caller's thread): copy the window out of g_perf and reset it.  The text formatting (a dozen snprintf with doubles) and the writing happen in r2_perf_format(), on the caller's thread
  * unless r2_perf_post is set, in which case the snapshot is handed to that function (vita_main.c: wait-free mailbox to the log writer thread) and the render thread never formats or writes. */
+uint32_t r2_perf_dbg[4];   /* us inside the last r2_perf_report: snapshot copy / counter reset / post-or-format / total (read by the [rstall] line in vita_gl_render.c) */
 void r2_perf_report(unsigned long guest_frame) {
+    const uint64_t a0 = r2_now_us();
     R2Perf snap = g_perf; snap.t_snap = r2_now_us();
     uint64_t at = g_perf.aud_us_tot, ab = g_perf.aud_blocks, ai = g_perf.aud_arm_instr, abk = g_perf.aud_arm_bulk, asm_ = g_perf.aud_samples; uint32_t aa = g_perf.aud_arm_us, av = g_perf.aud_vox_us, aavg = g_perf.aud_avg_us, amax = g_perf.aud_max_us;
+    const uint64_t a1 = r2_now_us();
     memset(&g_perf, 0, sizeof g_perf);
     g_perf.aud_us_tot = at; g_perf.aud_blocks = ab; g_perf.aud_arm_us = aa; g_perf.aud_vox_us = av; g_perf.aud_avg_us = aavg; g_perf.aud_max_us = amax; g_perf.aud_arm_instr = ai; g_perf.aud_arm_bulk = abk; g_perf.aud_samples = asm_;
+    const uint64_t a2 = r2_now_us();
     if (r2_perf_post) r2_perf_post(&snap, guest_frame); else r2_perf_format(&snap, guest_frame, NULL);
+    const uint64_t a3 = r2_now_us();
+    r2_perf_dbg[0] = (uint32_t)(a1 - a0); r2_perf_dbg[1] = (uint32_t)(a2 - a1); r2_perf_dbg[2] = (uint32_t)(a3 - a2); r2_perf_dbg[3] = (uint32_t)(a3 - a0);
 }

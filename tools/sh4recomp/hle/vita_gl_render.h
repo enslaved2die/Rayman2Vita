@@ -33,6 +33,15 @@ typedef struct VitaGlPerf {
 } VitaGlPerf;
 extern VitaGlPerf vita_gl_perf;
 
+/* per-frame work counters of the frame being / last rendered (render thread; reset at the start of every job; plain increments, always compiled).  Used by the once-per-second [pf] log (R2_PF) and by test_glcount. */
+typedef struct VitaGlPfFrame {
+    uint32_t draws, fog_draws, batches, verts;           /* glDrawArrays calls (fog re-draws and shadow-volume draws included in draws), batches built, vertices submitted */
+    uint32_t st_depth_test, st_depth_func, st_depth_mask, st_blend, st_blendfunc, st_alpha_test, st_alpha_ref, st_tex2d, st_env, st_colptr, st_stencil;   /* state calls that actually reached GL, by kind */
+    uint32_t tex_bind, tex_param, tex_up, tex_bytes;      /* glBindTexture, glTexParameteri, glTexImage2D count + bytes (frame-buffer presentation upload included) */
+    float area_opq, area_punch, area_trans, area_fog;    /* sum of triangle areas in units of the 640x480 screen: opaque / punch-through / translucent (= alpha blended) / opaque fog re-draw */
+} VitaGlPfFrame;
+const VitaGlPfFrame *vita_gl_pf_frame(void);
+
 void vita_gl_texture_cache_clear(void);
 
 #ifdef __cplusplus

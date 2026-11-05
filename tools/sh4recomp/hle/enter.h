@@ -15,8 +15,14 @@ extern uint32_t hle_fcount[0x80000];
 #define HLE_COUNT(a) ((void)0)
 #endif
 #if defined(__vita__) && !defined(R2_RING_TRACE)
-#define HLE_ENTER(a) do { HLE_COUNT(a); if (__builtin_expect(hle_trace_on, 0)) { hle_ring[hle_ring_pos & 255][0] = (a); hle_ring[hle_ring_pos & 255][1] = c->pr; hle_ring_pos++; hle_trace_enter(c, (a)); } } while (0)
+#define HLE_ENTER_BASE(a) do { HLE_COUNT(a); if (__builtin_expect(hle_trace_on, 0)) { hle_ring[hle_ring_pos & 255][0] = (a); hle_ring[hle_ring_pos & 255][1] = c->pr; hle_ring_pos++; hle_trace_enter(c, (a)); } } while (0)
 #else
-#define HLE_ENTER(a) do { HLE_COUNT(a); hle_ring[hle_ring_pos & 255][0] = (a); hle_ring[hle_ring_pos & 255][1] = c->pr; hle_ring_pos++; if (__builtin_expect(hle_trace_on, 0)) hle_trace_enter(c, (a)); } while (0)
+#define HLE_ENTER_BASE(a) do { HLE_COUNT(a); hle_ring[hle_ring_pos & 255][0] = (a); hle_ring[hle_ring_pos & 255][1] = c->pr; hle_ring_pos++; if (__builtin_expect(hle_trace_on, 0)) hle_trace_enter(c, (a)); } while (0)
+#endif
+#ifdef R2_PROF   /* on-device profiler (r2prof.h): shadow-stack push at entry, pop at any exit via the cleanup attribute */
+#include "r2prof.h"
+#define HLE_ENTER(a) int r2p_tok_ __attribute__((cleanup(r2p_leave_))) = r2p_enter_(a); HLE_ENTER_BASE(a)
+#else
+#define HLE_ENTER(a) HLE_ENTER_BASE(a)
 #endif
 #endif
