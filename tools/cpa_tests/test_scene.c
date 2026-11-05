@@ -124,6 +124,42 @@ int main(int argc, char **argv) {
         check_u("sprite non-finite positions", 0, nanPos);
     }
 
+    printf("texture animation (VisualMaterial frame lists) and .TEX post-load state:\n");
+    {
+        uint32_t withList = 0, headOk = 0, walk = 0;
+        for (uint32_t i = 0; i < s.nItems; i++) if (s.items[i].texAnimHead) {
+            uint32_t t0 = 0, tl = 0; float d0 = 0;
+            withList++;
+            headOk += cpa_tex_anim_node(&img, s.items[i].texAnimHead, 0, &t0, &d0) && t0 == s.items[i].texVa;   /* DAT = load state: texVa is the head frame */
+            walk += cpa_tex_anim_node(&img, s.items[i].texAnimHead, s.items[i].texAnimCount - 1, &tl, NULL) && !cpa_tex_anim_node(&img, s.items[i].texAnimHead, s.items[i].texAnimCount, &tl, NULL);
+        }
+        check_u("animated VisualMaterials (distinct)", 11, s.nAnimMat);
+        check_u("animated VisualMaterials with a malformed frame list", 0, s.nAnimMatBad);
+        check_u("DAT materials whose VM+0x4C was not the head frame (load state)", 0, s.nAnimLiveFrame);
+        check_true("draw items with a frame list exist", withList > 0);
+        check_u("frame-list items: node 0 texture == item texVa", withList, headOk);
+        check_u("frame-list items: list has exactly texAnimCount nodes", withList, walk);
+        char texp[1100]; size_t L = strlen(lvlp); uint8_t *texf = NULL; size_t texN = 0; CpaTexInfo *ti = NULL; uint32_t nti = 0;
+        snprintf(texp, sizeof texp, "%s", lvlp); if (L > 4) memcpy(texp + L - 4, ".TEX", 4);
+        int have = cpa_read_file(texp, &texf, &texN);
+        check_true(".TEX read and decoded: exactly one chunk per DAT texture-table entry", have && cpa_tex_table(&img, texf, texN, &ti, &nti));
+        if (ti) {
+            uint32_t flagDiff = 0, wrapDiff = 0, upd;
+            for (uint32_t i = 0; i < nti; i++) {
+                flagDiff += (cpa_u32(&img, ti[i].structVa + 4) & 0x7FFFFFFFu) != ti[i].flags;
+                uint8_t w = 0; cpa_rd8(&img, ti[i].structVa + 0x18, &w); wrapDiff += w != ti[i].wrap;
+            }
+            printf("  info: LEARN_10 textures %u; pre-load struct flags differ from post-load for %u, wrap for %u\n", nti, flagDiff, wrapDiff);
+            upd = cpa_scene_apply_tex(&s, ti, nti);
+            check_true("cpa_scene_apply_tex updates items and keeps them valid", upd > 0 && s.items[0].texFlagsValid);
+            uint32_t f; uint8_t w;
+            cpa_tex_postload(0x25000202u, &f, &w); check_true("postload(0x25000202) = flags 0x08 wrap 0x04 (Rodeo_40 texture 8: RAM 8/04)", f == 0x08 && w == 0x04);
+            cpa_tex_postload(0x3D000202u, &f, &w); check_true("postload(0x3D000202) = flags 0x48 wrap 0x01 (Rodeo_40 texture 18: RAM 48/01)", f == 0x48 && w == 0x01);
+            cpa_tex_postload(0x12000200u, &f, &w); check_true("postload(0x12000200) = flags 0x12 wrap 0x10 (Rodeo_40 texture 129: RAM 12/10)", f == 0x12 && w == 0x10);
+        }
+        free(ti); free(texf);
+    }
+
     printf("draw list consistency:\n");
     {
         uint32_t sum = 0, bad = 0;

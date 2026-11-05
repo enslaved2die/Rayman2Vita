@@ -44,7 +44,35 @@ static void check_rt(const char *name, int ok, const char *fmt, ...) {
 }
 
 typedef struct { uint64_t cmp, bad; } Cnt;   /* bytes compared / bytes differing */
-typedef struct { Cnt geo, mat, gm, vmp, tex; uint32_t meshes, meshBad, unreadable; } MeshStat;
+typedef struct { Cnt geo, mat, gm, vmp, tex; uint32_t meshes, meshBad, unreadable; uint32_t animVm, animBad, animLive; } MeshStat;
+
+/* VisualMaterial texture animation (see vm_texture() in src/cpa/cpa_scene.c; rule read from the lifted guest FUN_8c01215c): VM+0x140 count (0 = none),
+ * VM+0x148 byte 0, VM+0x138 head node, VM+0x13C current node, nodes {tex, float dur, next}, update does VM+0x4C = current.tex. VM+0x4C is runtime state of that
+ * animation, so it is NOT compared byte for byte; instead the exact invariants are asserted: same list (count, head, every node's tex/dur/next) in file and RAM, file
+ * state = load state (current == head, VM+0x4C == head tex), RAM +0x13C is a list node and RAM +0x4C == that node's tex. Returns 1 if VM is animated (handled). */
+static int anim_vm_check(const CpaImage *A, const CpaImage *B, uint32_t vm, MeshStat *ms) {
+    uint32_t cnt = 0; uint8_t b148 = 0;
+    if (!cpa_rd32(A, vm + 0x140, &cnt) || !cnt || !cpa_rd8(A, vm + 0x148, &b148) || b148) return 0;
+    ms->animVm++;
+    uint32_t bad = 0, hd, cur, t4c, bcnt = 0, bhd = 0, bcur = 0, bt4c = 0; uint8_t bb148 = 1;
+    int ok = cpa_rd32(A, vm + 0x138, &hd) && cpa_rd32(A, vm + 0x13C, &cur) && cpa_rd32(A, vm + 0x4C, &t4c) &&
+             cpa_rd32(B, vm + 0x140, &bcnt) && cpa_rd8(B, vm + 0x148, &bb148) && cpa_rd32(B, vm + 0x138, &bhd) && cpa_rd32(B, vm + 0x13C, &bcur) && cpa_rd32(B, vm + 0x4C, &bt4c);
+    if (!ok || cnt > 256 || bcnt != cnt || bb148 || bhd != hd || cur != hd) bad++;
+    uint32_t n = hd, headTex = 0, curTexB = 0; int curIn = 0;
+    for (uint32_t i = 0; ok && i < cnt && !bad; i++) {
+        uint32_t nx = 0, tx = 0;
+        if (!cpa_ptr(A, n, 12) || !cpa_ptr(B, n, 12) || memcmp(cpa_ptr(A, n, 12), cpa_ptr(B, n, 12), 12)) { bad++; break; }
+        cpa_rd32(A, n, &tx); cpa_rd32(A, n + 8, &nx);
+        if (i == 0) headTex = tx;
+        if (n == bcur) { curIn = 1; curTexB = tx; }
+        if (i + 1 < cnt ? !nx : nx) bad++;
+        n = nx;
+    }
+    if (!bad && (!curIn || t4c != headTex || bt4c != curTexB)) bad++;
+    if (!bad && bt4c != headTex) ms->animLive++;
+    if (bad) ms->animBad++;
+    return 1;
+}
 
 static void cmp_range(const CpaImage *A, const CpaImage *B, uint32_t va, size_t len, Cnt *c, uint32_t *firstBad) {
     const uint8_t *a = cpa_ptr(A, va, len), *b = cpa_ptr(B, va, len);
@@ -82,7 +110,7 @@ static void mesh_cmp(const CpaImage *A, const CpaImage *B, uint32_t geo, MeshSta
         if (cpa_is_ptr(A, w[0]) && cpa_rd32(A, w[0], &vm)) {
             cmp_range(A, B, w[0], 4, &ms->mat, NULL); cmp_range(A, B, w[0], 4, &ms->gm, NULL);
             if (cpa_is_ptr(A, vm) && cpa_rd32(A, vm + 0x4C, &tex)) {
-                cmp_range(A, B, vm + 0x4C, 4, &ms->mat, NULL); cmp_range(A, B, vm + 0x4C, 4, &ms->vmp, NULL);
+                if (!anim_vm_check(A, B, vm, ms)) { cmp_range(A, B, vm + 0x4C, 4, &ms->mat, NULL); cmp_range(A, B, vm + 0x4C, 4, &ms->vmp, NULL); }
                 if (cpa_is_ptr(A, tex) && cpa_ptr(A, tex, 0x1C)) cmp_range(A, B, tex, 0x1C, &ms->tex, NULL);
             }
         }
@@ -232,6 +260,11 @@ int main(int argc, char **argv) {
     check_rt("A2 actor mesh bytes identical (geometry)", W.actor.geo.bad == 0 && W.actor.meshes > 0,
           "meshes=%u bytesCompared=%llu bytesDiffer=%llu", W.actor.meshes, (unsigned long long)W.actor.geo.cmp, (unsigned long long)W.actor.geo.bad);
     check_rt("A2 actor material chain pointers identical", W.actor.mat.bad == 0, "bytesCompared=%llu bytesDiffer=%llu", (unsigned long long)W.actor.mat.cmp, (unsigned long long)W.actor.mat.bad);
+    check("A2 texture-animated VisualMaterials: same frame list in file and RAM, file = load state, RAM frame = a list node and VM+0x4C = its texture",
+          W.ipo.animBad == 0 && W.actor.animBad == 0, "animated VM refs ipo=%u actor=%u, bad=%u/%u, live frame != head in RAM: ipo=%u actor=%u",
+          W.ipo.animVm, W.actor.animVm, W.ipo.animBad, W.actor.animBad, W.ipo.animLive, W.actor.animLive);
+    printf("INFO  native scene animation stats: DAT animMat=%u liveFrameNormalised=%u bad=%u | RAM animMat=%u liveFrameNormalised=%u bad=%u\n",
+           sd.nAnimMat, sd.nAnimLiveFrame, sd.nAnimMatBad, sr.nAnimMat, sr.nAnimLiveFrame, sr.nAnimMatBad);
     printf("INFO  A2 IPO material chain breakdown, bytes differing/compared: GameMaterial->VisualMaterial ptr %llu/%llu, VisualMaterial+0x4C tex ptr %llu/%llu, texture struct(0x1C) %llu/%llu\n",
            (unsigned long long)W.ipo.gm.bad, (unsigned long long)W.ipo.gm.cmp, (unsigned long long)W.ipo.vmp.bad, (unsigned long long)W.ipo.vmp.cmp, (unsigned long long)W.ipo.tex.bad, (unsigned long long)W.ipo.tex.cmp);
     if (W.firstBadGeoIpo) printf("INFO  first differing IPO geometry byte at 0x%08X\n", W.firstBadGeoIpo);
@@ -262,12 +295,32 @@ int main(int argc, char **argv) {
     {   /* second texture layer selector (VisualMaterial+0x149) and sprite elements: the DAT image and the guest's loaded copy must agree */
         uint32_t ovBad = 0, ovNz = 0, sprBad = 0;
         if (itemsEq) for (uint32_t i = 0; i < sd.nItems; i++) { ovBad += sd.items[i].overlayMode != sr.items[i].overlayMode; ovNz += sd.items[i].overlayMode != 0; }
-        check("A3 overlayMode (VisualMaterial+0x149) identical DAT vs guest RAM, per draw item", itemsEq && ovBad == 0, "items=%u nonzero=%u bad=%u", sd.nItems, ovNz, ovBad);
+        check_rt("A3 overlayMode (VisualMaterial+0x149) identical DAT vs guest RAM, per draw item", itemsEq && ovBad == 0, "items=%u nonzero=%u bad=%u", sd.nItems, ovNz, ovBad);
+        {   /* static items only, in order (actor item lists mutate at run time): strict */
+            uint32_t i = 0, j = 0, n = 0, bad = 0;
+            for (;;) {
+                while (i < sd.nItems && sd.items[i].isActor) i++;
+                while (j < sr.nItems && sr.items[j].isActor) j++;
+                if (i >= sd.nItems || j >= sr.nItems) break;
+                bad += sd.items[i].overlayMode != sr.items[j].overlayMode; n++; i++; j++;
+            }
+            check("A3 overlayMode identical DAT vs guest RAM, static draw items in order", i == sd.nItems && j == sr.nItems && n > 0 && bad == 0, "static items=%u bad=%u", n, bad);
+        }
         if (sd.nSprites == sr.nSprites) for (uint32_t i = 0; i < sd.nSprites; i++) {
             const CpaSprite *x = &sd.sprites[i], *y = &sr.sprites[i];
-            sprBad += x->geoVa != y->geoVa || x->texVa != y->texVa || memcmp(&x->sizeX, &y->sizeX, 8) || memcmp(x->local, y->local, 12) || x->isActor != y->isActor;
+            int sb = x->geoVa != y->geoVa || x->texVa != y->texVa || memcmp(&x->sizeX, &y->sizeX, 8) || memcmp(x->local, y->local, 12) || x->isActor != y->isActor;
+            sprBad += sb;
+            if (sb && getenv("ORACLE_VERBOSE") && sprBad <= 4) printf("  sprite %u: geo %08X/%08X tex %08X/%08X size %g,%g/%g,%g local %g,%g,%g/%g,%g,%g actor %d/%d\n", i, x->geoVa, y->geoVa, x->texVa, y->texVa,
+                   x->sizeX, x->sizeY, y->sizeX, y->sizeY, x->local[0], x->local[1], x->local[2], y->local[0], y->local[1], y->local[2], x->isActor, y->isActor);
         }
-        check("A3 sprites (type 3) identical DAT vs guest RAM (count, geometry, texture, size, local vertex)", sd.nSprites == sr.nSprites && sprBad == 0, "sprites DAT=%u RAM=%u bad=%u", sd.nSprites, sr.nSprites, sprBad);
+        check_rt("A3 sprites (type 3) identical DAT vs guest RAM (count, geometry, texture, size, local vertex)", sd.nSprites == sr.nSprites && sprBad == 0, "sprites DAT=%u RAM=%u bad=%u", sd.nSprites, sr.nSprites, sprBad);
+        {   /* sprites live in actor geometries (none in static IPOs, VERIFIED on 3 levels), which the guest re-instantiates at run time (Rodeo_40: RAM sprite geometries sit in heap, outside the DAT image,
+             * with animated size): asserted strictly for the non-actor ones only */
+            uint32_t nd = 0, nr = 0;
+            for (uint32_t i = 0; i < sd.nSprites; i++) nd += !sd.sprites[i].isActor;
+            for (uint32_t i = 0; i < sr.nSprites; i++) nr += !sr.sprites[i].isActor;
+            check("A3 non-actor sprites: count equal DAT vs guest RAM", nd == nr, "DAT=%u RAM=%u", nd, nr);
+        }
     }
     check_rt("A3 draw items identical (count, vertex ranges, texture VA, isActor)", itemsEq && itemBad == 0, "items DAT=%u RAM=%u badItems=%u", sd.nItems, sr.nItems, itemBad);
     {   /* static items compared in order, independent of how many actor items each side produced (actor lists mutate at run time) */
@@ -316,33 +369,53 @@ int main(int argc, char **argv) {
         }
         (void)alphaDiff;
         check("A2 texture struct bit31 (load-state marker) set in DAT and cleared in RAM for every struct", b31Clr == nt && nt > 0, "cleared=%u/%u", b31Clr, nt);
-        /* The guest loader rewrites flags (+4) and the wrap byte (+0x18). Assert the rewrite is a deterministic function of the file value
-         * (same file value -> same RAM value everywhere); print the observed mapping tables so the native decode can be tied to RAM values. */
+        /* The guest loader overwrites tex+4 (flags), tex+0x18 (wrap byte) and tex+0x14 from the per-texture PVR header word of the .TEX file (FUN_8c03a502 ->
+         * FUN_8c03a680 / FUN_8c03a5dc, lifted code in tools/sh4recomp/gen_fix/recomp_05.c). cpa_tex_table() reproduces that function; assert it EXACTLY for every
+         * texture in the DAT table (no masks, no determinism-up-to-bits shortcut). */
         {
-            /* EMPIRICAL (RODEO_10, PLUM_10, BAST_10): the load rewrite is not a pure function of the file value; the only
-             * disagreements are in bits 0x10 (wrap byte) / 0x1A (flags: 0x02, 0x08, 0x10 seen set from file value 0 or 2 in RODEO_10, LEARN_40, NAVE_20) which the guest sets from something other than the file field
-             * (likely a texel/alpha scan: UNVERIFIED). Determinism is asserted with those bits masked; raw conflicts are reported. */
-            int wmap[256], wconf = 0, wconfRaw = 0; uint32_t wcnt[256] = {0}; uint32_t fk[64], fv[64], fc[64]; int nf = 0, fconf = 0, fconfRaw = 0;
-            for (int i = 0; i < 256; i++) wmap[i] = -1;
-            for (uint32_t j = 0; j < ns; j++) {
-                uint32_t t = seenTex[j];
-                uint32_t fd = cpa_u32(&imgD, t + 4) & 0x7FFFFFFFu, fr = cpa_u32(&imgR, t + 4) & 0x7FFFFFFFu;
-                uint8_t wd = 0, wr = 0; cpa_rd8(&imgD, t + 0x18, &wd); cpa_rd8(&imgR, t + 0x18, &wr);
-                if (wmap[wd] >= 0 && wmap[wd] != (wr & ~0x10)) wconf++;
-                wmap[wd] = wr & ~0x10; wcnt[wd]++;
-                { static int rawm[256]; static int rawInit; if (!rawInit) { for (int q = 0; q < 256; q++) rawm[q] = -1; rawInit = 1; } if (rawm[wd] >= 0 && rawm[wd] != wr) wconfRaw++; rawm[wd] = wr; }
-                int k; for (k = 0; k < nf; k++) if (fk[k] == fd) break;
-                if (k == nf && nf < 64) { fk[nf] = fd; fv[nf] = fr & ~0x1Au; fc[nf] = 0; nf++; }
-                if (k < nf) { if (fv[k] != (fr & ~0x1Au)) fconf++; fc[k]++; }
+            char tp[1100]; uint8_t *texf = NULL; size_t texN = 0; CpaTexInfo *ti = NULL; uint32_t nti = 0;
+            snprintf(tp, sizeof tp, "%s/%s/%s.TEX", argv[2], level, level);
+            int have = cpa_read_file(tp, &texf, &texN);
+            int tok = have && cpa_tex_table(&imgD, texf, texN, &ti, &nti);
+            check("A2 .TEX file decodes to exactly one chunk per DAT texture-table entry", tok, "textures=%u file=%zu bytes", nti, texN);
+            if (tok) {
+                uint32_t fm = 0, wm = 0, pm = 0, b31 = 0, preDiffF = 0, preDiffW = 0;
+                for (uint32_t i = 0; i < nti; i++) {
+                    uint32_t t = ti[i].structVa; uint8_t wr = 0, wd = 0;
+                    uint32_t fr = cpa_u32(&imgR, t + 4), fd = cpa_u32(&imgD, t + 4);
+                    cpa_rd8(&imgR, t + 0x18, &wr); cpa_rd8(&imgD, t + 0x18, &wd);
+                    fm += fr != ti[i].flags;                         /* RAM +4 == flags(raw) exactly (bit 31 included: must be clear) */
+                    wm += wr != ti[i].wrap;
+                    pm += cpa_u32(&imgR, t + 0x14) != ti[i].pvrFmt;
+                    b31 += !(fd & 0x80000000u) || (fr & 0x80000000u);
+                    preDiffF += (fd & 0x7FFFFFFFu) != ti[i].flags; preDiffW += wd != ti[i].wrap;
+                }
+                check("A2 texture flags (+4) in guest RAM == flags(.TEX PVR header word) exactly, every texture", fm == 0 && nti > 0, "mismatch=%u/%u", fm, nti);
+                check("A2 texture wrap byte (+0x18) in guest RAM == wrap(.TEX PVR header word) exactly, every texture", wm == 0 && nti > 0, "mismatch=%u/%u", wm, nti);
+                check("A2 texture +0x14 in guest RAM == (PVR header word & 0xFFFF), every texture", pm == 0 && nti > 0, "mismatch=%u/%u", pm, nti);
+                check("A2 every DAT texture struct has +4 bit31 set (pre-load) and the RAM one clear", b31 == 0, "violations=%u/%u", b31, nti);
+                printf("INFO  DAT (pre-load) struct values differ from the post-load .TEX-derived values: flags %u/%u, wrap %u/%u => cpa_scene_load reads pre-load values; use cpa_scene_apply_tex() for post-load\n",
+                       preDiffF, nti, preDiffW, nti);
+                /* the native API: apply the post-load table to the DAT scene and require the result equals what the RAM-side struct says, for all items */
+                {
+                    CpaScene sa; CpaImage ia; memset(&sa, 0, sizeof sa);
+                    if (cpa_scene_load_dats(&sa, &ia, fix, fixN, lvl, lvlN)) {
+                        uint32_t upd = cpa_scene_apply_tex(&sa, ti, nti), bad = 0;
+                        uint32_t outside = 0;
+                        for (uint32_t i = 0; i < sa.nItems; i++) if (sa.items[i].texVa) {
+                            int inTbl = 0; for (uint32_t q = 0; q < nti; q++) if (ti[q].structVa == sa.items[i].texVa) { inTbl = 1; break; }
+                            if (!inTbl) { outside++; if (getenv("ORACLE_VERBOSE")) printf("  item %u texVa 0x%08X not in level texture table (FIX.DAT texture?)\n", i, sa.items[i].texVa); continue; }
+                            uint8_t wr = 0; uint32_t fr = cpa_u32(&imgR, sa.items[i].texVa + 4); cpa_rd8(&imgR, sa.items[i].texVa + 0x18, &wr);
+                            bad += sa.items[i].texFlags != fr || sa.items[i].texWrapByte != wr || !sa.items[i].texFlagsValid;
+                        }
+                        check("A2 cpa_scene_apply_tex(): draw-item texFlags/wrap equal guest RAM texture structs", bad == 0, "updated=%u items=%u bad=%u (items with a texture outside the level table: %u)", upd, sa.nItems, bad, outside);
+                        cpa_scene_free(&sa);
+                    }
+                }
             }
-            check("A2 texture wrap byte (+0x18) DAT->RAM rewrite is a deterministic function (masked)", wconf == 0 && nt > 0, "conflicts=%d over %u structs", wconf, nt);
-            check("A2 texture flags (+4, low bits) DAT->RAM rewrite is a deterministic function (masked)", fconf == 0 && nt > 0, "conflicts=%d over %u structs", fconf, nt);
-            printf("INFO  texture rewrite raw (unmasked) conflicts: wrap=%d (a few expected, bit 0x10)\n", wconfRaw);
-            (void)fconfRaw;
-            printf("INFO  observed wrap byte DAT->RAM (bit 0x10 masked):"); for (int i = 0; i < 256; i++) if (wmap[i] >= 0) printf(" %02X->%02X(x%u)", i, wmap[i], wcnt[i]); printf("\n");
-            printf("INFO  observed flags DAT->RAM (bit31 stripped, bits 0x1A masked):"); for (int k = 0; k < nf; k++) printf(" %X->%X(x%u)", fk[k], fv[k], fc[k]); printf("\n");
+            free(ti); free(texf);
         }
-        if (flagBad || wrapBad) printf("INFO  texture structs where DAT value != RAM value: flags(excluding load-state bits 31/9)=%u wrap=%u of %u => native tile/alpha decode reads PRE-load values; INFERRED mapping to final values only as listed above\n", flagBad, wrapBad, nt);
+        (void)flagBad; (void)wrapBad;
         (void)b31Set;
     }
 

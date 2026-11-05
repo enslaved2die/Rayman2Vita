@@ -38,6 +38,7 @@ typedef struct {
     uint32_t tex;
     uint32_t nTri; int actor, chan; float *pos, *uv;
     uint8_t overlay;
+    uint32_t animHead, animCount;   /* VisualMaterial texture-animation frame list (0 = none), see vm_texture() */
 } Elem;
 
 typedef struct {
@@ -49,6 +50,7 @@ typedef struct {
     uint32_t *geoDone; uint32_t nGeoDone, capGeoDone;
     int curChan;   /* >= 0 while decoding a Rayman rig part */
     CpaSprite *spr; uint32_t nSpr, capSpr;
+    uint32_t *vmSeen; uint32_t nVmSeen, capVmSeen;   /* distinct VisualMaterials already counted for the animation statistics */
 } Ctx;
 
 /* Decode texture-struct flags/wrap. Wrap evidence (INFERRED, notes_levels.md): UV extents of static batches: wrap 2 has U-only
@@ -66,6 +68,52 @@ static void tex_decode(const CpaImage *im, uint32_t texVa, uint32_t *flags, uint
     else if (f & 0x08) *alpha = CPA_ALPHA_BLEND;
     else if (f == 0) *alpha = CPA_ALPHA_OPAQUE;
     if (wr <= 3) { *tileU = (wr & 2) ? 1 : 0; *tileV = (wr & 1) ? 1 : 0; *wrapUnclear = 0; }
+}
+
+
+/* VisualMaterial texture animation (VERIFIED from the lifted guest per-frame material update f_8c01215c = FUN_8c01215c, tools/sh4recomp/gen_fix/recomp_00.c,
+ * and by R2_WATCH on Rodeo_40: the late writes to VM+0x4C come from this function, with "VM+4 |= 0x1000" = texture-dirty):
+ *   VM+0x138 head node, VM+0x13C current node, VM+0x140 frame count (0 = not animated), VM+0x144 float time accumulator, VM+0x134 frame stamp of the last update,
+ *   VM+0x148 byte (must be 0 for the animation to run). Node (>= 0x10 bytes): +0 texture struct VA, +4 float duration, +8 next node (0 = end, the update then
+ *   wraps to the head). Every update does VM+0x4C = current.node[0] (guest: ST32(vm+0x4C, LD32(LD32(vm+0x13C)))).
+ * The DAT holds the load-time state (current == head, VM+0x4C == head texture, accumulator 0). A guest RAM dump taken after frames have run holds the live frame:
+ * VM+0x4C is then another list entry (Rodeo_40: 14-node ping-pong list, 70 ms per frame, Boat01 likewise). That live frame depends on elapsed guest time, which the
+ * loader cannot know, so the loader reports the HEAD (load-time) frame as texVa for a VM whose VM+0x4C equals its current node's texture, and exposes the list.
+ * Returns the texture VA to use; head and count are 0 for a VM without a valid list. *norm = 1 iff the live frame was replaced by the head frame. */
+static uint32_t vm_texture(const CpaImage *im, uint32_t vm, uint32_t *head, uint32_t *count, int *norm, int *bad) {
+    uint32_t t4c = 0, cnt = 0, hd = 0, cur = 0, n, tex0 = 0, curTex = 0; uint8_t b148 = 0;
+    *head = *count = 0; *norm = 0; *bad = 0;
+    if (!cpa_rd32(im, vm + 0x4C, &t4c)) return 0;
+    if (!cpa_rd32(im, vm + 0x140, &cnt) || cnt == 0) return t4c;
+    if (!cpa_rd8(im, vm + 0x148, &b148) || b148 != 0) return t4c;
+    if (cnt > 256 || !cpa_rd32(im, vm + 0x138, &hd) || !cpa_rd32(im, vm + 0x13C, &cur) || !cpa_is_ptr(im, hd) || !cpa_is_ptr(im, cur)) { *bad = 1; return t4c; }
+    n = hd; int curIn = 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint32_t nx = 0;
+        if (!cpa_is_ptr(im, n) || !cpa_rd32(im, n + 8, &nx)) { *bad = 1; return t4c; }
+        if (n == cur) { curIn = 1; cpa_rd32(im, n, &curTex); }
+        if (i == 0) cpa_rd32(im, n, &tex0);
+        if (i + 1 < cnt ? nx == 0 : nx != 0) { *bad = 1; return t4c; }   /* list must hold exactly cnt nodes */
+        n = nx;
+    }
+    if (!curIn) { *bad = 1; return t4c; }
+    *head = hd; *count = cnt;
+    if (t4c == curTex && t4c != tex0) { *norm = 1; return tex0; }
+    return t4c;
+}
+static void vm_anim_stats(Ctx *c, uint32_t vm, uint32_t head, int norm, int bad) {
+    if (!head && !bad) return;
+    for (uint32_t i = 0; i < c->nVmSeen; i++) if (c->vmSeen[i] == vm) return;
+    if (c->nVmSeen == c->capVmSeen) { c->capVmSeen = c->capVmSeen ? c->capVmSeen * 2 : 64; c->vmSeen = (uint32_t *)realloc(c->vmSeen, 4u * c->capVmSeen); if (!c->vmSeen) { c->capVmSeen = c->nVmSeen = 0; return; } }
+    c->vmSeen[c->nVmSeen++] = vm;
+    if (bad) c->s->nAnimMatBad++; else { c->s->nAnimMat++; c->s->nAnimLiveFrame += (uint32_t)norm; }
+}
+int cpa_tex_anim_node(const CpaImage *im, uint32_t head, uint32_t k, uint32_t *tex, float *dur) {
+    uint32_t n = head;
+    for (uint32_t i = 0; i < k; i++) { if (!cpa_is_ptr(im, n) || !cpa_rd32(im, n + 8, &n) || !n) return 0; }
+    if (!cpa_is_ptr(im, n) || !cpa_rd32(im, n, tex)) return 0;
+    if (dur) *dur = cpa_f32(im, n + 4);
+    return 1;
 }
 
 /* GeometricObject (GeoObj.c) -- VERIFIED: +00 float3* verts, +10 u16* elementTypes, +14 ptr* elements, +2C s16 nVerts, s16 nElements.
@@ -106,7 +154,8 @@ static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor, uint32_t s
             float sx, sy; memcpy(&sx, &w3[1], 4); memcpy(&sy, &w3[2], 4);
             if (!ok3 || nv != 1 || ne != 1 || !cpa_is_ptr(im, w3[0]) || !isfinite(sx) || !isfinite(sy)) { c->s->nSpriteBad++; continue; }
             if (c->curChan >= 0) { c->s->nSpriteRig++; continue; }
-            vm3 = w3[0]; cpa_rd32(im, vm3 + 0x4C, &tex3);
+            vm3 = w3[0];
+            { uint32_t ah, ac; int nm, bd; tex3 = vm_texture(im, vm3, &ah, &ac, &nm, &bd); vm_anim_stats(c, vm3, ah, nm, bd); }
             if (c->nSpr == c->capSpr) { c->capSpr = c->capSpr ? c->capSpr * 2 : 64; c->spr = (CpaSprite *)realloc(c->spr, sizeof(CpaSprite) * c->capSpr); if (!c->spr) { c->capSpr = c->nSpr = 0; free(vw); return 0; } }
             CpaSprite *sp = &c->spr[c->nSpr++]; memset(sp, 0, sizeof *sp);
             memcpy(sp->pos, vw[0], sizeof sp->pos); sp->sizeX = sx; sp->sizeY = sy; sp->texVa = tex3; sp->isActor = (uint8_t)isActor; sp->geoVa = geo; sp->soVa = soVa;
@@ -123,11 +172,15 @@ static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor, uint32_t s
             c->s->nElemSkipped++; continue;
         }
 
-        uint32_t vm = 0, tex = 0;
-        if (cpa_is_ptr(im, w[0]) && cpa_rd32(im, w[0], &vm) && cpa_is_ptr(im, vm)) cpa_rd32(im, vm + 0x4C, &tex);
+        uint32_t vm = 0, tex = 0, ahead = 0, acount = 0;
+        if (cpa_is_ptr(im, w[0]) && cpa_rd32(im, w[0], &vm) && cpa_is_ptr(im, vm)) {
+            int nm, bd;
+            tex = vm_texture(im, vm, &ahead, &acount, &nm, &bd);
+            vm_anim_stats(c, vm, ahead, nm, bd);
+        }
 
         Elem E; memset(&E, 0, sizeof E);
-        E.tex = tex; E.actor = isActor; E.chan = c->curChan;
+        E.tex = tex; E.actor = isActor; E.chan = c->curChan; E.animHead = ahead; E.animCount = acount;
         if (vm) cpa_rd8(im, vm + 0x149, &E.overlay);   /* VisualMaterial+0x149: second-pass selector, see cpa_scene.h */
         E.pos = (float *)malloc(sizeof(float) * 9 * ntri);
         E.uv  = (float *)malloc(sizeof(float) * 6 * ntri);
@@ -320,7 +373,7 @@ int cpa_scene_load(CpaScene *out, const CpaImage *img, uint32_t rootVa) {
     Mat id; mat_ident(&id);
     walk(&c, rootVa, 0, 0, &id);
     for (int i = 0; i < img->nReg; i++) free(c.seen[i]);
-    free(c.geoDone);
+    free(c.geoDone); free(c.vmSeen);
 
     /* split Rayman's local-space parts into the rig (re-posed per frame, not batched) */
     {
@@ -355,10 +408,10 @@ int cpa_scene_load(CpaScene *out, const CpaImage *img, uint32_t rootVa) {
     for (uint32_t i = 0; i < c.nEl && out->pos && out->uv && out->items && done; i++) {
         if (done[i]) continue;
         CpaDrawItem *b = &out->items[out->nItems++];
-        b->texVa = c.el[i].tex; b->firstVert = nv; b->isActor = (uint8_t)c.el[i].actor; b->overlayMode = c.el[i].overlay;
+        b->texVa = c.el[i].tex; b->firstVert = nv; b->isActor = (uint8_t)c.el[i].actor; b->overlayMode = c.el[i].overlay; b->texAnimHead = c.el[i].animHead; b->texAnimCount = c.el[i].animCount;
         tex_decode(img, b->texVa, &b->texFlags, &b->texWrapByte, &b->texFlagsValid, &b->tileU, &b->tileV, &b->wrapUnclear, &b->alphaClass);
         for (uint32_t j = i; j < c.nEl; j++) {
-            if (done[j] || c.el[j].tex != b->texVa || c.el[j].actor != b->isActor || c.el[j].overlay != b->overlayMode) continue;
+            if (done[j] || c.el[j].tex != b->texVa || c.el[j].animHead != c.el[i].animHead || c.el[j].actor != b->isActor || c.el[j].overlay != b->overlayMode) continue;
             memcpy(out->pos + nv * 3, c.el[j].pos, sizeof(float) * 9 * c.el[j].nTri);
             memcpy(out->uv + nv * 2, c.el[j].uv, sizeof(float) * 6 * c.el[j].nTri);
             nv += c.el[j].nTri * 3;
@@ -498,4 +551,103 @@ void cpa_rig_pose(CpaScene *s, float ft) {
             for (int k = 0; k < 3; k++) { float x = r->wpos[v * 3 + k]; if (x < R->pmin[k]) R->pmin[k] = x; if (x > R->pmax[k]) R->pmax[k] = x; }
         }
     }
+}
+
+
+/* ---------- .TEX post-load state (see cpa_scene.h) ---------- */
+void cpa_tex_postload(uint32_t raw, uint32_t *flags, uint8_t *wrap) {
+    uint32_t w = 0, fl = 0, k;
+    /* FUN_8c03a5dc: U pair then V pair; a full V pair replaces the whole byte (guest: R5 = 1) */
+    if ((raw & 0xC0000000u) == 0xC0000000u) w = 2; else if (raw & 0x40000000u) w = 0x20; else if (raw & 0x80000000u) w = 8;
+    if ((raw & 0x30000000u) == 0x30000000u) w = 1; else if (raw & 0x10000000u) w |= 0x10; else if (raw & 0x20000000u) w |= 4;
+    /* FUN_8c03a680 */
+    if ((raw & 0x08000000u) == 0x08000000u) { raw &= 0xF700FFFFu; fl |= 0x40; }
+    k = raw & 0x0F000000u;
+    if (k == 0x01000000u || k == 0x02000000u) fl |= 0x12;
+    else if (k == 0x03000000u || k == 0x04000000u || k == 0x05000000u) fl |= 0x08;
+    else if (k == 0x06000000u) fl |= 0x20;
+    else if (k == 0x07000000u) fl |= 0x08 | 0x200;
+    *flags = fl; *wrap = (uint8_t)w;
+}
+
+/* One chunk. Returns malloc'ed block (*outN bytes) or NULL. */
+static uint8_t *tex_unpack(const uint8_t *p, size_t n, size_t *pos, size_t *outN) {
+    size_t cap = 0, len = 0, st = *pos, end;
+    uint8_t *o = NULL;
+    if (st + 4 > n) return NULL;
+    end = st + le32(p + st);
+    if (end > n || end < st + 4) return NULL;
+    size_t q = st + 4;
+    while (q < end) {
+        uint8_t c = p[q++]; size_t cnt, dist = 0; int copy = 0;
+        if (c & 1) {
+            uint32_t v;
+            if (q - 1 + 4 > end) { free(o); return NULL; }
+            v = le32(p + q - 1); q += 3;
+            cnt = v >> 24; dist = (v & 0xFFFFFEu) >> 1; copy = 1;
+            if (!dist || dist > len) { free(o); return NULL; }
+        } else if (c == 0) {
+            cnt = 4;
+        } else cnt = c >> 2;
+        if (!copy && q + cnt > end) { free(o); return NULL; }
+        if (len + cnt > cap) {
+            size_t nc = cap ? cap * 2 : 4096;
+            while (nc < len + cnt) nc *= 2;
+            if (nc > ((size_t)16 << 20)) { free(o); return NULL; }
+            uint8_t *t = (uint8_t *)realloc(o, nc); if (!t) { free(o); return NULL; }
+            o = t; cap = nc;
+        }
+        if (copy) for (size_t i = 0; i < cnt; i++) { o[len] = o[len - dist]; len++; }
+        else { memcpy(o + len, p + q, cnt); len += cnt; q += cnt; }
+    }
+    if (q != end) { free(o); return NULL; }
+    *pos = end; *outN = len;
+    return o;
+}
+
+int cpa_tex_table(const CpaImage *img, const uint8_t *texFile, size_t texN, CpaTexInfo **out, uint32_t *count) {
+    *out = NULL; *count = 0;
+    if (!img->nReg || img->reg[0].n < 0x94 || texN < 8 || memcmp(texFile, "LZSS", 4)) return 0;
+    uint32_t n = le32(img->reg[0].p + 0x8C), tbl = le32(img->reg[0].p + 0x90);
+    if (!n || n > 4096 || !cpa_ptr(img, tbl, (size_t)n * 4)) return 0;
+    CpaTexInfo *t = (CpaTexInfo *)calloc(n, sizeof *t);
+    if (!t) return 0;
+    size_t pos = 4; int ok = 1;
+    for (uint32_t i = 0; i < n && ok; i++) {
+        size_t bn = 0; uint8_t *b = tex_unpack(texFile, texN, &pos, &bn);
+        if (!b) { ok = 0; break; }
+        uint32_t k = (bn >= 4 && !memcmp(b, "GBIX", 4)) ? 4 : 0;
+        if (bn < (size_t)(k + 4) * 4) { free(b); ok = 0; break; }
+        CpaTexInfo *e = &t[i];
+        e->structVa = cpa_u32(img, tbl + 4 * i); e->hasGbix = (uint8_t)(k != 0);
+        e->raw = le32(b + (k + 2) * 4);
+        { uint32_t wh = le32(b + (k + 3) * 4); e->width = (uint16_t)(wh & 0xFFFF); e->height = (uint16_t)(wh >> 16); }
+        e->pvrFmt = (uint16_t)(e->raw & 0xFFFF);
+        cpa_tex_postload(e->raw, &e->flags, &e->wrap);
+        free(b);
+        if (!cpa_is_ptr(img, e->structVa)) ok = 0;
+    }
+    if (ok && pos != texN) ok = 0;   /* exactly n chunks */
+    *out = t; *count = n;
+    return ok;
+}
+
+static const CpaTexInfo *tex_find(const CpaTexInfo *t, uint32_t n, uint32_t va) {
+    for (uint32_t i = 0; i < n; i++) if (t[i].structVa == va) return &t[i];
+    return NULL;
+}
+static void tex_apply_one(const CpaTexInfo *e, uint32_t *flags, uint8_t *wrapB, uint8_t *valid, uint8_t *tileU, uint8_t *tileV, uint8_t *wrapUnclear, int8_t *alpha) {
+    uint32_t f = e->flags;
+    *flags = f; if (wrapB) *wrapB = e->wrap; *valid = 1;
+    *alpha = CPA_ALPHA_UNKNOWN;
+    if (f & 0x20) *alpha = CPA_ALPHA_ADDITIVE; else if (f & 0x40) *alpha = CPA_ALPHA_BLEND; else if (f & 0x10) *alpha = CPA_ALPHA_CUTOUT;
+    else if (f & 0x08) *alpha = CPA_ALPHA_BLEND; else if (f == 0) *alpha = CPA_ALPHA_OPAQUE;
+    *tileU = *tileV = 1; *wrapUnclear = 1;   /* the pre-load tile decode (tex_decode) is not valid for post-load wrap values: not claimed */
+}
+uint32_t cpa_scene_apply_tex(CpaScene *s, const CpaTexInfo *t, uint32_t n) {
+    uint32_t u = 0;
+    for (uint32_t i = 0; i < s->nItems; i++) { CpaDrawItem *d = &s->items[i]; const CpaTexInfo *e = tex_find(t, n, d->texVa); if (e) { tex_apply_one(e, &d->texFlags, &d->texWrapByte, &d->texFlagsValid, &d->tileU, &d->tileV, &d->wrapUnclear, &d->alphaClass); u++; } }
+    for (uint32_t i = 0; i < s->nSprites; i++) { CpaSprite *d = &s->sprites[i]; const CpaTexInfo *e = tex_find(t, n, d->texVa); if (e) { tex_apply_one(e, &d->texFlags, NULL, &d->texFlagsValid, &d->tileU, &d->tileV, &d->wrapUnclear, &d->alphaClass); u++; } }
+    for (uint32_t i = 0; i < s->rig.nPart; i++) { CpaRigPart *d = &s->rig.part[i]; const CpaTexInfo *e = tex_find(t, n, d->texVa); if (e) { tex_apply_one(e, &d->texFlags, &d->texWrapByte, &d->texFlagsValid, &d->tileU, &d->tileV, &d->wrapUnclear, &d->alphaClass); u++; } }
+    return u;
 }

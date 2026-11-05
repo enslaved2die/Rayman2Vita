@@ -51,6 +51,9 @@ typedef struct CpaDrawItem {
     uint8_t  overlayMode;    /* raw byte at VisualMaterial+0x149; 0 = single pass. Non-zero = the polygons of this item are drawn a SECOND time (second texture
                                 layer, UV x CPA_OVERLAY_UV_SCALE, translucent list). Correlation VERIFIED against the oracle TA stream, see the block comment
                                 above CPA_OVERLAY_UV_SCALE; the meaning of the values 1/2/3 and the identity of the layer-2 texture are UNKNOWN (not in the material). */
+    uint32_t texAnimHead;    /* VisualMaterial texture-animation frame list (VM+0x138 head node), 0 = not animated. texVa is then the LOAD-TIME (head) frame; the live frame
+                                of a running game is another list entry and depends on elapsed guest time (see vm_texture() in cpa_scene.c). Walk with cpa_tex_anim_node(). */
+    uint32_t texAnimCount;   /* VM+0x140 node count */
 } CpaDrawItem;
 
 /* Rayman rig. Layout of animation tables H0..H9 = LEARN DAT header words 0..9 (VERIFIED, notes_geometry.md sec 3 / notes_pose.md). */
@@ -122,9 +125,13 @@ typedef struct CpaScene {
     uint32_t nActors, nActorNoTable, nActorTblEntries, nActorNullPo, nActorBadChain, nActorDupGeo;
     uint32_t nActorGeos;                          /* unique non-Rayman actor GeometricObjects decoded */
     uint32_t nTexDistinct, nTexFlagUnclear, nTexWrapUnclear;
+    uint32_t nAnimMat, nAnimLiveFrame, nAnimMatBad;   /* distinct animated VisualMaterials; of those, how many had a live frame != head (so texVa was normalised to the head); animated-looking VMs whose list is malformed */
     uint32_t raymanSoVa;
     CpaImage img;                 /* copy of the image view (pointers only; buffers must outlive the scene) */
 } CpaScene;
+
+/* k-th node (0 = head) of a texture-animation frame list: texture struct VA and frame duration (float, node +4). Returns 0 if the list ends earlier or is unreadable. */
+int  cpa_tex_anim_node(const CpaImage *im, uint32_t head, uint32_t k, uint32_t *tex, float *dur);
 
 /* Root = VA of the World SuperObject (level DAT header word 13; VERIFIED type 1, parent NULL, 3 children).
  * `img` must have the level DAT as region 0 and FIX.DAT (optional but needed for global matrices/shared objects) after it.
@@ -138,5 +145,32 @@ void cpa_scene_free(CpaScene *s);
 /* Evaluate Rayman's animation at fractional frame ft in [firstFrame, firstFrame+nFrames-1] and fill rig part wpos.
  * Structure (table walk, quaternion decode, key/next-key t) VERIFIED against decompile; slerp/lerp itself INFERRED. */
 void cpa_rig_pose(CpaScene *s, float ft);
+
+/* ---- .TEX post-load texture state ------------------------------------------------------------------------------------------------------------------------------
+ * The guest TEX loader (FUN_8c039f80 -> FUN_8c03a502 per texture, lifted in tools/sh4recomp/gen_fix/recomp_05.c) rewrites the texture struct from the .TEX file:
+ *   tex+0x14 = the PVR header word (word [k+2] of the decompressed block, k = 4 if the block starts with "GBIX", else 0)
+ *   tex+0x18 (wrap byte) = wrap(raw)   [FUN_8c03a5dc],   tex+4 (flags) = flags(raw)   [FUN_8c03a680],   then tex+0x14 = raw & 0xFFFF.
+ * Whatever the DAT image holds at +4 / +0x18 is overwritten. VERIFIED by running: predicted == guest RAM for 9374 of 9374 level textures in all 78 oracle dumps
+ * (flags and wrap byte, 0 mismatches; tools/cpa_tests/test_oracle.c checks it per level).
+ * The .TEX file is "LZSS" followed by chunks {u32 size (counted from the size field itself); payload}, one chunk per texture, in the order of the DAT texture table
+ * (level header: u32 count at file offset 0x8C, VA of the u32[count] table of texture-struct VAs at 0x90). Chunk payload (FUN_8c039f80): control byte c:
+ * c==0 -> 4 literal bytes follow; c even, c!=0 -> c>>2 literal bytes follow; c odd -> the little-endian u32 at c's position gives length = bits 31..24 and
+ * distance = bits 23..1, copy from (out - distance) forwards byte by byte. */
+typedef struct CpaTexInfo {
+    uint32_t structVa;       /* texture struct VA from the DAT table */
+    uint32_t raw;            /* PVR header word before the guest masks it (top bits carry the wrap/alpha-class source) */
+    uint32_t flags;          /* guest tex+4 after load */
+    uint8_t  wrap;           /* guest tex+0x18 after load */
+    uint8_t  hasGbix;
+    uint16_t pvrFmt;         /* raw & 0xFFFF = guest tex+0x14 after load (low byte: pixel format, next byte: data format) */
+    uint16_t width, height;  /* PVR chunk word [k+3]: low u16, high u16 (as passed by the guest to the Kamui surface create) */
+} CpaTexInfo;
+void cpa_tex_postload(uint32_t raw, uint32_t *flags, uint8_t *wrap);
+/* Decode all chunks of `texFile` against the level image's texture table. Returns 1 iff the file has exactly `count` chunks, all decoded, and every table entry is a
+ * readable pointer. *out is malloc'ed (free it); *count = number of textures. */
+int  cpa_tex_table(const CpaImage *img, const uint8_t *texFile, size_t texN, CpaTexInfo **out, uint32_t *count);
+/* Replace texFlags/texWrapByte/tile/alpha of every draw item, sprite and rig part by the post-load values of its texture (texFlagsValid = 1). Items whose texVa is not in
+ * the table are left alone. Returns the number of items/parts/sprites updated. Optional: cpa_scene_load itself keeps reading the DAT (pre-load) struct values. */
+uint32_t cpa_scene_apply_tex(CpaScene *s, const CpaTexInfo *t, uint32_t n);
 
 #endif
