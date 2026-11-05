@@ -45,6 +45,10 @@ void r2_perf_format(const R2Perf *pp, unsigned long guest_frame, void (*sink)(co
     o += snprintf(b + o, sizeof b - o, "[perf] ---- guest frame %lu: window of %u rendered frames, %.2f s wall | variant %s ----\n", guest_frame, p.frames, wall, r2_variant_name);
     o += snprintf(b + o, sizeof b - o, "[perf] period %.2f ms (%.1f fps, max %.1f ms) = guest %.2f (ta %.2f) + build %.2f + texdec %.2f + submit %.2f + swap %.2f + other %.2f\n",
                   per, per > 0 ? 1000.0 / per : 0.0, p.max_period_us / 1000.0, guest, ta_ms, build, texd, submit, swap, per - guest - rend - swap);
+#if R2_SQF_PROBE
+    if (p.sqf_probes) o += snprintf(b + o, sizeof b - o, "[perf] sq flush path (pref -> TA sink, extrapolated from 1-in-32 probes): %.2f ms/frame = %.1f%% of guest, %.0f flushes/frame, %.2f us each\n",
+                  (double)p.t_sqf_probe / R2_SQF_UNIT * ((double)p.sqf_n / p.sqf_probes) / 1000.0 / n, guest > 0 ? 100.0 * (double)p.t_sqf_probe / R2_SQF_UNIT * ((double)p.sqf_n / p.sqf_probes) / 1000.0 / n / guest : 0.0, (double)p.sqf_n / n, (double)p.t_sqf_probe / R2_SQF_UNIT / p.sqf_probes);
+#endif
     o += snprintf(b + o, sizeof b - o, "[perf] frames over 16.7 ms: %u/%u, over 33.4 ms: %u, over 50 ms: %u\n", p.over17, p.frames, p.over34, p.over50);
     o += snprintf(b + o, sizeof b - o, "[perf] per frame: strips %.0f tris %.0f batches %.0f draws %.0f (+%.0f fog) verts %.0f | gl state calls %.0f (+%.0f skipped) | tex binds %.0f uploads %.2f (%.1f KB) | SQ writes %.0f\n",
                   (double)p.strips / n, (double)p.tris / n, (double)p.batches / n, (double)p.draws / n, (double)p.fog_draws / n, (double)p.verts / n, (double)p.state_calls / n, (double)p.state_skipped / n,

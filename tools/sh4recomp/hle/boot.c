@@ -420,7 +420,7 @@ static uint32_t vram_min[2] = {~0u, ~0u}, vram_max[2]; unsigned long vram_area_n
 static void (*sq_sink)(uint32_t phys, const uint8_t *data32);
 void hle_set_sq_sink(void (*fn)(uint32_t phys, const uint8_t *data32)) { sq_sink = fn; }
 static unsigned long sq_ram_n, sq_other_n;
-static void sq_flush_default(SH4Ctx *c, uint32_t addr) {          /* `pref @Rn` with Rn in the SQ window */
+static void sq_flush_body(SH4Ctx *c, uint32_t addr) {          /* `pref @Rn` with Rn in the SQ window */
     (void)c;
     if (addr < 0xE0000000u || addr > 0xE3FFFFFFu) return;          /* pref to a normal address = cache prefetch: no side effect (was corrupting RAM with SQ contents) */
     int q = (addr >> 5) & 1;
@@ -433,6 +433,19 @@ static void sq_flush_default(SH4Ctx *c, uint32_t addr) {          /* `pref @Rn` 
     if (phys >= 0x04000000u && phys < 0x08000000u) { vram_area_n[(phys >> 24) & 3]++; memcpy(&vram[phys & 0x7FFFFF], d, 32); vram_stamp(phys & 0x7FFFFF, 32); sq_other_n++; return; }        /* SQ -> VRAM */
     hle_unhandled("sq-flush", phys, 32, 0);
 }
+#if R2_SQF_PROBE && R2_PERF
+#if defined(__vita__)
+#define SQF_NOW() r2_now_us()                     /* Vita: 1 us resolution (unbiased on average over many probes) */
+#else
+static inline uint64_t SQF_NOW(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }   /* host: ns, the perf line divides by SQF_UNIT */
+#endif
+static void sq_flush_default(SH4Ctx *c, uint32_t addr) {      /* measurement build: time every 32nd flush (whole path incl. the TA sink) */
+    if ((g_perf.sqf_n++ & 31) != 0) { sq_flush_body(c, addr); return; }
+    uint64_t t = SQF_NOW(); sq_flush_body(c, addr); g_perf.t_sqf_probe += SQF_NOW() - t; g_perf.sqf_probes++;
+}
+#else
+#define sq_flush_default sq_flush_body
+#endif
 static uint32_t sq_rd(uint32_t a, int size) { uint32_t v = 0; memcpy(&v, sq_buf + (a & 0x3F), size); return v; }
 static void sq_wr(uint32_t a, int size, uint32_t v) { memcpy(sq_buf + (a & 0x3F), &v, size); }
 
