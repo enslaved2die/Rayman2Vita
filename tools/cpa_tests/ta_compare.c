@@ -26,7 +26,7 @@
 #include <dirent.h>
 #include <ctype.h>
 
-typedef struct { int ok; uint32_t staticTotal, matched, frag, unmBad, unmClip, unverif, sub, oracleTris, texUnexpl, texBoundTotal, vNative, vNear, vOther; double maxErr; } Stats;
+typedef struct { int ok; uint32_t texUnexplActor; uint32_t cull[10]; uint32_t staticTotal, matched, frag, unmBad, unmClip, unverif, sub, subExpl, copOther, copOtherExpl, redraw, redrawSame, oracleTris, texUnexpl, texBoundTotal, vNative, vNear, vOther; double maxErr; } Stats;
 
 #define RAM_BASE 0x8C000000u
 #define VA_HFOV 0x8C00F300u
@@ -41,8 +41,8 @@ typedef struct { int ok; uint32_t staticTotal, matched, frag, unmBad, unmClip, u
 
 typedef struct { float x, y, z, u, v, base[4], off[4]; } TaV;      /* == TaVertex in hle/ta.h */
 typedef struct { uint32_t ctl, isp, tsp, tcw, first, count, sprite, list; } TaS;
-typedef struct { float sx[3], sy[3], w[3], u[3], v[3]; uint32_t item; uint32_t tri; int used; float cx; } PTri;
-typedef struct { float sx[3], sy[3], z[3], u[3], v[3]; uint32_t tcw, tsp, list; int cand, matched, frag, nw; } OTri;
+typedef struct { float sx[3], sy[3], w[3], u[3], v[3]; uint32_t item; uint32_t tri; int used; int by; float cx; } PTri;
+typedef struct { float sx[3], sy[3], z[3], u[3], v[3]; uint32_t tcw, tsp, list; int cand, matched, frag, nw, redraw, redrawSame; uint32_t copT1, fragT1; int copKind, subexp, ambig; } OTri;
 static const int perms[6][3] = { {0,1,2}, {1,2,0}, {2,0,1}, {0,2,1}, {2,1,0}, {1,0,2} };
 
 static float rdf(const uint8_t *ram, uint32_t va) { float f; memcpy(&f, ram + (va - RAM_BASE), 4); return f; }
@@ -50,6 +50,86 @@ static int cmp_cx(const void *a, const void *b) { float x = ((const PTri *)a)->c
 static uint8_t *slurp(const char *p, size_t *n) {
     FILE *f = fopen(p, "rb"); if (!f) return NULL; fseek(f, 0, SEEK_END); long l = ftell(f); fseek(f, 0, SEEK_SET);
     uint8_t *b = malloc((size_t)l + 1); if (!b || fread(b, 1, (size_t)l, f) != (size_t)l) { fclose(f); free(b); return NULL; } fclose(f); *n = (size_t)l; return b;
+}
+
+
+/* Polygon helpers for the subdivision-area test: clip a camera-space triangle at the near plane, project, clip to the 640x480 viewport, return the area in px^2. */
+typedef struct { double x, y; } P2;
+static double poly_area(const P2 *p, int n) { double a = 0; for (int i = 0; i < n; i++) { int j = (i + 1) % n; a += p[i].x * p[j].y - p[j].x * p[i].y; } return fabs(a) * 0.5; }
+static int clip_edge(const P2 *in, int n, P2 *out, int axis, double lim, int keepGreater) {
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        P2 a = in[i], b = in[(i + 1) % n]; double va = axis ? a.y : a.x, vb = axis ? b.y : b.x;
+        int ia = keepGreater ? va >= lim : va <= lim, ib = keepGreater ? vb >= lim : vb <= lim;
+        if (ia) out[m++] = a;
+        if (ia != ib) { double t = (lim - va) / (vb - va); P2 q = { a.x + t * (b.x - a.x), a.y + t * (b.y - a.y) }; out[m++] = q; }
+    }
+    return m;
+}
+static double native_screen_area(const double A[3][3], const double F[3], const double L[3], const double U[3], double fx, double fy) {
+    double cam[8][3]; int nc = 0;
+    double z[3]; double lx[3], uy[3];
+    for (int j = 0; j < 3; j++) { z[j] = F[0]*A[j][0] + F[1]*A[j][1] + F[2]*A[j][2]; lx[j] = L[0]*A[j][0] + L[1]*A[j][1] + L[2]*A[j][2]; uy[j] = U[0]*A[j][0] + U[1]*A[j][1] + U[2]*A[j][2]; }
+    for (int j = 0; j < 3; j++) {
+        int k = (j + 1) % 3; int ij = z[j] >= NEAR_ZC, ik = z[k] >= NEAR_ZC;
+        if (ij) { cam[nc][0] = lx[j]; cam[nc][1] = uy[j]; cam[nc][2] = z[j]; nc++; }
+        if (ij != ik) { double t = (NEAR_ZC - z[j]) / (z[k] - z[j]); cam[nc][0] = lx[j] + t * (lx[k] - lx[j]); cam[nc][1] = uy[j] + t * (uy[k] - uy[j]); cam[nc][2] = NEAR_ZC; nc++; }
+    }
+    if (nc < 3) return 0;
+    P2 a[16], b[16]; int n = nc;
+    for (int i = 0; i < nc; i++) { a[i].x = 320.0 - fx * cam[i][0] / cam[i][2]; a[i].y = 240.0 - fy * cam[i][1] / cam[i][2]; }
+    n = clip_edge(a, n, b, 0, 0.0, 1);   if (n < 3) return 0;
+    n = clip_edge(b, n, a, 0, 640.0, 0); if (n < 3) return 0;
+    n = clip_edge(a, n, b, 1, 0.0, 1);   if (n < 3) return 0;
+    n = clip_edge(b, n, a, 1, 480.0, 0); if (n < 3) return 0;
+    return poly_area(a, n);
+}
+
+/* ---- Provenance (tooling only; mirrors the walk in src/cpa/cpa_scene.c so the library is unchanged): which IPO SuperObject and which sector SuperObject a static native vertex came from.
+ * The world position of every vertex of every IPO geometry is computed with the loader's exact float arithmetic (same matrix chain, same xform), so a native triangle's three world
+ * positions are found bit-for-bit in the table. Triangles whose vertices are not all from one IPO (shared coordinates between IPOs) get ipo = 0 (unknown). */
+typedef struct { float m[16]; } PMat;
+typedef struct { uint32_t k[3], ipo, sector; } PV;
+typedef struct { PV *a; uint32_t n, cap, nIpo, nSector, nodes; } PVTab;
+static int pm_read(const CpaImage *im, uint32_t va, PMat *r) { uint32_t t; if (!cpa_rd32(im, va, &t) || t < 1 || t > 6) return 0; for (int i = 0; i < 16; i++) if (!cpa_rdf(im, va + 0x28 + 4u * i, &r->m[i])) return 0; return 1; }
+static void pm_mul(const PMat *a, const PMat *b, PMat *r) { PMat t; for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) { float s = 0; for (int k = 0; k < 4; k++) s += a->m[i*4+k] * b->m[k*4+j]; t.m[i*4+j] = s; } *r = t; }
+static void pm_xf(const PMat *m, const float v[3], float o[3]) { for (int j = 0; j < 3; j++) o[j] = v[0] * m->m[j] + v[1] * m->m[4+j] + v[2] * m->m[8+j] + m->m[12+j]; }
+static int pv_cmp(const void *a, const void *b) { const PV *x = a, *y = b; for (int i = 0; i < 3; i++) if (x->k[i] != y->k[i]) return x->k[i] < y->k[i] ? -1 : 1; return 0; }
+static void prov_walk(const CpaImage *im, uint32_t va, const PMat *pg, uint32_t sector, int depth, PVTab *T) {
+    uint32_t w[18]; if (depth > 32 || T->nodes++ > 100000) return;
+    for (int i = 0; i < 18; i++) if (!cpa_rd32(im, va + 4u * i, &w[i])) return;
+    PMat loc, glob, chain, world; int hl = cpa_is_ptr(im, w[8]) && pm_read(im, w[8], &loc), hg = cpa_is_ptr(im, w[9]) && pm_read(im, w[9], &glob);
+    if (hl) pm_mul(&loc, pg, &chain); else chain = *pg;
+    world = hg ? glob : chain;
+    if (w[0] == CPA_SO_SECTOR) sector = ++T->nSector;
+    if (w[0] == CPA_SO_IPO) {
+        uint32_t po, vs, geo, pv, cnt;
+        if (cpa_is_ptr(im, w[1]) && cpa_rd32(im, w[1], &po) && cpa_is_ptr(im, po) && cpa_rd32(im, po, &vs) && cpa_is_ptr(im, vs) && cpa_rd32(im, vs + 4, &geo) && cpa_is_ptr(im, geo) &&
+            cpa_rd32(im, geo, &pv) && cpa_rd32(im, geo + 0x2C, &cnt) && (cnt & 0xFFFF) && (cnt & 0xFFFF) <= 20000 && cpa_is_ptr(im, pv)) {
+            uint32_t nv = cnt & 0xFFFF, id = ++T->nIpo;
+            for (uint32_t i = 0; i < nv; i++) {
+                float v[3], o[3]; int ok = 1; for (int k = 0; k < 3; k++) ok &= cpa_rdf(im, pv + i * 12 + k * 4, &v[k]); if (!ok) continue;
+                pm_xf(&world, v, o);
+                if (T->n == T->cap) { T->cap = T->cap ? T->cap * 2 : 4096; T->a = realloc(T->a, T->cap * sizeof *T->a); }
+                PV *e = &T->a[T->n++]; memcpy(e->k, o, 12); e->ipo = id; e->sector = sector;
+            }
+        }
+    }
+    uint32_t ch = w[2], n = 0;
+    while (ch && n++ < 100000) { uint32_t nx; if (!cpa_rd32(im, ch + 0x14, &nx)) break; prov_walk(im, ch, &world, sector, depth + 1, T); ch = nx; }
+}
+/* ipo/sector ids of native triangle t (all three vertices must be found in ONE IPO; sector then follows); 0 = unknown */
+static void prov_find(const PVTab *T, const float *P9, uint32_t *ipo, uint32_t *sector) {
+    uint32_t cand[16]; int nc = 0; PV key; *ipo = *sector = 0;
+    memcpy(key.k, P9, 12);
+    uint32_t lo = 0, hi = T->n; while (lo < hi) { uint32_t m = (lo + hi) / 2; if (pv_cmp(&T->a[m], &key) < 0) lo = m + 1; else hi = m; }
+    for (uint32_t m = lo; m < T->n && !pv_cmp(&T->a[m], &key) && nc < 16; m++) cand[nc++] = m;
+    for (int c = 0; c < nc; c++) {
+        int all = 1;
+        for (int v = 1; v < 3 && all; v++) { PV k2; memcpy(k2.k, P9 + 3 * v, 12); uint32_t l2 = 0, h2 = T->n; while (l2 < h2) { uint32_t m = (l2 + h2) / 2; if (pv_cmp(&T->a[m], &k2) < 0) l2 = m + 1; else h2 = m; }
+            int f = 0; for (uint32_t m = l2; m < T->n && !pv_cmp(&T->a[m], &k2); m++) if (T->a[m].ipo == T->a[cand[c]].ipo) { f = 1; break; } all = f; }
+        if (all) { *ipo = T->a[cand[c]].ipo; *sector = T->a[cand[c]].sector; return; }
+    }
 }
 
 static int do_scene(const CpaScene *scp, const char *capdir, const char *level, long scene, long ramscene, double tol, double ztol, int verbose, Stats *st) {
@@ -145,7 +225,7 @@ static int do_scene(const CpaScene *scp, const char *capdir, const char *level, 
             if (hitIdx >= 0) break;
         }
         if (hitIdx < 0) continue;
-        pt[hitIdx].used = 1; ot[a].matched = 1; ot[a].nw = ((pt[hitIdx].sx[1]-pt[hitIdx].sx[0])*(pt[hitIdx].sy[2]-pt[hitIdx].sy[0]) - (pt[hitIdx].sx[2]-pt[hitIdx].sx[0])*(pt[hitIdx].sy[1]-pt[hitIdx].sy[0])) < 0; matched++; matchedCand[ot[a].cand]++; sumErr += hitErr; if (hitErr > maxErr) maxErr = hitErr; if (ot[a].list < 8) listMatched[ot[a].list]++;
+        pt[hitIdx].used = 1; pt[hitIdx].by = (int)a; ot[a].matched = 1; ot[a].nw = ((pt[hitIdx].sx[1]-pt[hitIdx].sx[0])*(pt[hitIdx].sy[2]-pt[hitIdx].sy[0]) - (pt[hitIdx].sx[2]-pt[hitIdx].sx[0])*(pt[hitIdx].sy[1]-pt[hitIdx].sy[0])) < 0; matched++; matchedCand[ot[a].cand]++; sumErr += hitErr; if (hitErr > maxErr) maxErr = hitErr; if (ot[a].list < 8) listMatched[ot[a].list]++;
         int uvok = 1; for (int j = 0; j < 3; j++) { int q = perms[hitPerm][j]; if (fabsf(pt[hitIdx].u[q] - ot[a].u[j]) > 1e-3f || fabsf(pt[hitIdx].v[q] - ot[a].v[j]) > 1e-3f) uvok = 0; }
         uvok ? uvAgree++ : uvDis++;
         const CpaDrawItem *d = &sc.items[pt[hitIdx].item]; texPair++;
@@ -155,19 +235,40 @@ static int do_scene(const CpaScene *scp, const char *capdir, const char *level, 
         if (ot[a].list < 5) xtab[d->alphaClass + 1][ot[a].list]++;
         if (verbose) printf("  oracle tri %u list %u -> native tri %u item %u perm %d err %.4f px uv %s\n", a, ot[a].list, pt[hitIdx].tri, pt[hitIdx].item, hitPerm, hitErr, uvok ? "same" : "DIFF");
     }
+    /* Re-draw model (geometry only, UV independent): an unmatched oracle triangle whose screen/depth geometry equals a native static triangle that is ALREADY paired with another
+     * oracle triangle is a second draw of the same static polygon (multi-pass / second texture layer / translucent overlay). Counted as explained geometry; the UV scale and whether the
+     * texture (tcw) is the same as the first draw are reported so the claim is checkable. */
+    uint32_t nRedraw = 0, nRedrawSameTcw = 0, redrawList[8] = { 0 }, redrawTcw[256]; int nRedrawTcw = 0;
+    for (uint32_t a = 0; a < no; a++) {
+        if (ot[a].matched) continue;
+        float ocx = (ot[a].sx[0] + ot[a].sx[1] + ot[a].sx[2]) / 3.0f; int hit = -1;
+        uint32_t lo = 0, hi = npt; while (lo < hi) { uint32_t m = (lo + hi) / 2; if (pt[m].cx < ocx - (float)tol - 1e-3f) lo = m + 1; else hi = m; }
+        for (uint32_t m = lo; m < npt && pt[m].cx <= ocx + (float)tol + 1e-3f && hit < 0; m++) {
+            if (!pt[m].used) continue;
+            for (int pi = 0; pi < 6 && hit < 0; pi++) { int ok = 1;
+                for (int j = 0; j < 3 && ok; j++) { int q = perms[pi][j];
+                    if (fabs(pt[m].sx[q] - ot[a].sx[j]) > tol || fabs(pt[m].sy[q] - ot[a].sy[j]) > tol || fabs(pt[m].w[q] - ot[a].z[j]) / (fabs(ot[a].z[j]) + 1e-9) > ztol) ok = 0; }
+                if (ok) hit = (int)m; }
+        }
+        if (hit < 0) continue;
+        { int k = 0; while (k < nRedrawTcw && redrawTcw[k] != ot[a].tcw) k++; if (k == nRedrawTcw && nRedrawTcw < 256) redrawTcw[nRedrawTcw++] = ot[a].tcw; }
+        ot[a].redraw = 1; ot[a].redrawSame = (ot[pt[hit].by].tcw == ot[a].tcw); nRedraw++; nRedrawSameTcw += ot[a].redrawSame; if (ot[a].list < 8) redrawList[ot[a].list]++;
+        if (verbose) printf("  REDRAW oracle tri %u (list %u tcw %08x) = static native tri %u already paired with oracle tri %d (list %u tcw %08x)\n", a, ot[a].list, ot[a].tcw, pt[hit].tri, pt[hit].by, ot[pt[hit].by].list, ot[pt[hit].by].tcw);
+        if (verbose) { float mo = 0, mn = 0; for (int j = 0; j < 3; j++) { float a1 = fabsf(ot[a].u[j]) > fabsf(ot[a].v[j]) ? fabsf(ot[a].u[j]) : fabsf(ot[a].v[j]), b1 = fabsf(ot[pt[hit].by].u[j]) > fabsf(ot[pt[hit].by].v[j]) ? fabsf(ot[pt[hit].by].u[j]) : fabsf(ot[pt[hit].by].v[j]); if (a1 > mo) mo = a1; if (b1 > mn) mn = b1; } printf("    max |uv|: redraw %.3f, first draw %.3f; tile bits tsp redraw %08x first %08x\n", mo, mn, ot[a].tsp, ot[pt[hit].by].tsp); }
+    }
     /* Clip / subdivision model (geometry only, UV independent): the game clips against the near plane (and the frustum), emitting NEW vertices on the
      * edges of the original triangle. An unmatched oracle triangle is a "clip fragment" iff all three of its vertices, unprojected with the same camera
      * (Zc = 1/(4 z), L.r = (320-sx) Zc/fx, U.r = (240-sy) Zc/fy, F.r = Zc), lie on the plane of ONE native static triangle (distance <= FRAG_PLANE * Zc)
      * and inside it (barycentric >= -FRAG_BARY), with a consistent texture if the native texture is already bound. Reason class: the native triangle has
      * a vertex behind the camera (near clip), else a vertex off the 640x480 viewport (frustum clip), else neither (other subdivision: reported, not hidden). */
-    double minZcMatched = 1e30, minZcFrag = 1e30;
-    for (uint32_t a = 0; a < no; a++) if (ot[a].matched) for (int j = 0; j < 3; j++) { double zc = 1.0 / (4.0 * ot[a].z[j]); if (zc < minZcMatched) minZcMatched = zc; }
+    double minZcMatched = 1e30, minZcFrag = 1e30, maxZcMatched = 0;
+    for (uint32_t a = 0; a < no; a++) if (ot[a].matched) for (int j = 0; j < 3; j++) { double zc = 1.0 / (4.0 * ot[a].z[j]); if (zc < minZcMatched) minZcMatched = zc; if (zc > maxZcMatched) maxZcMatched = zc; }
     uint32_t vNative = 0, vNear = 0, vOther = 0;
-    uint32_t nFrag = 0, fragNear = 0, fragFrustum = 0, fragOther = 0, fragTexBad = 0, fragUnbound = 0, fragSub = 0;
+    uint32_t nFrag = 0, fragNear = 0, fragFrustum = 0, fragOther = 0, fragTexBad = 0, fragUnbound = 0, fragSub = 0, nFragLayer = 0;
     {
         const double FRAG_PLANE = 3e-3, FRAG_BARY = 0.02;
         for (uint32_t a = 0; a < no; a++) {
-            if (ot[a].matched) continue;
+            if (ot[a].matched || ot[a].redraw) continue;
             double R[3][3]; int okz = 1;
             for (int j = 0; j < 3; j++) {
                 double zc = 1.0 / (4.0 * ot[a].z[j]); if (!(ot[a].z[j] > 0) || !isfinite(zc)) { okz = 0; break; }
@@ -193,12 +294,18 @@ static int do_scene(const CpaScene *scp, const char *capdir, const char *level, 
                     if (b0 < -FRAG_BARY || b1 < -FRAG_BARY || b2 < -FRAG_BARY) all = 0;
                 }
                 if (!all) continue;
-                int f = -1; for (int i = 0; i < ntexmap; i++) if (texmap[i].va == natTex[t]) { f = i; break; }
-                if (f >= 0 && texmap[f].tcw != ot[a].tcw) { fragTexBad++; continue; }
+                int f = -1, layerFrag = 0; for (int i = 0; i < ntexmap; i++) if (texmap[i].va == natTex[t]) { f = i; break; }
+                if (f >= 0 && texmap[f].tcw != ot[a].tcw) {
+                    /* A second texture layer (tcw proven by exact re-draws above to be drawn over static polygons) legitimately differs from the first-pass texture. */
+                    int isLayer = 0; for (int k = 0; k < nRedrawTcw; k++) if (redrawTcw[k] == ot[a].tcw) isLayer = 1;
+                    if (!isLayer) { fragTexBad++; continue; }
+                    layerFrag = 1;
+                }
                 int behind = natBehind[t], off = 0;
                 if (!behind) for (int j = 0; j < 3; j++) { double zc = 0; for (int k = 0; k < 3; k++) zc += F[k]*A[j][k];
                     double sxx = 320.0 - fx * (L[0]*A[j][0]+L[1]*A[j][1]+L[2]*A[j][2]) / zc, syy = 240.0 - fy * (U[0]*A[j][0]+U[1]*A[j][1]+U[2]*A[j][2]) / zc;
                     if (sxx < 0 || sxx >= 640 || syy < 0 || syy >= 480) off = 1; }
+                if (!ot[a].copT1) { ot[a].copT1 = t + 1; ot[a].copKind = (!behind && !off) ? 1 : 2; }
                 if (!behind && !off) { fragOther++; continue; }            /* coplanar and inside, but the native triangle is not clipped: decal/shadow/other, NOT counted as a clip fragment */
                 int cn = 0, cz = 0, co = 0, ci = 0;     /* vertex classes: native vertex | on the near plane | other, outside the viewport (frustum clip) | other, INSIDE the viewport */
                 for (int j = 0; j < 3; j++) {
@@ -213,29 +320,125 @@ static int do_scene(const CpaScene *scp, const char *capdir, const char *level, 
                 }
                 /* Plain clipping can only create vertices on the near plane or on the frustum (outside / on the viewport edge). An INTERIOR new vertex means the game subdivided
                  * (or this is a coplanar decal): classified apart and NOT counted as a clip fragment. */
-                if (ci) { fragSub++; continue; }
+                if (ci) { fragSub++; ot[a].ambig = 1; if (verbose) printf("  AMBIGUOUS oracle tri %u list %u tcw %08x uv0 (%.3f %.3f) area %.2f px^2 centre (%.1f %.1f) inside native tri %u\n", a, ot[a].list, ot[a].tcw, ot[a].u[0], ot[a].v[0], fabs((ot[a].sx[1]-ot[a].sx[0])*(ot[a].sy[2]-ot[a].sy[0]) - (ot[a].sx[2]-ot[a].sx[0])*(ot[a].sy[1]-ot[a].sy[0])) * 0.5, (ot[a].sx[0]+ot[a].sx[1]+ot[a].sx[2])/3, (ot[a].sy[0]+ot[a].sy[1]+ot[a].sy[2])/3, t); continue; }
                 if (f < 0) fragUnbound++;                                  /* counted, but its texture could not be cross-checked */
                 for (int j = 0; j < 3; j++) { double zc = 1.0 / (4.0 * ot[a].z[j]); if (behind && zc < minZcFrag) minZcFrag = zc; }
                 vNative += cn; vNear += cz; vOther += co;
-                ot[a].frag = 1; nFrag++; if (behind) fragNear++; else fragFrustum++;
+                ot[a].frag = 1; ot[a].fragT1 = t + 1; nFrag++; nFragLayer += layerFrag; if (behind) fragNear++; else fragFrustum++;
                 break;
             }
         }
     }
+    /* Subdivision test (area conservation, geometry only): unmatched oracle triangles that lie in the plane of ONE native static triangle and inside it (recorded above as copT1) are
+     * grouped per native triangle. If the summed screen area of the group equals the native triangle's projected area (near-plane- and viewport-clipped) within 5%, the native triangle was
+     * drawn as several smaller triangles (game-side subdivision) and the group is explained. A coplanar decal/shadow would not conserve area. */
+    uint32_t nSubdivNat = 0, nSubdivTris = 0, nSubdivNatUndrawn = 0, nAmbig = 0, nAmbigExpl = 0, nAmbigNonStatic = 0, nCopOther = 0, nCopOtherExpl = 0;
+    {
+        double *sumSub = calloc(nt, sizeof(double)); uint8_t *okNat = calloc(nt, 1);
+        for (uint32_t a = 0; a < no; a++) if (!ot[a].matched && !ot[a].redraw && ot[a].copT1) {
+            const OTri *o = &ot[a]; sumSub[o->copT1 - 1] += fabs((o->sx[1]-o->sx[0])*(o->sy[2]-o->sy[0]) - (o->sx[2]-o->sx[0])*(o->sy[1]-o->sy[0])) * 0.5; }
+        double Fd[3] = { F[0], F[1], F[2] }, Ld[3] = { L[0], L[1], L[2] }, Ud[3] = { U[0], U[1], U[2] };
+        for (uint32_t t = 0; t < nt; t++) if (sumSub[t] > 0) {
+            const float *P = &sc.pos[t * 9]; double A[3][3];
+            for (int j = 0; j < 3; j++) for (int k = 0; k < 3; k++) A[j][k] = P[j * 3 + k] - C[k];
+            double ar = native_screen_area(A, Fd, Ld, Ud, fx, fy);
+            if (ar > 1e-6 && fabs(sumSub[t] / ar - 1.0) <= 0.05) { okNat[t] = 1; nSubdivNat++; }
+        }
+        for (uint32_t m = 0; m < npt; m++) if (!pt[m].used && okNat[pt[m].tri]) nSubdivNatUndrawn++;
+        for (uint32_t a = 0; a < no; a++) {
+            if (ot[a].matched || ot[a].redraw || !ot[a].copT1) continue;
+            int ok = okNat[ot[a].copT1 - 1];
+            if (ok && !ot[a].frag) { ot[a].subexp = 1; nSubdivTris++; }
+            if (ot[a].ambig) {
+                int bound = 0; for (int i = 0; i < ntexmap; i++) if (texmap[i].tcw == ot[a].tcw) { bound = 1; break; }
+                nAmbig++; nAmbigExpl += ok; if (!ok && !bound) { nAmbigNonStatic++; ot[a].subexp = 2; }   /* texture never paired with any static triangle: effect/particle quad that is only coincidentally coplanar */
+            }
+            else if (ot[a].copKind == 1 && !ot[a].frag) { nCopOther++; nCopOtherExpl += ok; }
+        }
+        free(sumSub); free(okNat);
+    }
     /* Independent (UV/geometry-free) cross-check of the static denominator: oracle triangles whose texture (tcw) is the image of a native STATIC texture proven by
      * matched pairs. Those that are neither matched nor explained as clip fragments are reported as "unexplained": they are either actor/HUD/decal triangles that
      * share a level texture, or real misses (not hidden). */
-    uint32_t texUnexpl = 0, texBoundTotal = 0;
+    uint32_t texUnexpl = 0, texBoundTotal = 0, texUnexplCand[3] = { 0, 0, 0 };
     for (uint32_t a = 0; a < no; a++) {
         int bound = 0; for (int i = 0; i < ntexmap; i++) if (texmap[i].tcw == ot[a].tcw) { bound = 1; break; }
-        if (!bound) continue; texBoundTotal++; if (!ot[a].matched && !ot[a].frag) { texUnexpl++; if (verbose) printf("  UNEXPLAINED tri %u (static-bound tcw %08x list %u): v0 (%.2f %.2f z %.5f) v1 (%.2f %.2f) v2 (%.2f %.2f)\n", a, ot[a].tcw, ot[a].list, ot[a].sx[0], ot[a].sy[0], ot[a].z[0], ot[a].sx[1], ot[a].sy[1], ot[a].sx[2], ot[a].sy[2]); }
+        if (!bound) continue; texBoundTotal++; if (!ot[a].matched && !ot[a].frag && !ot[a].redraw && !ot[a].subexp) { texUnexpl++; texUnexplCand[ot[a].cand]++; if (verbose) { printf("  UNEXPLAINED tri %u (static-bound tcw %08x list %u): v0 (%.2f %.2f z %.5f) v1 (%.2f %.2f) v2 (%.2f %.2f)\n", a, ot[a].tcw, ot[a].list, ot[a].sx[0], ot[a].sy[0], ot[a].z[0], ot[a].sx[1], ot[a].sy[1], ot[a].sx[2], ot[a].sy[2]);
+            for (int j = 0; j < 3; j++) { double zc = 1.0 / (4.0 * ot[a].z[j]), lr = (320.0 - ot[a].sx[j]) * zc / fx, ur = (240.0 - ot[a].sy[j]) * zc / fy; printf("    W%d %.5f %.5f %.5f uv %.4f %.4f\n", j, C[0] + lr*L[0] + ur*U[0] + zc*F[0], C[1] + lr*L[1] + ur*U[1] + zc*F[1], C[2] + lr*L[2] + ur*U[2] + zc*F[2], ot[a].u[j], ot[a].v[j]); } } }
     }
     /* Winding / back-face evidence: signed screen area of matched oracle triangles vs. fully on-screen native triangles the oracle did not draw. */
     uint32_t wMatched[2] = { 0, 0 }, wUnmOn[2] = { 0, 0 }, nUnmOn = 0;
-    for (uint32_t a = 0; a < no; a++) if (ot[a].matched) wMatched[ot[a].nw]++;
+    uint32_t wList[8][2]; memset(wList, 0, sizeof wList);
+    for (uint32_t a = 0; a < no; a++) if (ot[a].matched) { wMatched[ot[a].nw]++; if (ot[a].list < 8) wList[ot[a].list][ot[a].nw]++; }
     for (uint32_t m = 0; m < npt; m++) if (!pt[m].used) {
         int on = 1; for (int j = 0; j < 3; j++) if (pt[m].sx[j] < 0 || pt[m].sx[j] >= 640 || pt[m].sy[j] < 0 || pt[m].sy[j] >= 480) on = 0;
         if (!on) continue; double ar = (pt[m].sx[1]-pt[m].sx[0])*(pt[m].sy[2]-pt[m].sy[0]) - (pt[m].sx[2]-pt[m].sx[0])*(pt[m].sy[1]-pt[m].sy[0]); wUnmOn[ar < 0]++; nUnmOn++;
+    }
+    /* Culling classification of fully on-screen native static triangles that the oracle did NOT draw (descriptive, from this scene's own matched pairs; NOT a predictive visibility model).
+     * Granularity levels via SuperObject provenance (prov_walk): IPO (one mesh object) and its sector. "Drawn" native triangle = paired with an oracle triangle, or the parent of a clip fragment.
+     * Screen signed area ar<0 is the winding every matched triangle of a one-sided IPO has (INFERRED front face). */
+    uint32_t cDegen = 0, cBackOne = 0, cBackTwo = 0, cBackUnk = 0, cFrontPartIpo = 0, cFrontIpoCulled = 0, cFrontSectorCulled = 0, cFrontUnk = 0, cFrontElemUndrawn = 0, cTwin = 0, nIpoDrawn = 0, nIpoCulled = 0, nIpoMixed = 0, nMixedMinority = 0, nIpoMatchedAny = 0, nSecDrawn = 0, nSecCulled = 0;
+    {
+        PVTab T; memset(&T, 0, sizeof T);
+        PMat id; memset(&id, 0, sizeof id); id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.f;
+        { uint32_t root = 0; if (sc.img.nReg > 0 && sc.img.reg[0].n >= 0x38) { const uint8_t *q = sc.img.reg[0].p + 13 * 4; root = (uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24; }
+          if (root) prov_walk(&sc.img, root, &id, 0, 0, &T); }
+        if (T.n) qsort(T.a, T.n, sizeof *T.a, pv_cmp);
+        uint32_t *tIpo = calloc(nt, 4), *tSec = calloc(nt, 4); uint8_t *drawn = calloc(nt, 1);
+        for (uint32_t t = 0; t < nt; t++) if (natStatic[t] && T.n) prov_find(&T, &sc.pos[t * 9], &tIpo[t], &tSec[t]);
+        for (uint32_t m = 0; m < npt; m++) if (pt[m].used) drawn[pt[m].tri] = 1;
+        for (uint32_t a = 0; a < no; a++) if (ot[a].fragT1) drawn[ot[a].fragT1 - 1] = 1;
+        uint32_t ni = T.nIpo + 1, ns = T.nSector + 1;
+        uint32_t *iD = calloc(ni, 4), *iPos = calloc(ni, 4), *iNeg = calloc(ni, 4), *iUnd = calloc(ni, 4), *sD = calloc(ns, 4), *sUnd = calloc(ns, 4);
+        for (uint32_t m = 0; m < npt; m++) if (pt[m].used) { uint32_t g = tIpo[pt[m].tri];
+            double ar = (pt[m].sx[1]-pt[m].sx[0])*(pt[m].sy[2]-pt[m].sy[0]) - (pt[m].sx[2]-pt[m].sx[0])*(pt[m].sy[1]-pt[m].sy[0]); if (ar < 0) iNeg[g]++; else iPos[g]++; }
+        uint32_t *tItemId = calloc(nt, 4); uint32_t *ipoItemD = calloc((size_t)ni * (sc.nItems + 1), 4);
+        for (uint32_t it = 0; it < sc.nItems; it++) for (uint32_t k = 0; k < sc.items[it].vertCount / 3; k++) tItemId[sc.items[it].firstVert / 3 + k] = it;
+        for (uint32_t t = 0; t < nt; t++) if (natStatic[t] && drawn[t]) { iD[tIpo[t]]++; sD[tSec[t]]++; ipoItemD[(size_t)tIpo[t] * (sc.nItems + 1) + tItemId[t]]++; }
+        for (uint32_t m = 0; m < npt; m++) if (!drawn[pt[m].tri]) {
+            int on = 1; for (int j = 0; j < 3; j++) if (pt[m].sx[j] < 0 || pt[m].sx[j] >= 640 || pt[m].sy[j] < 0 || pt[m].sy[j] >= 480) on = 0;
+            double ar = (pt[m].sx[1]-pt[m].sx[0])*(pt[m].sy[2]-pt[m].sy[0]) - (pt[m].sx[2]-pt[m].sx[0])*(pt[m].sy[1]-pt[m].sy[0]);
+            if (!on || ar >= 0 || fabs(ar) < 1e-3) continue; iUnd[tIpo[pt[m].tri]]++; sUnd[tSec[pt[m].tri]]++;
+        }
+        uint32_t wTab[5][2][2]; memset(wTab, 0, sizeof wTab);   /* [alphaClass+1][matched=0/undrawn=1][ar<0 front=0 / ar>=0 back=1] */
+        for (uint32_t m = 0; m < npt; m++) {
+            int on = 1; for (int j = 0; j < 3; j++) if (pt[m].sx[j] < 0 || pt[m].sx[j] >= 640 || pt[m].sy[j] < 0 || pt[m].sy[j] >= 480) on = 0;
+            if (!on) continue; if (!pt[m].used && drawn[pt[m].tri]) continue;
+            double ar = (pt[m].sx[1]-pt[m].sx[0])*(pt[m].sy[2]-pt[m].sy[0]) - (pt[m].sx[2]-pt[m].sx[0])*(pt[m].sy[1]-pt[m].sy[0]); if (fabs(ar) < 1e-3) continue;
+            wTab[sc.items[pt[m].item].alphaClass + 1][pt[m].used ? 0 : 1][ar >= 0]++;
+        }
+        { const char *rn[5] = { "unknown", "opaque", "cutout", "blend", "additive" };
+          printf("  fully on-screen native tris by material class (INFERRED alphaClass) [matched front/back | undrawn front/back]:");
+          for (int r = 0; r < 5; r++) printf(" %s %u/%u|%u/%u;", rn[r], wTab[r][0][0], wTab[r][0][1], wTab[r][1][0], wTab[r][1][1]);
+          printf("\n"); }
+        for (uint32_t m = 0; m < npt; m++) if (!drawn[pt[m].tri]) {
+            int on = 1; for (int j = 0; j < 3; j++) if (pt[m].sx[j] < 0 || pt[m].sx[j] >= 640 || pt[m].sy[j] < 0 || pt[m].sy[j] >= 480) on = 0;
+            if (!on) continue;
+            double ar = (pt[m].sx[1]-pt[m].sx[0])*(pt[m].sy[2]-pt[m].sy[0]) - (pt[m].sx[2]-pt[m].sx[0])*(pt[m].sy[1]-pt[m].sy[0]); uint32_t g = tIpo[pt[m].tri], sec = tSec[pt[m].tri];
+            /* Winding rule measured above: matched OPAQUE-list triangles are (almost) never positive-area, matched TRANSLUCENT-list ones often are => opaque materials are one-sided (back faces
+             * culled), translucent two-sided. Material class of a native triangle = INFERRED alphaClass of its draw item. Positive area = back face (INFERRED). */
+            int opaque = sc.items[pt[m].item].alphaClass == CPA_ALPHA_OPAQUE;
+            /* twin: a DRAWN native triangle with the same three projected vertices (any order/winding): the level data holds the polygon twice (e.g. front + back copy of a two-sided face)
+             * and the oracle drew it once, so the unpaired copy is the same draw, not a culled one. */
+            int twin = 0;
+            { uint32_t lo = 0, hi = npt; while (lo < hi) { uint32_t q = (lo + hi) / 2; if (pt[q].cx < pt[m].cx - (float)tol - 1e-3f) lo = q + 1; else hi = q; }
+              for (uint32_t q = lo; q < npt && pt[q].cx <= pt[m].cx + (float)tol + 1e-3f && !twin; q++) {
+                  if (q == m || !pt[q].used) continue;
+                  for (int pi = 0; pi < 6 && !twin; pi++) { int ok = 1;
+                      for (int j = 0; j < 3 && ok; j++) { int k = perms[pi][j]; if (fabs(pt[q].sx[k] - pt[m].sx[j]) > tol || fabs(pt[q].sy[k] - pt[m].sy[j]) > tol || fabs(pt[q].w[k] - pt[m].w[j]) / (fabs(pt[m].w[j]) + 1e-9) > ztol) ok = 0; }
+                      twin = ok; } } }
+            if (twin) cTwin++;
+            else if (fabs(ar) < 1e-3) cDegen++;
+            else if (ar > 0 && opaque) cBackOne++;
+            else if (ar > 0) cBackTwo++;                                   /* back-facing but a non-opaque (two-sided by the rule) material: NOT explained by culling */
+            else if (!g) cFrontUnk++;
+            else if (iD[g] && !ipoItemD[(size_t)g * (sc.nItems + 1) + pt[m].item]) cFrontElemUndrawn++;
+            else if (iD[g]) { cFrontPartIpo++; if (verbose) printf("  FRONT-UNDRAWN-PARTIAL-IPO native tri %u ipo %u (drawn %u) alpha %d area %.2f px^2 Zc %.1f %.1f %.1f centre (%.0f %.0f)\n", pt[m].tri, g, iD[g], sc.items[pt[m].item].alphaClass, fabs(ar) * 0.5, 0.25 / pt[m].w[0], 0.25 / pt[m].w[1], 0.25 / pt[m].w[2], pt[m].cx, (pt[m].sy[0]+pt[m].sy[1]+pt[m].sy[2])/3); }
+            else if (sD[sec]) cFrontIpoCulled++; else cFrontSectorCulled++;
+        }
+        for (uint32_t g = 1; g < ni; g++) { if (iD[g]) nIpoDrawn++; else if (iUnd[g]) nIpoCulled++; if (iPos[g] && iNeg[g]) { nIpoMixed++; nMixedMinority += iPos[g] < iNeg[g] ? iPos[g] : iNeg[g]; } if (iPos[g] + iNeg[g]) nIpoMatchedAny++; }
+        for (uint32_t g = 1; g < ns; g++) { if (sD[g]) nSecDrawn++; else if (sUnd[g]) nSecCulled++; }
+        free(T.a); free(tIpo); free(tSec); free(drawn); free(iD); free(iPos); free(iNeg); free(iUnd); free(sD); free(sUnd); free(tItemId); free(ipoItemD);
     }
     /* Static-triangle denominator. An oracle triangle counts as "static" if it was matched by geometry, OR it is unmatched but has a native static triangle with
      * identical UVs whose texture struct is already known (from the matched pairs above) to be the oracle triangle's texture (tcw). This keeps coincidental
@@ -289,13 +492,22 @@ static int do_scene(const CpaScene *scp, const char *capdir, const char *level, 
     printf("  fragment vertices: coincide with a native vertex %u | lie on the near plane Zc=%.2f %u | outside the viewport (frustum clip) %u\n", vNative, NEAR_ZC, vNear, vOther);
     printf("  near-plane evidence: smallest Zc among matched (unclipped) oracle vertices %.4f; smallest Zc among oracle vertices of near-clip fragments %.4f\n", minZcMatched, minZcFrag);
     printf("  clip-aware match rate: (matched %u + clip fragments %u) / static %u = %.2f%%   (strict, no clip model: %.2f%%)\n", matched, nFrag, staticTotal, staticTotal ? 100.0 * (matched + nFrag) / staticTotal : 0.0, staticTotal ? 100.0 * matched / staticTotal : 0.0);
-    printf("  oracle triangles using a static-proven texture: %u, of which neither matched nor clip fragment (unexplained): %u\n", texBoundTotal, texUnexpl);
+    printf("  re-draws: %u unmatched oracle triangles equal (geometry only) a static native triangle already paired with another oracle triangle (%u with the same tcw as the first draw, %u with a different tcw); by list: opaque %u, op-mod %u, translucent %u, tr-mod %u, punch %u\n", nRedraw, nRedrawSameTcw, nRedraw - nRedrawSameTcw, redrawList[0], redrawList[1], redrawList[2], redrawList[3], redrawList[4]);
+    printf("  subdivision test (summed screen area of the coplanar-inside pieces == projected area of ONE native triangle +/-5%%): %u native triangles, %u oracle triangles explained, %u of those native triangles were not drawn as themselves; coplanar-ambiguous %u of which explained %u, of which texture never seen on a static pair (non-level) %u; coplanar with an unclipped native %u of which explained %u\n", nSubdivNat, nSubdivTris, nSubdivNatUndrawn, nAmbig, nAmbigExpl, nAmbigNonStatic, nCopOther, nCopOtherExpl);
+    printf("  of the clip fragments, %u belong to a second texture layer (tcw proven by exact re-draws, differs from the first-pass texture of the clipped native polygon)\n", nFragLayer);
+    printf("  oracle triangles using a static-proven texture: %u, of which neither matched, clip fragment nor re-draw (unexplained): %u (UV identical to: a native static triangle %u | only an actor-pile triangle %u | no native triangle %u)\n", texBoundTotal, texUnexpl, texUnexplCand[2], texUnexplCand[1], texUnexplCand[0]);
+    { uint32_t h[5] = { 0, 0, 0, 0, 0 };   /* screen areas of matched oracle triangles: <0.1, <0.5, <1, <4, >=4 px^2 (no tiny-triangle cull if the small bins are populated) */
+      for (uint32_t a = 0; a < no; a++) if (ot[a].matched) { double ar = fabs((ot[a].sx[1]-ot[a].sx[0])*(ot[a].sy[2]-ot[a].sy[0]) - (ot[a].sx[2]-ot[a].sx[0])*(ot[a].sy[1]-ot[a].sy[0])) * 0.5; h[ar < 0.1 ? 0 : ar < 0.5 ? 1 : ar < 1 ? 2 : ar < 4 ? 3 : 4]++; }
+      printf("  largest Zc among vertices of matched oracle triangles: %.1f | matched screen area histogram <0.1: %u, <0.5: %u, <1: %u, <4: %u, >=4 px^2: %u\n", maxZcMatched, h[0], h[1], h[2], h[3], h[4]); }
     printf("  winding (screen signed area) of matched oracle tris: positive %u, negative %u | fully on-screen native tris NOT drawn by the oracle: %u (winding positive %u, negative %u)\n", wMatched[0], wMatched[1], nUnmOn, wUnmOn[0], wUnmOn[1]);
+    printf("  matched winding by TA list [positive/negative area]: opaque %u/%u, op-mod %u/%u, translucent %u/%u, tr-mod %u/%u, punch %u/%u\n", wList[0][0], wList[0][1], wList[1][0], wList[1][1], wList[2][0], wList[2][1], wList[3][0], wList[3][1], wList[4][0], wList[4][1]);
+    printf("  undrawn fully on-screen native tris: duplicate (twin) of a drawn native polygon %u | degenerate %u | positive area (back face) in an OPAQUE-class material (back-face culled, one-sided rule) %u | positive area in a non-opaque (two-sided) material, undrawn %u | [unused] %u | FRONT-facing: in a drawn IPO but a texture/material group of it with no drawn triangle %u, in a drawn IPO and drawn material group %u, in an undrawn IPO of a drawn sector %u, in an entirely undrawn sector %u, provenance unknown %u\n", cTwin, cDegen, cBackOne, cBackTwo, cBackUnk, cFrontElemUndrawn, cFrontPartIpo, cFrontIpoCulled, cFrontSectorCulled, cFrontUnk);
+    printf("  IPOs with a drawn triangle %u | IPOs with on-screen front-facing geometry and NO drawn triangle %u | sectors with a drawn triangle %u | sectors with on-screen front-facing geometry and NO drawn triangle %u | IPOs with matched tris of BOTH windings %u of %u (minority-winding matched tris %u)\n", nIpoDrawn, nIpoCulled, nSecDrawn, nSecCulled, nIpoMixed, nIpoMatchedAny, nMixedMinority);
     printf("native->oracle (informational; game sector culling / backface culling not modelled): static tris with a vertex on screen %u, of which matched %u\n", natVisible, matched);
     printf("\nRESULT: scene %ld tol %.3f px: %u/%u static oracle triangles matched strictly (%.2f%%), +%u clip fragments => %.2f%% clip-aware; %u of all %u oracle triangles (rest: actors/HUD/particles).\n",
            scene, tol, matched, staticTotal, staticTotal ? 100.0 * matched / staticTotal : 0.0, nFrag, staticTotal ? 100.0 * (matched + nFrag) / staticTotal : 0.0, matched, no);
     free(pt); free(ot); free(fb); free(ram); free(natTex); free(natStatic); free(natBehind);
-    if (st) { st->staticTotal = staticTotal; st->matched = matched; st->frag = nFrag; st->unmBad = unmBad; st->unmClip = unmClip; st->sub = fragSub; st->unverif = unverif + unverifCoinc; st->oracleTris = no; st->vNative = vNative; st->vNear = vNear; st->vOther = vOther; st->texUnexpl = texUnexpl; st->texBoundTotal = texBoundTotal; st->ok = 1; st->maxErr = maxErr; }
+    if (st) { st->staticTotal = staticTotal; st->matched = matched; st->frag = nFrag; st->unmBad = unmBad; st->unmClip = unmClip; st->sub = fragSub; st->cull[0] = cDegen; st->cull[1] = cBackOne; st->cull[2] = cBackTwo; st->cull[3] = cBackUnk; st->cull[4] = cFrontPartIpo; st->cull[5] = cFrontIpoCulled; st->cull[6] = cFrontSectorCulled; st->cull[7] = cFrontUnk; st->cull[8] = cFrontElemUndrawn; st->cull[9] = cTwin; st->subExpl = nAmbigExpl + nAmbigNonStatic; st->copOther = nCopOther; st->copOtherExpl = nCopOtherExpl; st->redraw = nRedraw; st->redrawSame = nRedrawSameTcw; st->unverif = unverif + unverifCoinc; st->oracleTris = no; st->vNative = vNative; st->vNear = vNear; st->vOther = vOther; st->texUnexpl = texUnexpl; st->texUnexplActor = texUnexplCand[1]; st->texBoundTotal = texBoundTotal; st->ok = 1; st->maxErr = maxErr; }
     return 0;
 }
 
@@ -322,20 +534,21 @@ int main(int argc, char **argv) {
     uint8_t *fix, *lvl; size_t fixN, lvlN; CpaImage img; CpaScene sc;
     if (!cpa_read_file(fixp, &fix, &fixN) || !cpa_read_file(lvlp, &lvl, &lvlN)) { fprintf(stderr, "cannot read %s / %s\n", fixp, lvlp); return 2; }
     if (!cpa_scene_load_dats(&sc, &img, fix, fixN, lvl, lvlN)) { fprintf(stderr, "scene load failed\n"); return 2; }
-    uint64_t sSub = 0, sT = 0, sM = 0, sF = 0, sTB = 0, sTU = 0, sU = 0, sMis = 0, sVn = 0, sVz = 0, sVo = 0; int nOk = 0, nBad = 0;
+    uint64_t sTUA = 0, sAmbE = 0, sCull[10] = { 0 }, sRd = 0, sSub = 0, sT = 0, sM = 0, sF = 0, sTB = 0, sTU = 0, sU = 0, sMis = 0, sVn = 0, sVz = 0, sVo = 0; int nOk = 0, nBad = 0;
     for (int i = 0; i < ns; i++) {
         Stats st; memset(&st, 0, sizeof st);
         int rc = do_scene(&sc, capdir, level, scenes[i], all ? -1 : ramscene, tol, ztol, verbose, &st);
         if (all) {
-            if (rc == 0 && st.ok) { nOk++; sT += st.staticTotal; sM += st.matched; sF += st.frag; sTB += st.texBoundTotal; sTU += st.texUnexpl; sU += st.unverif; sMis += st.unmBad + st.unmClip; sSub += st.sub; sVn += st.vNative; sVz += st.vNear; sVo += st.vOther;
-                printf("SCENE %s %ld static %u matched %u clipfrag %u mismatch %u coplanar-ambiguous %u unverifiable %u static-texture-unexplained %u/%u strict %.2f%% clipaware %.2f%% conservative %.2f%%\n", level, scenes[i], st.staticTotal, st.matched, st.frag, st.unmBad + st.unmClip, st.sub, st.unverif, st.texUnexpl, st.texBoundTotal,
+            if (rc == 0 && st.ok) { nOk++; sT += st.staticTotal; sRd += st.redraw; sM += st.matched; sF += st.frag; sTB += st.texBoundTotal; sTU += st.texUnexpl; sTUA += st.texUnexplActor; sU += st.unverif; sMis += st.unmBad + st.unmClip; sSub += st.sub; sAmbE += st.subExpl; for (int k = 0; k < 10; k++) sCull[k] += st.cull[k]; sVn += st.vNative; sVz += st.vNear; sVo += st.vOther;
+                printf("SCENE %s %ld static %u matched %u clipfrag %u mismatch %u coplanar-ambiguous %u (explained %u) redraw %u unverifiable %u static-texture-unexplained %u/%u strict %.2f%% clipaware %.2f%% conservative %.2f%%\n", level, scenes[i], st.staticTotal, st.matched, st.frag, st.unmBad + st.unmClip, st.sub, st.subExpl, st.redraw, st.unverif, st.texUnexpl, st.texBoundTotal,
                        st.staticTotal ? 100.0 * st.matched / st.staticTotal : 0.0, st.staticTotal ? 100.0 * (st.matched + st.frag) / st.staticTotal : 0.0, st.texBoundTotal ? 100.0 * (st.texBoundTotal - st.texUnexpl) / st.texBoundTotal : 0.0); }
             else { nBad++; printf("SCENE %s %ld SKIPPED (rc %d: no valid camera / capture)\n", level, scenes[i], rc); }
         }
     }
-    if (all) printf("LEVEL %s scenes %d (skipped %d) static %llu matched %llu clipfrag %llu mismatch %llu coplanar-ambiguous %llu strict %.2f%% clipaware %.2f%% pessimistic(+ambiguous in denominator) %.2f%% | static-texture tris %llu unexplained %llu conservative %.2f%% | unverifiable %llu | frag verts native/near/other %llu/%llu/%llu\n",
-                    level, nOk, nBad, (unsigned long long)sT, (unsigned long long)sM, (unsigned long long)sF, (unsigned long long)sMis, (unsigned long long)sSub, sT ? 100.0 * sM / sT : 0.0, sT ? 100.0 * (sM + sF) / sT : 0.0, (sT + sSub) ? 100.0 * (sM + sF) / (sT + sSub) : 0.0,
-                    (unsigned long long)sTB, (unsigned long long)sTU, sTB ? 100.0 * (sTB - sTU) / sTB : 0.0, (unsigned long long)sU, (unsigned long long)sVn, (unsigned long long)sVz, (unsigned long long)sVo);
+    if (all) printf("LEVEL %s scenes %d (skipped %d) static %llu matched %llu clipfrag %llu mismatch %llu coplanar-ambiguous %llu (explained as non-level %llu) redraw %llu strict %.2f%% clipaware %.2f%% pessimistic(+unexplained ambiguous in denominator) %.2f%% | static-texture tris %llu unexplained %llu (UV-identical only to an actor-pile triangle: %llu) conservative %.2f%% (excluding those %.2f%%) | unverifiable %llu | frag verts native/near/other %llu/%llu/%llu | undrawn-onscreen twin %llu backface-opaque %llu degenerate %llu backface-nonopaque %llu front-in-drawn-ipo %llu front-in-undrawn-ipo-or-sector %llu\n",
+                    level, nOk, nBad, (unsigned long long)sT, (unsigned long long)sM, (unsigned long long)sF, (unsigned long long)sMis, (unsigned long long)sSub, (unsigned long long)sAmbE, (unsigned long long)sRd, sT ? 100.0 * sM / sT : 0.0, sT ? 100.0 * (sM + sF) / sT : 0.0, (sT + sSub - sAmbE) ? 100.0 * (sM + sF) / (sT + sSub - sAmbE) : 0.0,
+                    (unsigned long long)sTB, (unsigned long long)sTU, (unsigned long long)sTUA, sTB ? 100.0 * (sTB - sTU) / sTB : 0.0, sTB > sTUA ? 100.0 * (sTB - sTU) / (sTB - sTUA) : 0.0, (unsigned long long)sU, (unsigned long long)sVn, (unsigned long long)sVz, (unsigned long long)sVo,
+                    (unsigned long long)sCull[9], (unsigned long long)sCull[1], (unsigned long long)sCull[0], (unsigned long long)sCull[2], (unsigned long long)(sCull[4] + sCull[8] + sCull[7] + sCull[3]), (unsigned long long)(sCull[5] + sCull[6]));
     cpa_scene_free(&sc); free(fix); free(lvl);
     return 0;
 }
