@@ -31,4 +31,12 @@ ta-capture: build/ta_capture
 ta-compare: build/ta_compare
 	./build/ta_compare $(TAOUT) $(ASSETS)/DCDATA --level $(LEVEL) $(TAARGS)
 
-.PHONY: ta-capture ta-compare
+LEVELS ?= Learn_10 Jail_10 Bast_10 Helic_30 Rodeo_60 Nave_20 Whale_10
+REL    ?= 300,500,800,1100,1400,1700
+NSCN   ?= 2
+# ta-summary: capture REL-offset windows (guest frames after the level name is current) of every level in LEVELS with the stick script (--walk), compare all scenes, print totals.
+ta-summary: build/ta_capture build/ta_compare
+	REL=$(REL) N=$(NSCN) WALK=1 ./ta_levels.sh $(ASSETS) "$(LEVELS)" | tee build/ta_summary.txt
+	@awk '/^LEVEL/ { for (i=1;i<=NF;i++) { if ($$i=="static") s+=$$(i+1); if ($$i=="matched") m+=$$(i+1); if ($$i=="clipfrag") f+=$$(i+1); if ($$i=="mismatch") x+=$$(i+1); if ($$i=="coplanar-ambiguous") u+=$$(i+1) } } END { printf "AGGREGATE (all levels) static %d matched %d clipfrag %d mismatch %d coplanar-ambiguous %d strict %.2f%% clipaware %.2f%% pessimistic %.2f%%\n", s, m, f, x, u, 100*m/s, 100*(m+f)/s, 100*(m+f)/(s+u) }' build/ta_summary.txt
+
+.PHONY: ta-capture ta-compare ta-summary

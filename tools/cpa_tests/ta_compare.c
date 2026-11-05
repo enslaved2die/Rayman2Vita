@@ -1,5 +1,5 @@
 /* ta_compare: kind-C comparison (docs/NATIVE_ENGINE.md sec. 4) of ONE oracle TA scene against the native static draw list.
- *   ta_compare CAPDIR DCDATA_DIR [--level Learn_10] [--scene N] [--tol PX] [--ztol REL] [-v]
+ *   ta_compare CAPDIR DCDATA_DIR [--level Learn_10] [--scene N | --all] [--tol PX] [--ztol REL] [-v]
  * CAPDIR comes from ta_capture (see ta.mk): f<N>/frame.bin = the TA vertex stream of scene N as parsed by hle/ta.c (x,y screen pixels, z = 1/w, u, v),
  * ram_<N>.bin = guest RAM at the end of that guest frame.
  *
@@ -14,8 +14,8 @@
  *   and that these addresses are the active camera in every level / mode (only Learn_10 checked).  UNKNOWN: which struct these fields belong to.
  * Matching never uses UVs: native triangle (projected with the RAM camera) <-> oracle triangle iff some vertex permutation agrees in x, y within --tol px
  * and in 1/w within --ztol relative.  UVs/texture are then compared on the matched pairs as an independent check.
- * Limits (reported, not hidden): only STATIC native triangles are projected (actors are an unposed pile in cpa_scene); native triangles with any vertex behind the
- * camera (Zc <= 0) are skipped (the game clips those, producing new vertices); the game's sector visibility/back-face culling is not modelled, so
+ * Limits (reported, not hidden): only STATIC native triangles are projected (actors are an unposed pile in cpa_scene); native triangles with any vertex nearer than the near plane
+ * (Zc < NEAR_ZC = 0.25, measured) are not projected (the game clips those, producing new vertices on the plane); unmatched oracle triangles are then tested as clip fragments (see below); the game's sector visibility/back-face culling is not modelled, so
  * native->oracle ("coverage") is informational only. The pass metric is oracle->native over oracle triangles that are static-UV candidates. */
 #include "../../src/cpa/cpa_scene.h"
 #include <math.h>
@@ -26,6 +26,8 @@
 #include <dirent.h>
 #include <ctype.h>
 
+typedef struct { int ok; uint32_t staticTotal, matched, frag, unmBad, unmClip, unverif, sub, oracleTris, texUnexpl, texBoundTotal, vNative, vNear, vOther; double maxErr; } Stats;
+
 #define RAM_BASE 0x8C000000u
 #define VA_HFOV 0x8C00F300u
 #define VA_ASPECT 0x8C00F304u
@@ -33,11 +35,14 @@
 #define VA_ROW_F 0x8C00F314u
 #define VA_ROW_L 0x8C00F320u
 #define VA_POS 0x8C00F394u
+/* Near plane: Zc = 0.25 (z_ta = 1.0). Measured over 7 levels / 50+ scenes: the smallest Zc of every oracle vertex of a near-clip fragment is exactly 0.2500 and the smallest Zc of any
+ * unclipped matched vertex is 0.6457 (never between). Not read from game code; INFERRED from the TA stream. */
+#define NEAR_ZC 0.25
 
 typedef struct { float x, y, z, u, v, base[4], off[4]; } TaV;      /* == TaVertex in hle/ta.h */
 typedef struct { uint32_t ctl, isp, tsp, tcw, first, count, sprite, list; } TaS;
 typedef struct { float sx[3], sy[3], w[3], u[3], v[3]; uint32_t item; uint32_t tri; int used; float cx; } PTri;
-typedef struct { float sx[3], sy[3], z[3], u[3], v[3]; uint32_t tcw, tsp, list; int cand, matched; } OTri;
+typedef struct { float sx[3], sy[3], z[3], u[3], v[3]; uint32_t tcw, tsp, list; int cand, matched, frag, nw; } OTri;
 static const int perms[6][3] = { {0,1,2}, {1,2,0}, {2,0,1}, {0,2,1}, {2,1,0}, {1,0,2} };
 
 static float rdf(const uint8_t *ram, uint32_t va) { float f; memcpy(&f, ram + (va - RAM_BASE), 4); return f; }
@@ -47,42 +52,16 @@ static uint8_t *slurp(const char *p, size_t *n) {
     uint8_t *b = malloc((size_t)l + 1); if (!b || fread(b, 1, (size_t)l, f) != (size_t)l) { fclose(f); free(b); return NULL; } fclose(f); *n = (size_t)l; return b;
 }
 
-int main(int argc, char **argv) {
-    const char *capdir = NULL, *dcdata = NULL, *level = "Learn_10"; long scene = -1, ramscene = -1; double tol = 0.1, ztol = 2e-3; int verbose = 0;
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--level") && i + 1 < argc) level = argv[++i];
-        else if (!strcmp(argv[i], "--scene") && i + 1 < argc) scene = atol(argv[++i]);
-        else if (!strcmp(argv[i], "--ram") && i + 1 < argc) ramscene = atol(argv[++i]);     /* use ram_<N>.bin (default: same N as the scene) */
-        else if (!strcmp(argv[i], "--tol") && i + 1 < argc) tol = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--ztol") && i + 1 < argc) ztol = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-v")) verbose = 1;
-        else if (!capdir) capdir = argv[i]; else if (!dcdata) dcdata = argv[i];
-    }
-    if (!capdir || !dcdata) { fprintf(stderr, "usage: %s CAPDIR DCDATA_DIR [--level L] [--scene N] [--tol px] [--ztol rel] [-v]\n", argv[0]); return 2; }
-    if (scene < 0) {                                                /* first f<N> scene directory in CAPDIR */
-        DIR *d = opendir(capdir); struct dirent *e; long best = -1;
-        while (d && (e = readdir(d))) { long n; if (sscanf(e->d_name, "f%ld", &n) == 1 && (best < 0 || n < best)) best = n; }
-        if (d) closedir(d); scene = best;
-    }
-    if (scene < 0) { fprintf(stderr, "no f<N> scene in %s (run ta-capture)\n", capdir); return 2; }
-
+static int do_scene(const CpaScene *scp, const char *capdir, const char *level, long scene, long ramscene, double tol, double ztol, int verbose, Stats *st) {
+    CpaScene sc = *scp; char p[1100]; size_t n;
     if (ramscene < 0) {                        /* measured (Jail_10): scene N is projected with the camera in RAM at the end of the previous guest frame, ram_<N-1> */
         char q[1100]; snprintf(q, sizeof q, "%s/ram_%ld.bin", capdir, scene - 1); FILE *t = fopen(q, "rb"); if (t) { fclose(t); ramscene = scene - 1; } else ramscene = scene;
     }
-    char p[1100]; size_t n;
     snprintf(p, sizeof p, "%s/ram_%ld.bin", capdir, ramscene); uint8_t *ram = slurp(p, &n); if (!ram || n != 16u << 20) { fprintf(stderr, "bad %s\n", p); return 2; }
     snprintf(p, sizeof p, "%s/f%ld/frame.bin", capdir, scene); size_t fn; uint8_t *fb = slurp(p, &fn); if (!fb) { fprintf(stderr, "cannot read %s\n", p); return 2; }
     uint32_t *H = (uint32_t *)fb; uint32_t nstrip = H[1], nvert = H[2];
     TaS *strips = (TaS *)(fb + 16); TaV *tv = (TaV *)(fb + 16 + nstrip * 32);
     if (16 + (size_t)nstrip * 32 + (size_t)nvert * sizeof(TaV) != fn) { fprintf(stderr, "frame.bin size mismatch\n"); return 2; }
-
-    /* native scene */
-    char fixp[1100], lvlp[1100]; snprintf(fixp, sizeof fixp, "%s/FIX.DAT", dcdata);
-    char up[64]; snprintf(up, sizeof up, "%s", level); for (char *c = up; *c; c++) *c = (char)toupper((unsigned char)*c);
-    snprintf(lvlp, sizeof lvlp, "%s/%s/%s.DAT", dcdata, up, up);
-    uint8_t *fix, *lvl; size_t fixN, lvlN; CpaImage img; CpaScene sc;
-    if (!cpa_read_file(fixp, &fix, &fixN) || !cpa_read_file(lvlp, &lvl, &lvlN)) { fprintf(stderr, "cannot read %s / %s\n", fixp, lvlp); return 2; }
-    if (!cpa_scene_load_dats(&sc, &img, fix, fixN, lvl, lvlN)) { fprintf(stderr, "scene load failed\n"); return 2; }
 
     /* camera from guest RAM */
     float hfov = rdf(ram, VA_HFOV), asp = rdf(ram, VA_ASPECT), U[3], F[3], L[3], C[3];
@@ -105,7 +84,7 @@ int main(int argc, char **argv) {
             for (int j = 0; j < 3; j++) {
                 const float *P = &sc.pos[(t * 3 + j) * 3]; double r[3] = { P[0] - C[0], P[1] - C[1], P[2] - C[2] };
                 double zc = F[0]*r[0] + F[1]*r[1] + F[2]*r[2];
-                if (zc <= 1e-4) { ok = 0; break; }
+                if (zc < NEAR_ZC) { ok = 0; break; }
                 q.sx[j] = (float)(320.0 - fx * (L[0]*r[0] + L[1]*r[1] + L[2]*r[2]) / zc);
                 q.sy[j] = (float)(240.0 - fy * (U[0]*r[0] + U[1]*r[1] + U[2]*r[2]) / zc);
                 q.w[j] = (float)(1.0 / (4.0 * zc)); q.u[j] = sc.uv[(t * 3 + j) * 2]; q.v[j] = sc.uv[(t * 3 + j) * 2 + 1];
@@ -115,7 +94,7 @@ int main(int argc, char **argv) {
         }
     }
     qsort(pt, npt, sizeof *pt, cmp_cx);
-    printf("native static triangles %u: projected %u, skipped (vertex behind camera) %u\n", nStatic, npt, nBehind);
+    printf("native static triangles %u: projected %u, skipped (a vertex nearer than the near plane Zc<0.25, clipped by the game) %u\n", nStatic, npt, nBehind);
 
     /* oracle triangles (non-sprite strips; strip of n verts gives n-2 triangles) */
     OTri *ot = calloc(nvert + 1, sizeof *ot); uint32_t no = 0, nspr = 0, nsprV = 0;
@@ -166,7 +145,7 @@ int main(int argc, char **argv) {
             if (hitIdx >= 0) break;
         }
         if (hitIdx < 0) continue;
-        pt[hitIdx].used = 1; ot[a].matched = 1; matched++; matchedCand[ot[a].cand]++; sumErr += hitErr; if (hitErr > maxErr) maxErr = hitErr; if (ot[a].list < 8) listMatched[ot[a].list]++;
+        pt[hitIdx].used = 1; ot[a].matched = 1; ot[a].nw = ((pt[hitIdx].sx[1]-pt[hitIdx].sx[0])*(pt[hitIdx].sy[2]-pt[hitIdx].sy[0]) - (pt[hitIdx].sx[2]-pt[hitIdx].sx[0])*(pt[hitIdx].sy[1]-pt[hitIdx].sy[0])) < 0; matched++; matchedCand[ot[a].cand]++; sumErr += hitErr; if (hitErr > maxErr) maxErr = hitErr; if (ot[a].list < 8) listMatched[ot[a].list]++;
         int uvok = 1; for (int j = 0; j < 3; j++) { int q = perms[hitPerm][j]; if (fabsf(pt[hitIdx].u[q] - ot[a].u[j]) > 1e-3f || fabsf(pt[hitIdx].v[q] - ot[a].v[j]) > 1e-3f) uvok = 0; }
         uvok ? uvAgree++ : uvDis++;
         const CpaDrawItem *d = &sc.items[pt[hitIdx].item]; texPair++;
@@ -176,13 +155,95 @@ int main(int argc, char **argv) {
         if (ot[a].list < 5) xtab[d->alphaClass + 1][ot[a].list]++;
         if (verbose) printf("  oracle tri %u list %u -> native tri %u item %u perm %d err %.4f px uv %s\n", a, ot[a].list, pt[hitIdx].tri, pt[hitIdx].item, hitPerm, hitErr, uvok ? "same" : "DIFF");
     }
+    /* Clip / subdivision model (geometry only, UV independent): the game clips against the near plane (and the frustum), emitting NEW vertices on the
+     * edges of the original triangle. An unmatched oracle triangle is a "clip fragment" iff all three of its vertices, unprojected with the same camera
+     * (Zc = 1/(4 z), L.r = (320-sx) Zc/fx, U.r = (240-sy) Zc/fy, F.r = Zc), lie on the plane of ONE native static triangle (distance <= FRAG_PLANE * Zc)
+     * and inside it (barycentric >= -FRAG_BARY), with a consistent texture if the native texture is already bound. Reason class: the native triangle has
+     * a vertex behind the camera (near clip), else a vertex off the 640x480 viewport (frustum clip), else neither (other subdivision: reported, not hidden). */
+    double minZcMatched = 1e30, minZcFrag = 1e30;
+    for (uint32_t a = 0; a < no; a++) if (ot[a].matched) for (int j = 0; j < 3; j++) { double zc = 1.0 / (4.0 * ot[a].z[j]); if (zc < minZcMatched) minZcMatched = zc; }
+    uint32_t vNative = 0, vNear = 0, vOther = 0;
+    uint32_t nFrag = 0, fragNear = 0, fragFrustum = 0, fragOther = 0, fragTexBad = 0, fragUnbound = 0, fragSub = 0;
+    {
+        const double FRAG_PLANE = 3e-3, FRAG_BARY = 0.02;
+        for (uint32_t a = 0; a < no; a++) {
+            if (ot[a].matched) continue;
+            double R[3][3]; int okz = 1;
+            for (int j = 0; j < 3; j++) {
+                double zc = 1.0 / (4.0 * ot[a].z[j]); if (!(ot[a].z[j] > 0) || !isfinite(zc)) { okz = 0; break; }
+                double lr = (320.0 - ot[a].sx[j]) * zc / fx, ur = (240.0 - ot[a].sy[j]) * zc / fy;
+                for (int k = 0; k < 3; k++) R[j][k] = lr * L[k] + ur * U[k] + zc * F[k];
+            }
+            if (!okz) continue;
+            for (uint32_t t = 0; t < nt; t++) {
+                if (!natStatic[t]) continue;
+                const float *P = &sc.pos[t * 9]; double A[3][3];
+                for (int j = 0; j < 3; j++) for (int k = 0; k < 3; k++) A[j][k] = P[j * 3 + k] - C[k];
+                double e1[3] = { A[1][0]-A[0][0], A[1][1]-A[0][1], A[1][2]-A[0][2] }, e2[3] = { A[2][0]-A[0][0], A[2][1]-A[0][1], A[2][2]-A[0][2] };
+                double nn[3] = { e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0] }; double nl = sqrt(nn[0]*nn[0]+nn[1]*nn[1]+nn[2]*nn[2]);
+                if (nl < 1e-12) continue;
+                double d11 = e1[0]*e1[0]+e1[1]*e1[1]+e1[2]*e1[2], d12 = e1[0]*e2[0]+e1[1]*e2[1]+e1[2]*e2[2], d22 = e2[0]*e2[0]+e2[1]*e2[1]+e2[2]*e2[2], den = d11*d22 - d12*d12;
+                int all = 1;
+                for (int j = 0; j < 3 && all; j++) {
+                    double r[3] = { R[j][0]-A[0][0], R[j][1]-A[0][1], R[j][2]-A[0][2] };
+                    double dist = fabs(r[0]*nn[0]+r[1]*nn[1]+r[2]*nn[2]) / nl, zc = 1.0 / (4.0 * ot[a].z[j]);
+                    if (dist > FRAG_PLANE * zc + 1e-4) { all = 0; break; }
+                    double d1 = r[0]*e1[0]+r[1]*e1[1]+r[2]*e1[2], d2 = r[0]*e2[0]+r[1]*e2[1]+r[2]*e2[2];
+                    double b1 = (d22*d1 - d12*d2) / den, b2 = (d11*d2 - d12*d1) / den, b0 = 1.0 - b1 - b2;
+                    if (b0 < -FRAG_BARY || b1 < -FRAG_BARY || b2 < -FRAG_BARY) all = 0;
+                }
+                if (!all) continue;
+                int f = -1; for (int i = 0; i < ntexmap; i++) if (texmap[i].va == natTex[t]) { f = i; break; }
+                if (f >= 0 && texmap[f].tcw != ot[a].tcw) { fragTexBad++; continue; }
+                int behind = natBehind[t], off = 0;
+                if (!behind) for (int j = 0; j < 3; j++) { double zc = 0; for (int k = 0; k < 3; k++) zc += F[k]*A[j][k];
+                    double sxx = 320.0 - fx * (L[0]*A[j][0]+L[1]*A[j][1]+L[2]*A[j][2]) / zc, syy = 240.0 - fy * (U[0]*A[j][0]+U[1]*A[j][1]+U[2]*A[j][2]) / zc;
+                    if (sxx < 0 || sxx >= 640 || syy < 0 || syy >= 480) off = 1; }
+                if (!behind && !off) { fragOther++; continue; }            /* coplanar and inside, but the native triangle is not clipped: decal/shadow/other, NOT counted as a clip fragment */
+                int cn = 0, cz = 0, co = 0, ci = 0;     /* vertex classes: native vertex | on the near plane | other, outside the viewport (frustum clip) | other, INSIDE the viewport */
+                for (int j = 0; j < 3; j++) {
+                    double zc = 1.0 / (4.0 * ot[a].z[j]); int isnat = 0;
+                    for (int q = 0; q < 3; q++) { double dd = sqrt((R[j][0]-A[q][0])*(R[j][0]-A[q][0]) + (R[j][1]-A[q][1])*(R[j][1]-A[q][1]) + (R[j][2]-A[q][2])*(R[j][2]-A[q][2])); if (dd < 3e-3 * zc + 1e-4) isnat = 1; }
+                    if (isnat) cn++; else if (fabs(zc - NEAR_ZC) < 2e-3) cz++;
+                    else if (ot[a].sx[j] < 0 || ot[a].sx[j] >= 640 || ot[a].sy[j] < 0 || ot[a].sy[j] >= 480) co++;
+                    else { ci++; if (verbose) { double rr[3] = { R[j][0]-A[0][0], R[j][1]-A[0][1], R[j][2]-A[0][2] }, q1 = rr[0]*e1[0]+rr[1]*e1[1]+rr[2]*e1[2], q2 = rr[0]*e2[0]+rr[1]*e2[1]+rr[2]*e2[2];
+                        double bb1 = (d22*q1 - d12*q2) / den, bb2 = (d11*q2 - d12*q1) / den;
+                        printf("  INTERIOR-VERTEX oracle tri %u vertex %d (%.2f %.2f Zc %.3f) bary (%.3f %.3f %.3f) native Zc %.2f %.2f %.2f\n", a, j, ot[a].sx[j], ot[a].sy[j], zc, 1-bb1-bb2, bb1, bb2,
+                               F[0]*A[0][0]+F[1]*A[0][1]+F[2]*A[0][2], F[0]*A[1][0]+F[1]*A[1][1]+F[2]*A[1][2], F[0]*A[2][0]+F[1]*A[2][1]+F[2]*A[2][2]); } }
+                }
+                /* Plain clipping can only create vertices on the near plane or on the frustum (outside / on the viewport edge). An INTERIOR new vertex means the game subdivided
+                 * (or this is a coplanar decal): classified apart and NOT counted as a clip fragment. */
+                if (ci) { fragSub++; continue; }
+                if (f < 0) fragUnbound++;                                  /* counted, but its texture could not be cross-checked */
+                for (int j = 0; j < 3; j++) { double zc = 1.0 / (4.0 * ot[a].z[j]); if (behind && zc < minZcFrag) minZcFrag = zc; }
+                vNative += cn; vNear += cz; vOther += co;
+                ot[a].frag = 1; nFrag++; if (behind) fragNear++; else fragFrustum++;
+                break;
+            }
+        }
+    }
+    /* Independent (UV/geometry-free) cross-check of the static denominator: oracle triangles whose texture (tcw) is the image of a native STATIC texture proven by
+     * matched pairs. Those that are neither matched nor explained as clip fragments are reported as "unexplained": they are either actor/HUD/decal triangles that
+     * share a level texture, or real misses (not hidden). */
+    uint32_t texUnexpl = 0, texBoundTotal = 0;
+    for (uint32_t a = 0; a < no; a++) {
+        int bound = 0; for (int i = 0; i < ntexmap; i++) if (texmap[i].tcw == ot[a].tcw) { bound = 1; break; }
+        if (!bound) continue; texBoundTotal++; if (!ot[a].matched && !ot[a].frag) { texUnexpl++; if (verbose) printf("  UNEXPLAINED tri %u (static-bound tcw %08x list %u): v0 (%.2f %.2f z %.5f) v1 (%.2f %.2f) v2 (%.2f %.2f)\n", a, ot[a].tcw, ot[a].list, ot[a].sx[0], ot[a].sy[0], ot[a].z[0], ot[a].sx[1], ot[a].sy[1], ot[a].sx[2], ot[a].sy[2]); }
+    }
+    /* Winding / back-face evidence: signed screen area of matched oracle triangles vs. fully on-screen native triangles the oracle did not draw. */
+    uint32_t wMatched[2] = { 0, 0 }, wUnmOn[2] = { 0, 0 }, nUnmOn = 0;
+    for (uint32_t a = 0; a < no; a++) if (ot[a].matched) wMatched[ot[a].nw]++;
+    for (uint32_t m = 0; m < npt; m++) if (!pt[m].used) {
+        int on = 1; for (int j = 0; j < 3; j++) if (pt[m].sx[j] < 0 || pt[m].sx[j] >= 640 || pt[m].sy[j] < 0 || pt[m].sy[j] >= 480) on = 0;
+        if (!on) continue; double ar = (pt[m].sx[1]-pt[m].sx[0])*(pt[m].sy[2]-pt[m].sy[0]) - (pt[m].sx[2]-pt[m].sx[0])*(pt[m].sy[1]-pt[m].sy[0]); wUnmOn[ar < 0]++; nUnmOn++;
+    }
     /* Static-triangle denominator. An oracle triangle counts as "static" if it was matched by geometry, OR it is unmatched but has a native static triangle with
      * identical UVs whose texture struct is already known (from the matched pairs above) to be the oracle triangle's texture (tcw). This keeps coincidental
      * UV patterns of actor/HUD triangles out of the denominator. Unmatched ones are then explained: native candidate behind the camera (the game clips it and
      * emits new vertices) or a genuine mismatch. Triangles whose native texture never appeared in a matched pair cannot be verified and are reported apart. */
     uint32_t unmClip = 0, unmBad = 0, unverif = 0, unverifCoinc = 0;
     for (uint32_t a = 0; a < no; a++) {
-        if (ot[a].matched) continue;
+        if (ot[a].matched || ot[a].frag) continue;
         int clip = 0, bad = 0, unv = 0; uint32_t unvT = 0;
         for (uint32_t t = 0; t < nt; t++) {
             if (!natStatic[t]) continue;
@@ -206,7 +267,7 @@ int main(int argc, char **argv) {
             }
         }
     }
-    uint32_t staticTotal = matched + unmClip + unmBad;
+    uint32_t staticTotal = matched + nFrag + unmClip + unmBad;       /* coplanar-ambiguous triangles (below) are NOT in this denominator: nothing proves they are level geometry; see the pessimistic rate */
     uint32_t natVisible = 0; for (uint32_t m = 0; m < npt; m++) { int inside = 0; for (int j = 0; j < 3; j++) if (pt[m].sx[j] >= 0 && pt[m].sx[j] < 640 && pt[m].sy[j] >= 0 && pt[m].sy[j] < 480) inside = 1; natVisible += inside; }
 
     printf("\noracle: %u triangles (+ %u sprite strips / %u verts not compared)\n", no, nspr, nsprV);
@@ -224,9 +285,57 @@ int main(int argc, char **argv) {
     printf("\nstatic oracle triangles (matched + unmatched-with-known-static-texture+UV): %u\n", staticTotal);
     printf("  matched %u | unmatched, native candidate behind camera (game clips) %u | unmatched, native candidate projected elsewhere (MISMATCH) %u | unmatched UV coincidences (oracle texture bound to another native texture) %u | unmatched, texture UNVERIFIABLE (oracle texture unbound) %u\n", matched, unmClip, unmBad, unverifCoinc, unverif);
     printf("  match rate over static oracle triangles: %u / %u = %.2f%%;  excluding clip-affected: %u / %u = %.2f%%\n", matched, staticTotal, staticTotal ? 100.0 * matched / staticTotal : 0.0, matched, matched + unmBad, matched + unmBad ? 100.0 * matched / (matched + unmBad) : 0.0);
+    printf("clip model: unmatched oracle triangles lying inside one native static triangle (plane+barycentric, UV-free): %u = near-plane clip %u + frustum clip %u (of which texture not cross-checkable %u); coplanar-with-unclipped-native (not counted) %u; coplanar-ambiguous (lie in a native triangle's plane with a vertex strictly inside the viewport and not on the near plane: decal/shadow/small mesh resting on a big floor triangle, or game subdivision; NOT counted, NOT in the denominator) %u; rejected for texture inconsistency %u\n", nFrag, fragNear, fragFrustum, fragUnbound, fragOther, fragSub, fragTexBad);
+    printf("  fragment vertices: coincide with a native vertex %u | lie on the near plane Zc=%.2f %u | outside the viewport (frustum clip) %u\n", vNative, NEAR_ZC, vNear, vOther);
+    printf("  near-plane evidence: smallest Zc among matched (unclipped) oracle vertices %.4f; smallest Zc among oracle vertices of near-clip fragments %.4f\n", minZcMatched, minZcFrag);
+    printf("  clip-aware match rate: (matched %u + clip fragments %u) / static %u = %.2f%%   (strict, no clip model: %.2f%%)\n", matched, nFrag, staticTotal, staticTotal ? 100.0 * (matched + nFrag) / staticTotal : 0.0, staticTotal ? 100.0 * matched / staticTotal : 0.0);
+    printf("  oracle triangles using a static-proven texture: %u, of which neither matched nor clip fragment (unexplained): %u\n", texBoundTotal, texUnexpl);
+    printf("  winding (screen signed area) of matched oracle tris: positive %u, negative %u | fully on-screen native tris NOT drawn by the oracle: %u (winding positive %u, negative %u)\n", wMatched[0], wMatched[1], nUnmOn, wUnmOn[0], wUnmOn[1]);
     printf("native->oracle (informational; game sector culling / backface culling not modelled): static tris with a vertex on screen %u, of which matched %u\n", natVisible, matched);
-    printf("\nRESULT: scene %ld tol %.3f px: %u/%u static oracle triangles matched (%.2f%%); %u of all %u oracle triangles (rest: actors/HUD/clip-generated). One scene, one level: N1 (>=99.5%%, 3 levels) is NOT met by this alone.\n",
-           scene, tol, matched, staticTotal, staticTotal ? 100.0 * matched / staticTotal : 0.0, matched, no);
-    cpa_scene_free(&sc); free(pt); free(ot); free(fb); free(ram); free(fix); free(lvl);
+    printf("\nRESULT: scene %ld tol %.3f px: %u/%u static oracle triangles matched strictly (%.2f%%), +%u clip fragments => %.2f%% clip-aware; %u of all %u oracle triangles (rest: actors/HUD/particles).\n",
+           scene, tol, matched, staticTotal, staticTotal ? 100.0 * matched / staticTotal : 0.0, nFrag, staticTotal ? 100.0 * (matched + nFrag) / staticTotal : 0.0, matched, no);
+    free(pt); free(ot); free(fb); free(ram); free(natTex); free(natStatic); free(natBehind);
+    if (st) { st->staticTotal = staticTotal; st->matched = matched; st->frag = nFrag; st->unmBad = unmBad; st->unmClip = unmClip; st->sub = fragSub; st->unverif = unverif + unverifCoinc; st->oracleTris = no; st->vNative = vNative; st->vNear = vNear; st->vOther = vOther; st->texUnexpl = texUnexpl; st->texBoundTotal = texBoundTotal; st->ok = 1; st->maxErr = maxErr; }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    const char *capdir = NULL, *dcdata = NULL, *level = "Learn_10"; long scene = -1, ramscene = -1; double tol = 0.1, ztol = 2e-3; int verbose = 0, all = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--level") && i + 1 < argc) level = argv[++i];
+        else if (!strcmp(argv[i], "--scene") && i + 1 < argc) scene = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--ram") && i + 1 < argc) ramscene = atol(argv[++i]);     /* use ram_<N>.bin (default: ram_<N-1> if present) */
+        else if (!strcmp(argv[i], "--tol") && i + 1 < argc) tol = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--ztol") && i + 1 < argc) ztol = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--all")) all = 1;                                       /* every f<N> scene in CAPDIR: one SCENE summary line each + a LEVEL line */
+        else if (!strcmp(argv[i], "-v")) verbose = 1;
+        else if (!capdir) capdir = argv[i]; else if (!dcdata) dcdata = argv[i];
+    }
+    if (!capdir || !dcdata) { fprintf(stderr, "usage: %s CAPDIR DCDATA_DIR [--level L] [--scene N | --all] [--tol px] [--ztol rel] [-v]\n", argv[0]); return 2; }
+    long scenes[256]; int ns = 0;
+    { DIR *d = opendir(capdir); struct dirent *e; while (d && (e = readdir(d))) { long n; if (sscanf(e->d_name, "f%ld", &n) == 1 && ns < 256) scenes[ns++] = n; } if (d) closedir(d); }
+    for (int i = 0; i < ns; i++) for (int j = i + 1; j < ns; j++) if (scenes[j] < scenes[i]) { long t = scenes[i]; scenes[i] = scenes[j]; scenes[j] = t; }
+    if (!all) { if (scene < 0 && ns) scene = scenes[0]; if (scene < 0) { fprintf(stderr, "no f<N> scene in %s (run ta-capture)\n", capdir); return 2; } scenes[0] = scene; ns = 1; }
+    char fixp[1100], lvlp[1100]; snprintf(fixp, sizeof fixp, "%s/FIX.DAT", dcdata);
+    char up[64]; snprintf(up, sizeof up, "%s", level); for (char *c = up; *c; c++) *c = (char)toupper((unsigned char)*c);
+    snprintf(lvlp, sizeof lvlp, "%s/%s/%s.DAT", dcdata, up, up);
+    uint8_t *fix, *lvl; size_t fixN, lvlN; CpaImage img; CpaScene sc;
+    if (!cpa_read_file(fixp, &fix, &fixN) || !cpa_read_file(lvlp, &lvl, &lvlN)) { fprintf(stderr, "cannot read %s / %s\n", fixp, lvlp); return 2; }
+    if (!cpa_scene_load_dats(&sc, &img, fix, fixN, lvl, lvlN)) { fprintf(stderr, "scene load failed\n"); return 2; }
+    uint64_t sSub = 0, sT = 0, sM = 0, sF = 0, sTB = 0, sTU = 0, sU = 0, sMis = 0, sVn = 0, sVz = 0, sVo = 0; int nOk = 0, nBad = 0;
+    for (int i = 0; i < ns; i++) {
+        Stats st; memset(&st, 0, sizeof st);
+        int rc = do_scene(&sc, capdir, level, scenes[i], all ? -1 : ramscene, tol, ztol, verbose, &st);
+        if (all) {
+            if (rc == 0 && st.ok) { nOk++; sT += st.staticTotal; sM += st.matched; sF += st.frag; sTB += st.texBoundTotal; sTU += st.texUnexpl; sU += st.unverif; sMis += st.unmBad + st.unmClip; sSub += st.sub; sVn += st.vNative; sVz += st.vNear; sVo += st.vOther;
+                printf("SCENE %s %ld static %u matched %u clipfrag %u mismatch %u coplanar-ambiguous %u unverifiable %u static-texture-unexplained %u/%u strict %.2f%% clipaware %.2f%% conservative %.2f%%\n", level, scenes[i], st.staticTotal, st.matched, st.frag, st.unmBad + st.unmClip, st.sub, st.unverif, st.texUnexpl, st.texBoundTotal,
+                       st.staticTotal ? 100.0 * st.matched / st.staticTotal : 0.0, st.staticTotal ? 100.0 * (st.matched + st.frag) / st.staticTotal : 0.0, st.texBoundTotal ? 100.0 * (st.texBoundTotal - st.texUnexpl) / st.texBoundTotal : 0.0); }
+            else { nBad++; printf("SCENE %s %ld SKIPPED (rc %d: no valid camera / capture)\n", level, scenes[i], rc); }
+        }
+    }
+    if (all) printf("LEVEL %s scenes %d (skipped %d) static %llu matched %llu clipfrag %llu mismatch %llu coplanar-ambiguous %llu strict %.2f%% clipaware %.2f%% pessimistic(+ambiguous in denominator) %.2f%% | static-texture tris %llu unexplained %llu conservative %.2f%% | unverifiable %llu | frag verts native/near/other %llu/%llu/%llu\n",
+                    level, nOk, nBad, (unsigned long long)sT, (unsigned long long)sM, (unsigned long long)sF, (unsigned long long)sMis, (unsigned long long)sSub, sT ? 100.0 * sM / sT : 0.0, sT ? 100.0 * (sM + sF) / sT : 0.0, (sT + sSub) ? 100.0 * (sM + sF) / (sT + sSub) : 0.0,
+                    (unsigned long long)sTB, (unsigned long long)sTU, sTB ? 100.0 * (sTB - sTU) / sTB : 0.0, (unsigned long long)sU, (unsigned long long)sVn, (unsigned long long)sVz, (unsigned long long)sVo);
+    cpa_scene_free(&sc); free(fix); free(lvl);
     return 0;
 }
