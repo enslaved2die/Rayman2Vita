@@ -57,6 +57,7 @@ static const char *config_path = "config.ini";
 #endif
 
 static int config_loaded = 0;
+static void config_load(void);
 static int s_fps_limit = 60;
 static int s_render_scale = 100;
 

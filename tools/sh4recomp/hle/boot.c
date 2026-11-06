@@ -5,6 +5,7 @@
 #include "perf.h"
 #include "swflag.h"
 #include "r2prof.h"
+#include "ta.h"
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdlib.h>
