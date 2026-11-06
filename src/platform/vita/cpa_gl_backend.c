@@ -4,7 +4,7 @@
 #include <math.h>
 #include <string.h>
 
-void cpa_gl_config_default(CpaGlConfig *c) { memset(c, 0, sizeof *c); c->farZ = 4000.0f; c->drawLayer2 = 0; c->clear = 1; c->clearColor[3] = 1.0f; }
+void cpa_gl_config_default(CpaGlConfig *c) { memset(c, 0, sizeof *c); c->farZ = 4000.0f; c->drawLayer2 = 1; c->clear = 1; c->clearColor[3] = 1.0f; c->layer2Alpha = 1.0f; }
 
 void cpa_gl_build_matrices(const CpaCamera *cam, int w, int h, CpaFit fit, float farZ, float proj[16], float mv[16]) {
     CpaProj p; cpa_proj_init(&p, cam, w, h, fit);
@@ -37,6 +37,8 @@ void cpa_gl_backend_shutdown(CpaGlBackend *b) {
     memset(b->tex, 0, sizeof b->tex); b->nTex = 0;
 }
 
+static int wrap_enum(unsigned m) { return m == CPA_WRAP_CLAMP ? GL_CLAMP_TO_EDGE : m == CPA_WRAP_MIRROR ? GL_MIRRORED_REPEAT : GL_REPEAT; }
+
 static void be_upload(void *user, const CpaTexDesc *t) {
     CpaGlBackend *b = (CpaGlBackend *)user; int s = tex_find(b, t->texVa);
     if (s >= 0) return;
@@ -44,18 +46,24 @@ static void be_upload(void *user, const CpaTexDesc *t) {
     static uint8_t grey[8 * 8 * 4]; static int gi;
     if (!gi) { memset(grey, 0x80, sizeof grey); for (int i = 3; i < 8 * 8 * 4; i += 4) grey[i] = 0xFF; gi = 1; }
     GLuint id = 0; glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id); b->curTex = -1;
-    if (t->rgba && t->width && t->height) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t->width, t->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, t->rgba);
-    else glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, grey);   /* placeholder: PVR decode is not in src/cpa yet */
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    b->tex[s].va = t->texVa; b->tex[s].id = id; b->tex[s].wrapU = b->tex[s].wrapV = 1; b->nTex++;
+    int real = t->rgba && t->width && t->height, mip = real && t->mip;
+    /* Level 0 only, RGBA8 straight from cpa_tex (VERIFIED byte-exact vs the oracle's decode, transparent-texel bleed included); mips are generated like the oracle's GL path does for PVR mip chains.
+     * Filter: bilinear, nearest mip level when a chain exists (GL_LINEAR_MIPMAP_NEAREST) = the PVR filter field value 1 (see WRAPCHK/FILTCHK in shadow_run for what the game uses). */
+    if (real) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t->width, t->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, t->rgba);
+    else glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, grey);   /* placeholder: the provider could not decode this VA */
+    if (mip) glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, mip ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    uint8_t wu = real ? t->wrapU : CPA_WRAP_REPEAT, wv = real ? t->wrapV : CPA_WRAP_REPEAT;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_enum(wu)); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_enum(wv));
+    b->tex[s].va = t->texVa; b->tex[s].id = id; b->tex[s].wrapU = wu; b->tex[s].wrapV = wv; b->tex[s].mip = (uint8_t)mip; b->tex[s].placeholder = (uint8_t)!real; b->nTex++;
+    if (real) b->nUploaded++; else b->nPlaceholder++;
 }
 
 static void set_cap(GLenum cap, int *cur, int on) { if (*cur == on) return; if (on) glEnable(cap); else glDisable(cap); *cur = on; }
 
 static void be_begin(void *user, const CpaRenderFrame *f) {
     CpaGlBackend *b = (CpaGlBackend *)user; float proj[16], mv[16];
-    b->verts = f->verts; b->drawsIssued = b->drawsSkipped = 0;
+    b->verts = f->verts; b->drawsIssued = b->drawsSkipped = b->drawsLayer2 = b->drawsPlaceholder = 0;
     cpa_gl_build_matrices(&f->cam, f->w, f->h, f->fit, b->cfg.farZ, proj, mv);
     glViewport(0, 0, f->w, f->h);
     glMatrixMode(GL_PROJECTION); glLoadMatrixf(proj); glMatrixMode(GL_MODELVIEW); glLoadMatrixf(mv);
@@ -73,7 +81,7 @@ static void be_begin(void *user, const CpaRenderFrame *f) {
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL);     /* LEQUAL: layer 2 re-draws the exact base depth */
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
     glEnable(GL_TEXTURE_2D);
-    b->curTex = -1; b->blendOn = b->alphaOn = b->cullOn = -1; b->depthWrite = 1; b->curSrc = b->curDst = 0xFFFFFFFFu;
+    b->curTex = -1; b->blendOn = b->alphaOn = b->cullOn = -1; b->depthWrite = 1; b->curSrc = b->curDst = 0xFFFFFFFFu; b->colorA = 1.0f;
 }
 
 static void be_draw(void *user, const CpaRenderFrame *f, const CpaRenderDraw *d) {
@@ -84,9 +92,18 @@ static void be_draw(void *user, const CpaRenderFrame *f, const CpaRenderDraw *d)
     if (d->texVa && s < 0) { b->drawsSkipped++; return; }          /* texture was never uploaded */
     if (d->texVa) {
         if (b->curTex != s) { glBindTexture(GL_TEXTURE_2D, b->tex[s].id); b->curTex = s; }
-        if (b->tex[s].wrapU != d->wrapU) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, d->wrapU ? GL_REPEAT : GL_CLAMP_TO_EDGE); b->tex[s].wrapU = d->wrapU; }
-        if (b->tex[s].wrapV != d->wrapV) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, d->wrapV ? GL_REPEAT : GL_CLAMP_TO_EDGE); b->tex[s].wrapV = d->wrapV; }
+        if (b->tex[s].wrapU != d->wrapU) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_enum(d->wrapU)); b->tex[s].wrapU = d->wrapU; }
+        if (b->tex[s].wrapV != d->wrapV) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_enum(d->wrapV)); b->tex[s].wrapV = d->wrapV; }
+        if (b->tex[s].placeholder) b->drawsPlaceholder++;
     }
+    /* Layer 2 (second texture layer, overlayMode 1..3). INFERRED approximation of the bump lighting: the game draws the polygon a second time with a resident 64x64 PVR2 bump map (S/R
+     * texels), UVs x8, translucent (src alpha, inv src alpha, VERIFIED TSP), the bump coefficients K1..K3,Q coming per polygon from the offset colour (UNKNOWN per polygon; the oracle's
+     * fixed K measured on the game's strips are used when the texture is decoded). The result of that decode is a WHITE texture whose alpha is the bump intensity, so the layer is a
+     * white detail/grain pattern blended over the base. We draw exactly that with a constant light direction (the decode's Q) and a constant strength (cfg.layer2Alpha); the true per-polygon
+     * light direction/strength and the substitute noise (the real map is generated per boot) are NOT reproduced. */
+    float ca = d->layer ? b->cfg.layer2Alpha : 1.0f;
+    if (b->colorA != ca) { glColor4f(1, 1, 1, ca); b->colorA = ca; }
+    if (d->layer) b->drawsLayer2++;
     int blend = d->blend != CPA_BLEND_NONE;
     set_cap(GL_BLEND, &b->blendOn, blend);
     if (blend) { unsigned dst = d->blend == CPA_BLEND_ADD ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA; if (b->curSrc != GL_SRC_ALPHA || b->curDst != dst) { glBlendFunc(GL_SRC_ALPHA, dst); b->curSrc = GL_SRC_ALPHA; b->curDst = dst; } }

@@ -13,13 +13,16 @@
  *   4. pass sort/merge   opaque + cutout: free reorder, sorted by (texture,state) and merged (DESIGN: depth test makes the order irrelevant for opaque, fewer GL draws than the
  *                        oracle's submission order); translucent: back to front by batch centroid (DESIGN, INFERRED order in the oracle = submission order), layer 2 after its base,
  *                        only adjacent identical states are merged.
- * NOT modelled (honest list, see shadow report): vertex colours / lighting, fog, shadows, particles/HUD quads, texture pixels (PVR decode is not in src/cpa; the backend gets the
- * texture VA + the .TEX header info and, if the embedder supplies it, pixels), the layer-2 texture (unknown global), animated-texture live frame for STATIC items, live moving static IPOs. */
+ * Textures: CpaTexStore (below) decodes the level + FIX .TEX natively (cpa_tex, VERIFIED byte-exact) and serves them through opts.describe; pass/blend follow tex.flags (flagRule), wrap modes come
+ * from the .TEX header wrap byte (MEASURED against the oracle TSP bits). Layer 2 draws with a SUBSTITUTE bump texture (INFERRED) - the real per-polygon bump lighting is not reproduced.
+ * NOT modelled (honest list, see shadow report): vertex colours / lighting, fog, shadows, particles/HUD quads, the real layer-2 bump coefficients and noise, animated-texture live frame
+ * (native binds the load-time head frame), live moving static IPOs. */
 #ifndef CPA_RENDER_H
 #define CPA_RENDER_H
 
 #include "cpa_drawlist.h"
 #include "cpa_anim.h"
+#include "cpa_tex.h"
 
 /* ---------------- frame output ---------------- */
 typedef struct CpaRenderVertex { float x, y, z, u, v; } CpaRenderVertex;      /* world space (raw engine axes), 20 bytes */
@@ -27,14 +30,14 @@ enum { CPA_SRC_STATIC = 0, CPA_SRC_ACTOR = 1, CPA_SRC_SPRITE = 2 };
 
 typedef struct CpaRenderDraw {
     uint32_t first, count;      /* into CpaRenderFrame.verts, triangle list */
-    uint32_t texVa;             /* texture struct VA; 0 = layer-2 (unknown global texture) or untextured */
+    uint32_t texVa;             /* texture struct VA; 0 = untextured; CPA_TEXVA_BUMP_MIP / CPA_TEXVA_BUMP on layer-2 draws (substitute bump noise, see below) */
     uint8_t  pass;              /* CpaPass */
     uint8_t  blend;             /* CpaBlendMode */
     uint8_t  alphaTest;
     uint8_t  cullBack;          /* 1: cull faces with positive cpa_screen_area2 (back); 0: two-sided */
-    uint8_t  wrapU, wrapV;      /* 1 repeat, 0 clamp */
+    uint8_t  wrapU, wrapV;      /* CPA_WRAP_*: 0 clamp, 1 repeat, 2 mirror (from the .TEX header wrap bits when a CpaTexStore is attached, else repeat) */
     uint8_t  layer;             /* 0 base, 1 second texture layer */
-    uint8_t  layerTexUnknown;
+    uint8_t  layerTexUnknown;   /* layer 2: the real texture is a resident bump map generated per boot; texVa is a SUBSTITUTE (INFERRED) */
     uint32_t nSrc;              /* number of source batches merged into this draw */
     uint32_t nSrcKind[3];       /* of those, per CPA_SRC_* */
 } CpaRenderDraw;
@@ -49,6 +52,8 @@ typedef struct CpaRenderStats {
     uint32_t actorsGiven, actorsPosed, actorsFailed, actorsBboxCulled, actorsVisCulled, actorsDrawn;
     uint32_t actorElemSkipped;
     uint32_t texturesUsed;                                           /* distinct texVa in the draws (layer 2 excluded) */
+    uint32_t texturesMissing, drawsTexMissing;                       /* with a CpaTexStore attached: distinct texVa (and draws using one) that do not resolve to a .TEX chunk (layer 2 excluded) */
+    uint32_t passByFlags;                                            /* source batches whose pass/blend came from tex.flags (flag rule) instead of the drawlist's alphaClass */
     uint32_t haveVis, visSector, visNIpos;
 } CpaRenderStats;
 
@@ -82,10 +87,47 @@ typedef struct CpaTexDesc {
     uint32_t texVa;
     uint16_t width, height;     /* 0 if unknown */
     uint16_t pvrFmt;            /* CpaTexInfo.pvrFmt, 0 if unknown */
-    const uint8_t *rgba;        /* tightly packed RGBA8 pixels or NULL when the embedder cannot decode (PVR decode is not part of src/cpa yet): the backend then uses a placeholder */
+    const uint8_t *rgba;        /* tightly packed RGBA8 pixels (R in the low byte of each u32), level 0 only, transparent-texel colour bleed already applied (cpa_tex_bleed, as the oracle's host decode);
+                                   NULL when the embedder cannot decode: the backend then uses a grey placeholder */
+    uint8_t  mip;               /* 1: the PVR carries a mip chain, the backend generates mipmaps from level 0 (the oracle's GL path does the same) */
+    uint8_t  wrapU, wrapV;      /* default wrap of the texture from its .TEX header (CPA_WRAP_*); providers must fill them (a zeroed desc means clamp) */
+    uint8_t  substitute;        /* 1 = layer-2 bump noise (INFERRED substitute for the per-boot generated resident texture) */
 } CpaTexDesc;
 /* Optional texture provider: fills `out` for a texture struct VA (return 0 = unknown texture). Called once per VA until cpa_render_ctx_forget_textures. */
 typedef int (*CpaTexDescribeFn)(void *user, uint32_t texVa, CpaTexDesc *out);
+
+/* ---------------- texture store: real textures for the draws ----------------
+ * Level .TEX + FIX.TEX banks (cpa_texbank_*), keyed by texture struct VA. Decoded lazily to RGBA8 level 0 (+ cpa_tex_bleed), cached, handed to the backend through CpaTexDescribeFn.
+ * Evidence: pixels VERIFIED byte-exact vs the oracle's TA decode (cpa_tex.h, test_tex); VA -> chunk mapping VERIFIED (level table 9374/9374, FIX table 280/280); wrap modes see
+ * cpa_tex_wrap_modes. The layer-2 bump textures are a SUBSTITUTE (INFERRED, see CPA_TEXVA_BUMP). */
+enum { CPA_WRAP_CLAMP = 0, CPA_WRAP_REPEAT = 1, CPA_WRAP_MIRROR = 2 };
+#define CPA_TEXVA_BUMP_MIP 0xFFFFB001u   /* layer 2, overlayMode 1: resident 64x64 bump map with mips (oracle tcw 0xA0050000). Not a guest address. */
+#define CPA_TEXVA_BUMP     0xFFFFB002u   /* layer 2, overlayMode 2 and 3: resident 64x64 bump map, no mips (oracle tcw 0x20050558) */
+
+/* .TEX header wrap byte (tex+0x18 after load, cpa_tex_postload) -> per-axis wrap mode of the texture object. */
+void cpa_tex_wrap_modes(uint8_t wrapByte, uint8_t *wrapU, uint8_t *wrapV);
+
+typedef struct CpaTexEntry {
+    uint32_t va; uint16_t w, h, pvrFmt; uint8_t mip, isFix, wrapByte, wrapU, wrapV;
+    uint32_t raw, flags;        /* PVR header word, post-load tex.flags (cpa_tex_postload) */
+    const CpaTexBank *bank; uint32_t chunk;
+    uint32_t *rgba;             /* decoded level 0 (lazy; freed by cpa_texstore_trim) */
+    int8_t   state;             /* 0 not decoded, 1 decoded, -1 decode failed */
+} CpaTexEntry;
+typedef struct CpaTexStore {
+    CpaTexBank bank[2];         /* 0 level, 1 FIX */
+    CpaTexEntry *e; uint32_t n;                 /* sorted by va */
+    uint32_t nLevel, nFix; int levelOk, fixOk;
+    uint32_t *bumpRgba[2]; uint32_t nDecoded, nDecodeFail;
+} CpaTexStore;
+/* Loads both banks. sc (may be NULL) gets cpa_scene_apply_tex with the post-load flags of BOTH banks, so pass classification uses the values the running game has (the DAT image holds
+ * pre-load values). Any of lvlTex / fixDat / fixTex may be NULL (that bank is then empty). Returns 1 iff the level bank matched the DAT table and every chunk of both banks parsed. */
+int  cpa_texstore_load(CpaTexStore *s, CpaScene *sc, const uint8_t *lvlTex, size_t lvlTexN, const uint8_t *fixDat, size_t fixDatN, const uint8_t *fixTex, size_t fixTexN);
+void cpa_texstore_free(CpaTexStore *s);
+const CpaTexEntry *cpa_texstore_find(const CpaTexStore *s, uint32_t va);   /* no decode; the layer-2 substitutes are not entries */
+const uint32_t *cpa_texstore_pixels(CpaTexStore *s, uint32_t va);          /* decode level 0 on first use; NULL if unknown / failed. Also serves CPA_TEXVA_BUMP* (64x64) */
+void cpa_texstore_trim(CpaTexStore *s);                                    /* drop cached pixels (after upload); re-decoded on demand */
+int  cpa_texstore_describe(void *store, uint32_t texVa, CpaTexDesc *out);  /* CpaTexDescribeFn; out->rgba valid until cpa_texstore_trim / free */
 
 typedef struct CpaRenderOpts {
     int useVis;                 /* default 1 */
@@ -96,6 +138,9 @@ typedef struct CpaRenderOpts {
     int mergeOpaque;            /* default 1: state-sort + merge opaque/cutout; 0 keeps scene order (and merges only adjacent identical states) */
     int cutoutAsTranslucent;    /* default 1: material class cutout (flag 0x10) is placed in the translucent pass with alpha blend, two-sided. VERIFIED against the oracle in shadow runs: all matched cutout-class
                                    triangles are in TA list 2 (translucent), none in list 4 (Learn_10 393/393, Jail_10 926/926); the cpa_drawlist.h 'punch-through' guess is not supported by the captures */
+    int flagRule;               /* default 1: pass/blend of every textured batch from tex.flags: flags & 0x2A -> translucent list (0x20 additive, else alpha blend), cutout (0x10) in the translucent pass
+                                   too (cutoutAsTranslucent), everything else opaque. List rule VERIFIED: flags 0 -> list 0 (3364/3364 strips), flags != 0 -> list 2 (1832/1832) in 5 scenes; the 0x2A mask is the
+                                   guest's own test in FUN_8c037700 (INFERRED from reading). Over all 9654 shipped textures flags != 0 <=> flags & 0x2A. 0 = the drawlist's alphaClass classes (older behaviour) */
     int animMode;               /* cpa_anim mode, default CPA_ANIM_BEST */
     float spriteHalfScale;      /* default 0.5 (sizeX/sizeY taken as full sizes; UNVERIFIED) */
     CpaTexDescribeFn describe; void *describeUser;
@@ -118,7 +163,10 @@ typedef struct CpaRenderCtx {
     CpaVisTriMap tmap; int haveTmap;
     CpaAnimTables tables; int haveTables;
     uint32_t *texSeen; uint32_t nTexSeen, capTexSeen;
+    CpaTexStore *store;         /* optional, see cpa_render_ctx_set_texstore */
 } CpaRenderCtx;
+/* Attach a texture store (must outlive the context): draw wrap modes come from it, texture misses are counted in the frame stats, and opts.describe/describeUser point at the store. NULL detaches. */
+void cpa_render_ctx_set_texstore(CpaRenderCtx *c, CpaTexStore *store);
 /* scene must outlive the context. Builds the triangle ownership map once (a few ms to tens of ms per level). Returns 1 (visibility/actors degrade gracefully when the map or the tables are missing). */
 int  cpa_render_ctx_init(CpaRenderCtx *c, const CpaScene *scene, const CpaRenderOpts *opts);
 void cpa_render_ctx_free(CpaRenderCtx *c);

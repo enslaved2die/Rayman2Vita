@@ -7,7 +7,145 @@
 void cpa_render_opts_default(CpaRenderOpts *o) {
     memset(o, 0, sizeof *o);
     o->useVis = 1; o->includeLayer2 = 1; o->includeSprites = 1; o->actorMode = 1; o->sortTranslucent = 1; o->mergeOpaque = 1;
-    o->cutoutAsTranslucent = 1; o->animMode = CPA_ANIM_BEST; o->spriteHalfScale = 0.5f;
+    o->cutoutAsTranslucent = 1; o->flagRule = 1; o->animMode = CPA_ANIM_BEST; o->spriteHalfScale = 0.5f;
+}
+
+/* ---------------- texture state from tex.flags / .TEX wrap bits ---------------- */
+
+/* List rule (VERIFIED as a list rule, see CpaRenderOpts.flagRule): flags & 0x2A -> translucent (0x20 additive, else alpha blend, two-sided); 0x10 cutout -> translucent pass with alpha blend
+ * (cutoutTrans, VERIFIED: matched cutout-class triangles are all in TA list 2) or the cutout pass with alpha test; otherwise opaque, back faces culled. Pixel format is NOT consulted. */
+static void flag_class(uint32_t f, int cutoutTrans, uint8_t *pass, uint8_t *blend, uint8_t *alphaTest, uint8_t *cullBack) {
+    f &= 0x7FFFFFFFu; *alphaTest = 0;
+    if (f & 0x2A)      { *pass = CPA_PASS_TRANSLUCENT; *blend = (f & 0x20) ? CPA_BLEND_ADD : CPA_BLEND_ALPHA; *cullBack = 0; }
+    else if (f & 0x10) { *cullBack = 0; if (cutoutTrans) { *pass = CPA_PASS_TRANSLUCENT; *blend = CPA_BLEND_ALPHA; } else { *pass = CPA_PASS_CUTOUT; *blend = CPA_BLEND_NONE; *alphaTest = 1; } }
+    else               { *pass = CPA_PASS_OPAQUE; *blend = CPA_BLEND_NONE; *cullBack = 1; }
+}
+
+/* Wrap byte (tex+0x18 after load = cpa_tex_postload) -> wrap per axis. MEASURED (shadow_run WRAPCHK, oracle TSP clamp/flip bits of the strips that sample each texture, 7 levels,
+ * deterministic per byte value, zero exceptions): 0x00 -> clamp U+V, 0x01 -> repeat U+V, 0x02 -> mirror U+V, 0x04 -> clamp V (U repeat), 0x10 -> clamp U (V repeat),
+ * 0x18 -> mirror U (V repeat). INFERRED for the values without an oracle sample (0x08: 9 shipped textures, 0x24: 8; 0x20 does not occur): per axis a flip bit beats a clamp bit
+ * (U: 0x08 flip, 0x10 clamp; V: 0x20 flip, 0x04 clamp), as 0x18 shows for U. The pre-load DAT wrap byte of cpa_scene (tileU/tileV) is a different encoding. */
+void cpa_tex_wrap_modes(uint8_t wb, uint8_t *wrapU, uint8_t *wrapV) {
+    if (wb <= 2) { uint8_t m = wb == 0 ? CPA_WRAP_CLAMP : wb == 1 ? CPA_WRAP_REPEAT : CPA_WRAP_MIRROR; *wrapU = *wrapV = m; return; }
+    *wrapU = (wb & 0x08) ? CPA_WRAP_MIRROR : (wb & 0x10) ? CPA_WRAP_CLAMP : CPA_WRAP_REPEAT;
+    *wrapV = (wb & 0x20) ? CPA_WRAP_MIRROR : (wb & 0x04) ? CPA_WRAP_CLAMP : CPA_WRAP_REPEAT;
+}
+
+/* ---------------- texture store ---------------- */
+static int cmp_entry(const void *a, const void *b) { uint32_t x = ((const CpaTexEntry *)a)->va, y = ((const CpaTexEntry *)b)->va; return x < y ? -1 : x > y; }
+
+int cpa_texstore_load(CpaTexStore *s, CpaScene *sc, const uint8_t *lvlTex, size_t lvlTexN, const uint8_t *fixDat, size_t fixDatN, const uint8_t *fixTex, size_t fixTexN) {
+    memset(s, 0, sizeof *s);
+    CpaTexInfo *ti = NULL, *all = NULL; uint32_t nti = 0, nfix = 0, fixVa[4096]; int ok = 1;
+    if (lvlTex && sc) {
+        int tabOk = cpa_tex_table(&sc->img, lvlTex, lvlTexN, &ti, &nti);
+        int bankOk = cpa_texbank_load(lvlTex, lvlTexN, &s->bank[0]);
+        if (tabOk && bankOk && s->bank[0].n == nti) {
+            uint32_t *va = (uint32_t *)malloc(4 * (nti + 1));
+            if (va) { for (uint32_t i = 0; i < nti; i++) va[i] = ti[i].structVa; s->levelOk = cpa_texbank_set_vas(&s->bank[0], va, nti); free(va); }
+        }
+        ok &= s->levelOk;
+    }
+    if (fixTex && fixDat) {
+        nfix = cpa_tex_fix_table(fixDat, fixDatN, fixVa, 4096);
+        int bankOk = cpa_texbank_load(fixTex, fixTexN, &s->bank[1]);
+        if (bankOk && nfix && nfix == s->bank[1].n) s->fixOk = cpa_texbank_set_vas(&s->bank[1], fixVa, nfix);
+        ok &= s->fixOk;
+    }
+    uint32_t nl = s->levelOk ? s->bank[0].n : 0, nf = s->fixOk ? s->bank[1].n : 0, n = nl + nf;
+    s->e = (CpaTexEntry *)calloc(n ? n : 1, sizeof *s->e); all = (CpaTexInfo *)calloc(n ? n : 1, sizeof *all);
+    if (!s->e || !all) { free(s->e); free(all); free(ti); s->e = NULL; return 0; }
+    for (int b = 0; b < 2; b++) {
+        uint32_t cnt = b ? nf : nl;
+        for (uint32_t i = 0; i < cnt; i++) {
+            const CpaTexChunk *c = &s->bank[b].c[i]; CpaTexEntry *e = &s->e[s->n]; CpaTexInfo *a = &all[s->n];
+            e->va = c->structVa; e->w = c->info.w; e->h = c->info.h; e->raw = c->info.raw; e->pvrFmt = (uint16_t)(c->info.raw & 0xFFFF); e->mip = c->info.mip; e->isFix = (uint8_t)b;
+            cpa_tex_postload(e->raw, &e->flags, &e->wrapByte); cpa_tex_wrap_modes(e->wrapByte, &e->wrapU, &e->wrapV);
+            e->bank = &s->bank[b]; e->chunk = i;
+            a->structVa = e->va; a->raw = e->raw; a->flags = e->flags; a->wrap = e->wrapByte; a->pvrFmt = e->pvrFmt; a->width = e->w; a->height = e->h;
+            s->n++;
+        }
+    }
+    s->nLevel = nl; s->nFix = nf;
+    if (sc && s->n) cpa_scene_apply_tex(sc, all, s->n);
+    qsort(s->e, s->n, sizeof *s->e, cmp_entry);
+    free(all); free(ti);
+    return ok;
+}
+
+void cpa_texstore_free(CpaTexStore *s) {
+    for (uint32_t i = 0; i < s->n; i++) free(s->e[i].rgba);
+    free(s->e); free(s->bumpRgba[0]); free(s->bumpRgba[1]);
+    cpa_texbank_free(&s->bank[0]); cpa_texbank_free(&s->bank[1]); memset(s, 0, sizeof *s);
+}
+
+const CpaTexEntry *cpa_texstore_find(const CpaTexStore *s, uint32_t va) {
+    if (!s || !va) return NULL;
+    uint32_t lo = 0, hi = s->n;
+    while (lo < hi) { uint32_t m = (lo + hi) / 2; if (s->e[m].va < va) lo = m + 1; else hi = m; }
+    return lo < s->n && s->e[lo].va == va ? &s->e[lo] : NULL;
+}
+
+/* Substitute for the resident layer-2 bump map. The guest generates it at boot (FUN_8c013b52: LCG noise through a Hilbert-order fill; content differs between boots, so any noise of the
+ * same kind is as faithful as the original). Substitute = deterministic LCG bytes as raw PVR bump texels (S = high byte, R = low byte), decoded by the normal bump path of cpa_tex with the
+ * oracle's fixed K1/K2/K3/Q (INFERRED, cpa_tex.c bump_px). 64x64; the mip variant carries a full chain (the backend generates it from level 0). */
+static uint32_t *bump_build(int mip) {
+    uint8_t *blk = (uint8_t *)calloc(1, 16 + 0x4000 + 64); CpaPvrInfo in; uint32_t *out = NULL;
+    if (!blk) return NULL;
+    memcpy(blk, "PVRT", 4); blk[8] = CPA_PVR_BUMP; blk[9] = mip ? CPA_PVRD_TWIDDLED_MIP : CPA_PVRD_TWIDDLED; blk[12] = 64; blk[14] = 64;
+    if (cpa_pvr_parse(blk, 16 + 0x4000 + 64, &in) && in.w == 64 && in.h == 64 && 16 + in.needLen <= 16 + 0x4000 + 64) {
+        uint32_t x = mip ? 0x2545F491u : 0x9E3779B9u;
+        for (uint32_t i = 0; i < in.needLen; i++) { x = x * 1664525u + 1013904223u; blk[16 + i] = (uint8_t)(x >> 24); }
+        out = (uint32_t *)malloc(64 * 64 * 4);
+        if (out && cpa_pvr_decode(&in, blk, 16 + 0x4000 + 64, NULL, 0, out)) { free(out); out = NULL; }
+    }
+    free(blk); return out;
+}
+
+const uint32_t *cpa_texstore_pixels(CpaTexStore *s, uint32_t va) {
+    if (va == CPA_TEXVA_BUMP_MIP || va == CPA_TEXVA_BUMP) {
+        int k = va == CPA_TEXVA_BUMP_MIP ? 0 : 1; if (!s->bumpRgba[k]) s->bumpRgba[k] = bump_build(k == 0);
+        return s->bumpRgba[k];
+    }
+    CpaTexEntry *e = (CpaTexEntry *)cpa_texstore_find(s, va);
+    if (!e || e->state < 0) return NULL;
+    if (e->state == 0) {
+        size_t npx = (size_t)e->w * e->h; e->state = -1;
+        if (!npx || npx > (size_t)1024 * 1024) { s->nDecodeFail++; return NULL; }
+        uint32_t *p = (uint32_t *)malloc(npx * 4);
+        if (!p) return NULL;
+        if (cpa_texbank_decode(e->bank, e->chunk, NULL, 0, p)) { free(p); s->nDecodeFail++; return NULL; }
+        cpa_tex_bleed(p, e->w, e->h); e->rgba = p; e->state = 1; s->nDecoded++;
+    }
+    return e->rgba;
+}
+
+void cpa_texstore_trim(CpaTexStore *s) {
+    for (uint32_t i = 0; i < s->n; i++) if (s->e[i].state == 1) { free(s->e[i].rgba); s->e[i].rgba = NULL; s->e[i].state = 0; }
+}
+
+int cpa_texstore_describe(void *user, uint32_t va, CpaTexDesc *out) {
+    CpaTexStore *s = (CpaTexStore *)user; const uint32_t *px = cpa_texstore_pixels(s, va);
+    if (!px) return 0;
+    out->texVa = va;
+    if (va == CPA_TEXVA_BUMP_MIP || va == CPA_TEXVA_BUMP) {
+        out->width = out->height = 64; out->pvrFmt = CPA_PVR_BUMP | ((va == CPA_TEXVA_BUMP_MIP ? CPA_PVRD_TWIDDLED_MIP : CPA_PVRD_TWIDDLED) << 8);
+        out->mip = va == CPA_TEXVA_BUMP_MIP; out->wrapU = out->wrapV = CPA_WRAP_REPEAT; out->substitute = 1;
+    } else {
+        const CpaTexEntry *e = cpa_texstore_find(s, va);
+        out->width = e->w; out->height = e->h; out->pvrFmt = e->pvrFmt; out->mip = e->mip; out->wrapU = e->wrapU; out->wrapV = e->wrapV; out->substitute = 0;
+    }
+    out->rgba = (const uint8_t *)px; return 1;
+}
+
+static void store_wrap(const CpaTexStore *s, uint32_t va, uint8_t *wu, uint8_t *wv) {
+    const CpaTexEntry *e = cpa_texstore_find(s, va);
+    if (e) { *wu = e->wrapU; *wv = e->wrapV; }
+}
+
+void cpa_render_ctx_set_texstore(CpaRenderCtx *c, CpaTexStore *store) {
+    c->store = store;
+    if (store) { c->opts.describe = cpa_texstore_describe; c->opts.describeUser = store; } else if (c->opts.describe == cpa_texstore_describe) { c->opts.describe = NULL; c->opts.describeUser = NULL; }
 }
 
 int cpa_render_ctx_init(CpaRenderCtx *c, const CpaScene *scene, const CpaRenderOpts *opts) {
@@ -34,6 +172,8 @@ typedef struct {
     RB *b; uint32_t n, cap;
     float *apos, *auv; uint32_t an, acap;      /* arena: actor / sprite vertices */
     int oom;
+    int flagRule, cutoutTrans; uint32_t nByFlags;
+    const CpaTexStore *store;
 } Build;
 
 static RB *rb_new(Build *B) {
@@ -51,13 +191,15 @@ static int arena_reserve(Build *B, uint32_t nv) {
 
 /* Material class decode of a texture struct; same rule as cpa_scene.c tex_decode (static there, restated: flags at +4 with bit31 set, wrap byte at +0x18).
  * INFERRED classes, see cpa_scene.h. Keep in sync with cpa_scene.c. */
-static void classify_tex(const CpaImage *im, uint32_t texVa, uint8_t *pass, uint8_t *blend, uint8_t *alphaTest, uint8_t *cullBack, uint8_t *wrapU, uint8_t *wrapV) {
-    uint32_t fl = 0; uint8_t wr = 0; int8_t alpha = CPA_ALPHA_UNKNOWN; *wrapU = *wrapV = 1;
+static void classify_tex(const CpaImage *im, uint32_t texVa, uint8_t *pass, uint8_t *blend, uint8_t *alphaTest, uint8_t *cullBack, uint8_t *wrapU, uint8_t *wrapV, int flagRule, int cutoutTrans, uint32_t *nByFlags) {
+    uint32_t fl = 0; uint8_t wr = 0; int8_t alpha = CPA_ALPHA_UNKNOWN; int flagsRead = 0; *wrapU = *wrapV = 1;
     if (texVa && cpa_is_ptr(im, texVa) && cpa_rd32(im, texVa + 4, &fl) && cpa_rd8(im, texVa + 0x18, &wr)) {
         uint32_t f = fl & 0x7FFFFFFFu;
         if (f & 0x20) alpha = CPA_ALPHA_ADDITIVE; else if (f & 0x40) alpha = CPA_ALPHA_BLEND; else if (f & 0x10) alpha = CPA_ALPHA_CUTOUT; else if (f & 0x08) alpha = CPA_ALPHA_BLEND; else if (f == 0) alpha = CPA_ALPHA_OPAQUE;
         /* bit31 set = pre-load DAT value (wrap byte decodable, INFERRED); clear = post-load guest value as found in a RAM dump (cpa_tex_postload: same flag bits, wrap byte not decoded -> repeat) */
-        if ((fl & 0x80000000u) && wr <= 3) { *wrapU = (wr & 2) ? 1 : 0; *wrapV = (wr & 1) ? 1 : 0; }
+        if (fl & 0x80000000u) { if (wr <= 3) { *wrapU = (wr & 2) ? 1 : 0; *wrapV = (wr & 1) ? 1 : 0; } }
+        else cpa_tex_wrap_modes(wr, wrapU, wrapV);          /* post-load wrap byte (RAM dump): the same decode as the texture store */
+        flagsRead = 1;
     }
     *alphaTest = 0;
     switch (alpha) {                                           /* same table as cpa_drawlist.c classify() */
@@ -66,6 +208,7 @@ static void classify_tex(const CpaImage *im, uint32_t texVa, uint8_t *pass, uint
     case CPA_ALPHA_ADDITIVE: *pass = CPA_PASS_TRANSLUCENT; *blend = CPA_BLEND_ADD;  *cullBack = 0; break;
     default:                 *pass = CPA_PASS_TRANSLUCENT; *blend = CPA_BLEND_ALPHA; *cullBack = 0; break;
     }
+    if (flagRule && flagsRead) { flag_class(fl, cutoutTrans, pass, blend, alphaTest, cullBack); (*nByFlags)++; }
 }
 
 /* ---------------- actors ---------------- */
@@ -108,7 +251,8 @@ static uint32_t actor_geo(Build *B, const CpaImage *im, uint32_t geo, const floa
         B->an += got * 3; total += got;
         RB *r = rb_new(B); if (!r) break;
         r->first = first; r->count = got * 3; r->arena = 1; r->source = CPA_SRC_ACTOR; r->texVa = tex;
-        classify_tex(im, tex, &r->pass, &r->blend, &r->alphaTest, &r->cullBack, &r->wrapU, &r->wrapV);
+        classify_tex(im, tex, &r->pass, &r->blend, &r->alphaTest, &r->cullBack, &r->wrapU, &r->wrapV, B->flagRule, B->cutoutTrans, &B->nByFlags);
+        store_wrap(B->store, tex, &r->wrapU, &r->wrapV);
     }
     free(vw); return total;
 }
@@ -143,7 +287,7 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
     const CpaScene *S = c->scene; const CpaRenderOpts *O = &c->opts;
     memset(out, 0, sizeof *out); out->cam = in->cam; out->w = in->w; out->h = in->h; out->fit = in->fit;
     CpaRenderStats *st = &out->st;
-    Build B; memset(&B, 0, sizeof B);
+    Build B; memset(&B, 0, sizeof B); B.flagRule = O->flagRule; B.cutoutTrans = O->cutoutAsTranslucent; B.store = c->store;
 
     /* 1. visibility */
     CpaVisFrustum fr; CpaVis vis; CpaVisCull cull; int haveVis = 0, haveCull = 0; uint32_t *drawnActors = NULL; uint32_t nDrawnActors = 0;
@@ -167,6 +311,16 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
         const CpaBatch *b = &dl.batches[i]; RB *r = rb_new(&B); if (!r) break;
         r->first = b->firstVert; r->count = b->vertCount; r->source = CPA_SRC_STATIC; r->texVa = b->texVa; r->pass = b->pass; r->blend = b->blend; r->alphaTest = b->alphaTest;
         r->cullBack = b->cullBack; r->wrapU = b->wrapU; r->wrapV = b->wrapV; r->layer = b->layer; r->uvRule = b->uvRule; r->layerTexUnknown = b->layerTexUnknown;
+        { /* tex.flags list rule (the item's flags are post-load once cpa_texstore_load applied them); a layer-2 batch keeps its base's cull state */
+            const CpaDrawItem *it = &S->items[b->item];
+            if (O->flagRule && it->texVa && it->texFlagsValid) {
+                uint8_t p, bl, at;
+                flag_class(it->texFlags, O->cutoutAsTranslucent, &p, &bl, &at, &r->cullBack);
+                if (!b->layer) { r->pass = p; r->blend = bl; r->alphaTest = at; B.nByFlags++; }
+            }
+        }
+        if (b->layer) { r->texVa = b->overlayMode == 1 ? CPA_TEXVA_BUMP_MIP : CPA_TEXVA_BUMP; r->wrapU = r->wrapV = CPA_WRAP_REPEAT; }   /* INFERRED substitute, see CpaTexDesc.substitute */
+        else store_wrap(c->store, r->texVa, &r->wrapU, &r->wrapV);
         st->staticBatches++;
     }
     if (haveCull) st->staticTrisCulled = cull.nTriCulled;
@@ -200,6 +354,10 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
         RB *r = rb_new(&B); if (!r) break;
         r->first = B.an; r->count = 6; B.an += 6; r->arena = 1; r->source = CPA_SRC_SPRITE; r->texVa = sp->texVa; r->pass = sp->pass; r->blend = sp->blend; r->alphaTest = sp->alphaTest;
         r->cullBack = 0; r->wrapU = sp->wrapU; r->wrapV = sp->wrapV; st->spriteQuads++;
+        if (O->flagRule && sp->src < S->nSprites && S->sprites[sp->src].texVa && S->sprites[sp->src].texFlagsValid) {
+            uint8_t cb; flag_class(S->sprites[sp->src].texFlags, O->cutoutAsTranslucent, &r->pass, &r->blend, &r->alphaTest, &cb); B.nByFlags++;
+        }
+        store_wrap(c->store, r->texVa, &r->wrapU, &r->wrapV);
     }
     cpa_drawlist_free(&dl); cpa_vis_cull_free(&cull); cpa_vis_free(&vis); free(drawnActors);
     if (B.oom) { free(B.b); free(B.apos); free(B.auv); return 0; }
@@ -245,9 +403,13 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
     out->passStart[CPA_PASS_COUNT] = out->nDraws; st->nDraws = out->nDraws;
     { /* distinct textures */
         uint32_t *t = (uint32_t *)malloc((out->nDraws + 1) * 4), n = 0;
-        if (t) { for (uint32_t i = 0; i < out->nDraws; i++) if (out->draws[i].texVa) t[n++] = out->draws[i].texVa;
-            qsort(t, n, 4, cmp_u32); for (uint32_t i = 0; i < n; i++) if (!i || t[i] != t[i - 1]) st->texturesUsed++; free(t); }
+        if (t) { for (uint32_t i = 0; i < out->nDraws; i++) if (out->draws[i].texVa && !out->draws[i].layer) {
+                     t[n++] = out->draws[i].texVa; if (c->store && !cpa_texstore_find(c->store, out->draws[i].texVa)) st->drawsTexMissing++; }
+            qsort(t, n, 4, cmp_u32);
+            for (uint32_t i = 0; i < n; i++) if (!i || t[i] != t[i - 1]) { st->texturesUsed++; if (c->store && !cpa_texstore_find(c->store, t[i])) st->texturesMissing++; }
+            free(t); }
     }
+    st->passByFlags = B.nByFlags;
     free(idx); free(B.b); free(B.apos); free(B.auv);
     return 1;
 }

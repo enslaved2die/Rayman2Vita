@@ -12,6 +12,7 @@
 #undef main
 #include "../../src/cpa/cpa_render.h"
 #include "../../src/platform/vita/cpa_gl_backend.h"
+#include "ta.h"
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -30,8 +31,73 @@ typedef struct {
     uint64_t tcStatic, tcMatched, tcFrag, tcMismatch;
 } Agg;
 
-static const CpaTexInfo *g_ti; static uint32_t g_nti;
-static int describe_cb(void *u, uint32_t va, CpaTexDesc *d) { (void)u; for (uint32_t i = 0; i < g_nti; i++) if (g_ti[i].structVa == va) { d->width = g_ti[i].width; d->height = g_ti[i].height; d->pvrFmt = g_ti[i].pvrFmt; return 1; } return 0; }
+/* ---- real textures (cpa_texstore) and their oracle comparison ---- */
+static CpaTexStore g_store; static int g_haveStore;
+enum { TC_EXACT, TC_ALPHA_ONLY, TC_PIXDIFF, TC_CLOBBER, TC_OTHER_LEVEL, TC_RESIDENT, TC_NO_ENTRY, TC_NO_DESC, TC_SIZE, TC_ORACLE_L2, TC_ANIM_FRAME, TC_N };
+static const char *const tc_name[TC_N] = { "exact", "exact-except-ignore-alpha", "PIXEL-DIFF", "vram-overwritten", "oracle-uses-another-.TEX-texture", "oracle-uses-non-.TEX-texture", "native-VA-not-in-store", "no-descriptor", "size-differs", "oracle-bump-layer2-paired-to-base(excluded)", "animated-texture-live-frame(native=head frame)" };
+static const CpaScene *g_scene;
+typedef struct {
+    uint64_t tri[2][TC_N], pair[2][TC_N];          /* [0] static [1] actor (layer 1 only): matched triangles / distinct (scene, VA, tcw) pairs per outcome */
+    uint64_t wrapTab[256][16], filt[4][2], filtDistinct, wrapOk, wrapTot;   /* WRAPCHK: wrap byte -> bits clampU|flipU<<1|clampV<<2|flipV<<3 of the oracle TSP; FILTCHK: TSP filter field x PVR has-mip */
+    uint64_t draws, drawsTextured, drawsMissing, drawsLayer2, drawsUntextured, texDistinct, texMissing, passByFlags;
+    uint64_t upl, uplSame, uplDiff, uplPlaceholder, uplBump, uplBumpSame, nDecodeFail, scenesChecked;
+} TexAgg;
+static TexAgg g_T;
+typedef struct { uint32_t va, tcw, tsp; int res; } PairRes;
+static uint32_t rdU32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+
+/* The texture the native batch binds (store entry of its VA) against the texture the oracle strip addresses (tcw -> texture memory address -> descriptor desc[7] of a .TEX texture). */
+static int tex_pair_check(const uint8_t *ram, const uint8_t *vram, uint32_t vn, const TaTexEnv *env, uint32_t va, uint32_t tcw, uint32_t tsp, TexAgg *T, int record) {
+    if (((tcw >> 27) & 7) == 4) return TC_ORACLE_L2;   /* bump format: the oracle's layer-2 draw of the same polygon was paired with the native base triangle (equal geometry) */
+    const CpaTexEntry *e = cpa_texstore_find(&g_store, va); if (!e) return TC_NO_ENTRY;
+    uint32_t dVa = rdU32(ram + (va & 0xFFFFFF)); if ((dVa >> 24) != 0x8C) return TC_NO_DESC;
+    uint32_t d7 = rdU32(ram + (dVa & 0xFFFFFF) + 28), addr = (tcw & 0x1FFFFF) << 3;
+    if (d7 != addr) {
+        /* animated texture: native binds the load-time head frame, the oracle's strip uses the live frame = another node of the same VisualMaterial list */
+        for (uint32_t it = 0; g_scene && it < g_scene->nItems; it++) { const CpaDrawItem *di = &g_scene->items[it]; if (di->texVa != va || !di->texAnimHead) continue;
+            for (uint32_t k = 0; k < di->texAnimCount && k < 64; k++) { uint32_t nv; float du; if (!cpa_tex_anim_node(&g_scene->img, di->texAnimHead, k, &nv, &du)) break;
+                uint32_t nd = rdU32(ram + (nv & 0xFFFFFF)); if ((nd >> 24) == 0x8C && rdU32(ram + (nd & 0xFFFFFF) + 28) == addr) return TC_ANIM_FRAME; } }
+        for (uint32_t i = 0; i < g_store.n; i++) { uint32_t dv = rdU32(ram + (g_store.e[i].va & 0xFFFFFF)); if ((dv >> 24) == 0x8C && rdU32(ram + (dv & 0xFFFFFF) + 28) == addr) return TC_OTHER_LEVEL; }
+        return TC_RESIDENT;
+    }
+    int tw, th; ta_tex_size(tsp, &tw, &th); if (tw != e->w || th != e->h) return TC_SIZE;
+    if (record) {
+        int cu = (tsp >> 16) & 1, fu = (tsp >> 18) & 1, cv = (tsp >> 15) & 1, fv = (tsp >> 17) & 1;
+        int obs = cu | fu << 1 | cv << 2 | fv << 3, exp = (e->wrapU == CPA_WRAP_CLAMP) | (e->wrapU == CPA_WRAP_MIRROR) << 1 | (e->wrapV == CPA_WRAP_CLAMP) << 2 | (e->wrapV == CPA_WRAP_MIRROR) << 3;
+        T->wrapTot++; T->wrapOk += obs == exp; T->wrapTab[e->wrapByte][obs]++; T->filt[(tsp >> 13) & 3][e->mip]++; T->filtDistinct++;
+    }
+    const CpaPvrInfo *in = &e->bank->c[e->chunk].info; uint32_t sh = (in->mip && !in->vq && !in->pal) ? 4 : 0;
+    if (d7 + sh + in->needLen > vn || memcmp(vram + d7 + sh, e->bank->c[e->chunk].blk + in->dataOff, in->needLen)) return TC_CLOBBER;   /* the oracle's texture memory no longer holds this chunk (INFERRED frame-buffer clobber) */
+    const uint32_t *nat = cpa_texstore_pixels(&g_store, va); if (!nat) return TC_PIXDIFF;
+    uint32_t n = (uint32_t)tw * (uint32_t)th; uint32_t *ora = (uint32_t *)malloc(4u * n); if (!ora) return TC_PIXDIFF;
+    ta_tex_decode(vram, vn, tcw, tsp, env, 0, 0, ora);
+    int same = !memcmp(ora, nat, 4u * n), res = TC_EXACT;
+    if (!same) {
+        ta_tex_decode(vram, vn, tcw, tsp, env, 0, 1, ora);
+        uint32_t bad = 0; for (uint32_t i = 0; i < n; i++) bad += (nat[i] | 0xFF000000u) != ora[i];
+        res = bad ? TC_PIXDIFF : TC_ALPHA_ONLY;
+    }
+    free(ora); return res;
+}
+
+/* fakegl: every texture the backend uploaded for this frame is byte-identical to an independent cpa_tex decode (+ bleed) of its chunk */
+static void upload_check(CpaRenderCtx *ctx, const CpaRenderFrame *f, TexAgg *T) {
+    CpaGlBackend gb; CpaRenderBackend be; CpaGlConfig cfg; cpa_gl_config_default(&cfg); cpa_gl_backend_init(&gb, &cfg); cpa_gl_backend_vtable(&gb, &be);
+    cpa_render_ctx_forget_textures(ctx); cpa_render_submit(ctx, f, &be);
+    for (int i = 0; i < CPA_GL_TEXSLOTS; i++) {
+        if (!gb.tex[i].va) continue;
+        unsigned id = gb.tex[i].id & 0xFFFF; uint64_t got = fgr.tex[id].pix; int gw = fgr.tex[id].w, gh = fgr.tex[id].h;
+        const CpaTexEntry *e = cpa_texstore_find(&g_store, gb.tex[i].va);
+        if (gb.tex[i].placeholder) { T->uplPlaceholder++; continue; }
+        if (e) {
+            uint32_t n = (uint32_t)e->w * e->h; uint32_t *buf = (uint32_t *)malloc(4u * n); T->upl++;
+            if (buf && !cpa_texbank_decode(e->bank, e->chunk, NULL, 0, buf)) { cpa_tex_bleed(buf, e->w, e->h); if (got == fgr_hash_bytes(buf, 4u * n) && gw == e->w && gh == e->h) T->uplSame++; else T->uplDiff++; } else T->uplDiff++;
+            free(buf);
+        } else { const uint32_t *px = cpa_texstore_pixels(&g_store, gb.tex[i].va); T->uplBump++; if (px && got == fgr_hash_bytes(px, 64 * 64 * 4) && gw == 64 && gh == 64) T->uplBumpSame++; }
+    }
+    cpa_gl_backend_shutdown(&gb);
+}
+
 typedef struct { uint64_t draws, states, binds; } GlCost;
 static GlCost gl_cost(CpaRenderCtx *ctx, const CpaRenderFrame *f) {
     CpaGlBackend gb; CpaRenderBackend be; CpaGlConfig cfg; cpa_gl_config_default(&cfg); cpa_gl_backend_init(&gb, &cfg); cpa_gl_backend_vtable(&gb, &be);
@@ -84,7 +150,17 @@ static int shadow_scene(CpaRenderCtx *ctx, const CpaScene *sc, const CpaVisTriMa
     /* oracle triangles */
     uint32_t no = 0, nspr = 0; OTri *ot = calloc(nvert + 1, sizeof *ot); uint64_t oList[8] = { 0 };
     for (uint32_t i = 0; i < nstrip; i++) { const TaS *s = &strips[i]; if (s->sprite) { nspr++; continue; }
-        for (uint32_t k = 0; k + 2 < s->count; k++) { OTri *o = &ot[no++]; for (int j = 0; j < 3; j++) { const TaV *v = &tv[s->first + k + j]; o->sx[j] = v->x; o->sy[j] = v->y; o->z[j] = v->z; o->u[j] = v->u; o->v[j] = v->v; } o->tcw = s->tcw; o->list = s->list; if (s->list < 8) oList[s->list]++; } }
+        for (uint32_t k = 0; k + 2 < s->count; k++) { OTri *o = &ot[no++]; for (int j = 0; j < 3; j++) { const TaV *v = &tv[s->first + k + j]; o->sx[j] = v->x; o->sy[j] = v->y; o->z[j] = v->z; o->u[j] = v->u; o->v[j] = v->v; } o->tcw = s->tcw; o->tsp = s->tsp; o->list = s->list; if (s->list < 8) oList[s->list]++; } }
+
+    /* texture memory + decode environment of this scene (for the per-triangle texture comparison) and the draw-level texture checks of the native frame */
+    uint8_t *vramB = NULL, *regB = NULL; size_t vramN = 0, regN = 0; TaTexEnv tenv; uint32_t tpal[1024]; PairRes pcache[2048]; int npc = 0; memset(&tenv, 0, sizeof tenv);
+    if (g_haveStore) {
+        snprintf(p, sizeof p, "%s/f%ld/vram.bin", capdir, scene); vramB = slurp(p, &vramN); snprintf(p, sizeof p, "%s/f%ld/pvrregs.bin", capdir, scene); regB = slurp(p, &regN);
+        if (regB && regN >= 4 * 1026) { memcpy(tpal, regB, sizeof tpal); tenv.pal = tpal; tenv.pal_ctrl = rdU32(regB + 4 * 1024); tenv.text_control = rdU32(regB + 4 * 1025); }
+        for (uint32_t d = 0; d < F1.nDraws; d++) { const CpaRenderDraw *dr = &F1.draws[d]; g_T.draws++; g_T.drawsLayer2 += dr->layer; if (!dr->layer) { if (dr->texVa) g_T.drawsTextured++; else g_T.drawsUntextured++; } }
+        g_T.drawsMissing += F1.st.drawsTexMissing; g_T.texDistinct += F1.st.texturesUsed; g_T.texMissing += F1.st.texturesMissing; g_T.passByFlags += F1.st.passByFlags; g_T.scenesChecked++;
+        upload_check(ctx, &F1, &g_T);
+    }
 
     /* native triangles of F1 projected with the same model as ta_compare (cpa_project at 640x480 HorPlus == oracle, VERIFIED in test_camera) */
     CpaProj prj; cpa_proj_init(&prj, &in.cam, 640, 480, CPA_FIT_HORPLUS);
@@ -124,8 +200,14 @@ static int shadow_scene(CpaRenderCtx *ctx, const CpaScene *sc, const CpaVisTriMa
         }
         if (hit >= 0) {
             NT *q = &sorted[hit]; q->used = 1; mTot++; if (q->layer) mL2++; else mSrc[q->src]++;
+            if (g_haveStore && vramB && regB && !q->layer && q->va && q->src != CPA_SRC_SPRITE) {
+                int si = q->src == CPA_SRC_ACTOR, k = -1; for (int i = 0; i < npc; i++) if (pcache[i].va == q->va && pcache[i].tcw == ot[a].tcw && pcache[i].tsp == ot[a].tsp) { k = i; break; }
+                int res; if (k >= 0) res = pcache[k].res;
+                else { res = tex_pair_check(ram, vramB, (uint32_t)vramN, &tenv, q->va, ot[a].tcw, ot[a].tsp, &g_T, 1); if (npc < 2048) { pcache[npc].va = q->va; pcache[npc].tcw = ot[a].tcw; pcache[npc].tsp = ot[a].tsp; pcache[npc].res = res; npc++; } g_T.pair[si][res]++; }
+                g_T.tri[si][res]++;
+            }
             if (verbose && q->src == CPA_SRC_ACTOR) { uint32_t fl = cpa_u32(&rimg, q->va + 4); uint8_t wb = 0; cpa_rd8(&rimg, q->va + 0x18, &wb); static int nd; if (nd++ < 12) printf("  ACTORDBG tex %08x flags %08x wrap %02x -> pass %d; oracle list %u\n", q->va, fl, wb, q->pass, ot[a].list); }
-            int expect = ot[a].list == 0 ? CPA_PASS_OPAQUE : ot[a].list == 4 ? CPA_PASS_CUTOUT : CPA_PASS_TRANSLUCENT; passTot++; passAg += (q->pass == expect); passTotSrc[q->src]++; if (q->src == 0 && !q->layer && q->pass == CPA_PASS_OPAQUE && (ot[a].list == 0 || ot[a].list == 2)) { A->fmtOp[ot[a].list == 2][(ot[a].tcw >> 27) & 7]++; for (uint32_t i = 0; i < g_nti; i++) if (g_ti[i].structVa == q->va) { A->pvrf[ot[a].list == 2][g_ti[i].pvrFmt & 0xFF]++; A->pvrfAll[ot[a].list == 2][g_ti[i].pvrFmt]++; } } if (q->src < 2 && !q->layer && ot[a].list < 8) A->xt[q->src][q->pass][ot[a].list]++; passAgSrc[q->src] += (q->pass == expect);
+            int expect = ot[a].list == 0 ? CPA_PASS_OPAQUE : ot[a].list == 4 ? CPA_PASS_CUTOUT : CPA_PASS_TRANSLUCENT; passTot++; passAg += (q->pass == expect); passTotSrc[q->src]++; if (q->src == 0 && !q->layer && q->pass == CPA_PASS_OPAQUE && (ot[a].list == 0 || ot[a].list == 2)) { A->fmtOp[ot[a].list == 2][(ot[a].tcw >> 27) & 7]++; { const CpaTexEntry *pe = g_haveStore ? cpa_texstore_find(&g_store, q->va) : NULL; if (pe) A->pvrf[ot[a].list == 2][pe->pvrFmt & 0xFF]++; } } if (q->src < 2 && !q->layer && ot[a].list < 8) A->xt[q->src][q->pass][ot[a].list]++; passAgSrc[q->src] += (q->pass == expect);
             /* UV: find the draw vertices again */
             const CpaRenderDraw *dr = &F1.draws[q->draw]; (void)dr;
             if (!q->layer && q->va) { int f2 = -1; for (int i = 0; i < ntm; i++) if (tmap[i].va == q->va && tmap[i].src == q->src) { f2 = i; break; }
@@ -167,6 +249,7 @@ static int shadow_scene(CpaRenderCtx *ctx, const CpaScene *sc, const CpaVisTriMa
     A->trisActorM1 += F1.st.trisActor; A->trisActorM2 += F2.st.trisActor; A->trisStatic0 += F0.st.trisStatic; A->trisAll0 += F0.nVerts / 3;
     A->tcStatic += st.staticTotal; A->tcMatched += st.matched; A->tcFrag += st.frag; A->tcMismatch += st.unmBad + st.unmClip;
     (void)verbose; (void)lvl; (void)triDraw;
+    free(vramB); free(regB);
     free(triDraw); free(sorted); free(nt); free(ot); free(actors); cpa_render_frame_free(&F1); cpa_render_frame_free(&F2); cpa_render_frame_free(&F0); cpa_render_frame_free(&Fu); free(ram); free(fb);
     return 0;
 }
@@ -177,11 +260,10 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--level") && i + 1 < argc) level = argv[++i];
         else if (!strcmp(argv[i], "--scene") && i + 1 < argc) scene = atol(argv[++i]);
         else if (!strcmp(argv[i], "--glc") && i + 1 < argc) glc = argv[++i];
-        else if (!strcmp(argv[i], "--post-tex")) continue; else if (!strcmp(argv[i], "--all")) all = 1; else if (!strcmp(argv[i], "-v")) verbose = 1;
+        else if (!strcmp(argv[i], "--post-tex") || !strcmp(argv[i], "--no-tex")) continue; else if (!strcmp(argv[i], "--all")) all = 1; else if (!strcmp(argv[i], "-v")) verbose = 1;
         else if (!capdir) capdir = argv[i]; else if (!dcdata) dcdata = argv[i];
     }
     if (!capdir || !dcdata) { fprintf(stderr, "usage: %s CAPDIR DCDATA_DIR [--level L] [--scene N | --all] [--glc test_glcount]\n", argv[0]); return 2; }
-    int postTex = 0; for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--post-tex")) postTex = 1;
     long scenes[256]; int ns = 0;
     { DIR *d = opendir(capdir); struct dirent *e; while (d && (e = readdir(d))) { long k; if (sscanf(e->d_name, "f%ld", &k) == 1 && ns < 256) scenes[ns++] = k; } if (d) closedir(d); }
     for (int i = 0; i < ns; i++) for (int j = i + 1; j < ns; j++) if (scenes[j] < scenes[i]) { long t = scenes[i]; scenes[i] = scenes[j]; scenes[j] = t; }
@@ -190,11 +272,18 @@ int main(int argc, char **argv) {
     snprintf(up, sizeof up, "%s", level); for (char *c = up; *c; c++) *c = (char)toupper((unsigned char)*c); snprintf(lvlp, sizeof lvlp, "%s/%s/%s.DAT", dcdata, up, up);
     uint8_t *fix, *lvl; size_t fixN, lvlN; CpaImage img; CpaScene sc;
     if (!cpa_read_file(fixp, &fix, &fixN) || !cpa_read_file(lvlp, &lvl, &lvlN) || !cpa_scene_load_dats(&sc, &img, fix, fixN, lvl, lvlN)) { fprintf(stderr, "load failed\n"); return 2; }
-    CpaTexInfo *ti = NULL; uint32_t nti = 0;
-    { char tp[1100]; snprintf(tp, sizeof tp, "%s/%s/%s.TEX", dcdata, up, up); uint8_t *tex; size_t texN;
-        if (cpa_read_file(tp, &tex, &texN)) { if (cpa_tex_table(&sc.img, tex, texN, &ti, &nti)) { if (postTex) printf("post-load texture state applied to %u scene items/sprites (%u textures)\n", cpa_scene_apply_tex(&sc, ti, nti), nti); } else { printf("cpa_tex_table failed, pre-load flags kept\n"); ti = NULL; } free(tex); } }
-    g_ti = ti; g_nti = nti;
-    CpaRenderCtx ctx; CpaRenderOpts o; cpa_render_opts_default(&o); o.describe = describe_cb; cpa_render_ctx_init(&ctx, &sc, &o);
+    int noTex = 0; for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--no-tex")) noTex = 1;   /* baseline: pre-load flags, drawlist classes, grey placeholders */
+    if (!noTex) {
+        char tp[1100], fp[1100]; uint8_t *tex = NULL, *fxt = NULL; size_t texN = 0, fxtN = 0;
+        snprintf(tp, sizeof tp, "%s/%s/%s.TEX", dcdata, up, up); snprintf(fp, sizeof fp, "%s/FIX.TEX", dcdata);
+        if (cpa_read_file(tp, &tex, &texN) && cpa_read_file(fp, &fxt, &fxtN)) {
+            cpa_texstore_load(&g_store, &sc, tex, texN, fix, fixN, fxt, fxtN); g_haveStore = 1;
+            printf("TEXSTORE %s: level bank %u textures (%s), FIX bank %u (%s); post-load flags applied to the scene\n", level, g_store.nLevel, g_store.levelOk ? "ok" : "FAILED", g_store.nFix, g_store.fixOk ? "ok" : "FAILED");
+        } else printf("TEXSTORE: .TEX files unreadable, running without textures\n");
+        free(tex); free(fxt);
+    }
+    g_scene = &sc;
+    CpaRenderCtx ctx; CpaRenderOpts o; cpa_render_opts_default(&o); if (noTex) o.flagRule = 0; cpa_render_ctx_init(&ctx, &sc, &o); if (g_haveStore) cpa_render_ctx_set_texstore(&ctx, &g_store);
     CpaVisTriMap tm; int haveTm = cpa_vis_trimap_build(&tm, &sc.img);
     Agg A; memset(&A, 0, sizeof A);
     for (int i = 0; i < ns; i++) shadow_scene(&ctx, &sc, haveTm ? &tm : NULL, lvl, capdir, level, scenes[i], glc, tol, ztol, verbose, &A);
@@ -212,6 +301,26 @@ int main(int argc, char **argv) {
            (unsigned long long)A.xt[1][0][0], (unsigned long long)A.xt[1][0][2], (unsigned long long)A.xt[1][0][4], (unsigned long long)A.xt[1][1][0], (unsigned long long)A.xt[1][1][2], (unsigned long long)A.xt[1][1][4], (unsigned long long)A.xt[1][2][0], (unsigned long long)A.xt[1][2][2], (unsigned long long)A.xt[1][2][4]);
     printf("FMTCHK %s static native-opaque matched, by oracle tcw pixel format (bits 27-29): oracle list0 [", level); for (int i = 0; i < 8; i++) printf("%llu ", (unsigned long long)A.fmtOp[0][i]); printf("] oracle list2 ["); for (int i = 0; i < 8; i++) printf("%llu ", (unsigned long long)A.fmtOp[1][i]); printf("]\n");
     for (int l = 0; l < 2; l++) { printf("PVRFMT %s oracle list%d low-byte pvrFmt histogram:", level, l ? 2 : 0); for (int i = 0; i < 256; i++) if (A.pvrf[l][i]) printf(" %02x:%llu", i, (unsigned long long)A.pvrf[l][i]); printf("\n"); }
+    if (g_haveStore) {
+        TexAgg *T = &g_T;
+        printf("TEXRES %s | %llu scenes: draws %llu = textured %llu + untextured %llu + layer-2 %llu; textured draws whose texture VA is NOT in the store: %llu; distinct textures used (sum over scenes) %llu, missing %llu | batches classified by tex.flags %llu\n",
+               level, (unsigned long long)T->scenesChecked, (unsigned long long)T->draws, (unsigned long long)T->drawsTextured, (unsigned long long)T->drawsUntextured, (unsigned long long)T->drawsLayer2, (unsigned long long)T->drawsMissing, (unsigned long long)T->texDistinct, (unsigned long long)T->texMissing, (unsigned long long)T->passByFlags);
+        printf("UPLOADCHK %s | fakegl: .TEX textures uploaded %llu, pixels byte-identical to an independent cpa_tex decode+bleed %llu, different %llu | layer-2 bump uploads %llu (plumbing-identical %llu) | grey placeholders %llu | store decode failures %u\n",
+               level, (unsigned long long)T->upl, (unsigned long long)T->uplSame, (unsigned long long)T->uplDiff, (unsigned long long)T->uplBump, (unsigned long long)T->uplBumpSame, (unsigned long long)T->uplPlaceholder, g_store.nDecodeFail);
+        for (int si = 0; si < 2; si++) {
+            uint64_t tt = 0, pt = 0; for (int k = 0; k < TC_N; k++) { tt += T->tri[si][k]; pt += T->pair[si][k]; }
+            uint64_t ttv = tt - T->tri[si][TC_CLOBBER] - T->tri[si][TC_ORACLE_L2], ptv = pt - T->pair[si][TC_CLOBBER] - T->pair[si][TC_ORACLE_L2], good = T->tri[si][TC_EXACT] + T->tri[si][TC_ALPHA_ONLY], pgood = T->pair[si][TC_EXACT] + T->pair[si][TC_ALPHA_ONLY];
+            printf("TEXCHK %s %s | matched layer-1 triangles %llu (distinct tex pairs %llu): pixel-exact (incl. ignore-alpha) %llu = %.2f%% of those with intact vram (%.2f%% of pairs)", level, si ? "actor " : "static", (unsigned long long)tt, (unsigned long long)pt, (unsigned long long)good, ttv ? 100.0 * good / ttv : 0.0, ptv ? 100.0 * pgood / ptv : 0.0);
+            for (int k = 0; k < TC_N; k++) printf(" | %s %llu/%llu", tc_name[k], (unsigned long long)T->tri[si][k], (unsigned long long)T->pair[si][k]);
+            printf("\n");
+        }
+        for (int w = 0; w < 256; w++) { uint64_t sum = 0; for (int k = 0; k < 16; k++) sum += T->wrapTab[w][k]; if (!sum) continue;
+            printf("WRAPCHK %s wrap byte %02x (U mode %u V mode %u as decoded) -> oracle TSP [clampU|flipU<<1|clampV<<2|flipV<<3] x pairs:", level, w, ({ uint8_t a, b; cpa_tex_wrap_modes((uint8_t)w, &a, &b); a; }), ({ uint8_t a, b; cpa_tex_wrap_modes((uint8_t)w, &a, &b); b; }));
+            for (int k = 0; k < 16; k++) if (T->wrapTab[w][k]) printf(" %x:%llu", k, (unsigned long long)T->wrapTab[w][k]); printf("\n"); }
+        printf("WRAPSUM %s | decoded wrap modes equal the oracle TSP clamp/flip bits for %llu of %llu distinct (VA, tcw) pairs\n", level, (unsigned long long)T->wrapOk, (unsigned long long)T->wrapTot);
+        printf("FILTCHK %s oracle TSP filter field (0 point 1 bilinear 2/3 trilinear) x pairs, [no-mip, mip]:", level); for (int f = 0; f < 4; f++) printf(" %d:[%llu,%llu]", f, (unsigned long long)T->filt[f][0], (unsigned long long)T->filt[f][1]); printf("\n");
+        cpa_texstore_free(&g_store);
+    }
     if (haveTm) cpa_vis_trimap_free(&tm);
     cpa_render_ctx_free(&ctx); cpa_scene_free(&sc); free(fix); free(lvl);
     return 0;

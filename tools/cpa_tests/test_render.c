@@ -70,23 +70,73 @@ static void t_frame(void) {
     CHECK(f.st.srcBatches == 4 && f.st.nDraws == 3, "src batches %u draws %u (expect 4 / 3: two opaque items merge, base + layer 2)", f.st.srcBatches, f.st.nDraws);
     CHECK(f.st.trisLayer2 == 1 && f.st.trisStatic == 4, "layer2 %u static %u", f.st.trisLayer2, f.st.trisStatic);
     const CpaRenderDraw *l2 = NULL; for (uint32_t i = 0; i < f.nDraws; i++) if (f.draws[i].layer) l2 = &f.draws[i];
-    CHECK(l2 && l2->texVa == 0 && l2->layerTexUnknown, "layer-2 draw has unknown texture");
+    CHECK(l2 && l2->texVa == CPA_TEXVA_BUMP && l2->layerTexUnknown && l2->wrapU == CPA_WRAP_REPEAT, "layer-2 draw uses the substitute bump texture (mode 3 -> non-mip)");
     if (l2) { const CpaRenderVertex *v = &f.verts[l2->first]; /* source: tri 3, vertex 1: uv (0.25, 0.5) -> (K*0.25, K*(1-0.5)) for mode 3 */
               CHECK(fabsf(v[1].u - 2.0f) < 1e-6f && fabsf(v[1].v - 4.0f) < 1e-6f, "layer-2 uv (%g %g)", v[1].u, v[1].v); }
     CpaGlBackend gb; CpaGlBackend *gbp = &gb; cpa_gl_backend_init(gbp, NULL); CpaRenderBackend be; cpa_gl_backend_vtable(gbp, &be);
     int ups = 0; CpaRenderBackend counting = be; (void)counting; (void)up_cb; (void)g_bound;
     extern FakeGl fg; unsigned long d0 = fg.draws;
     uint32_t n = cpa_render_submit(&ctx, &f, &be);
-    CHECK(n == 3 && gb.drawsIssued == 2 && gb.drawsSkipped == 1 && fg.draws - d0 == 2, "submit: %u draws offered, %u issued, %u skipped, fake saw %lu", n, gb.drawsIssued, gb.drawsSkipped, fg.draws - d0);
-    CHECK(gb.nTex == 2, "textures uploaded %u (expect 2: 0x100 and 0x200)", gb.nTex);
+    CHECK(n == 3 && gb.drawsIssued == 3 && gb.drawsSkipped == 0 && gb.drawsLayer2 == 1 && fg.draws - d0 == 3, "submit: %u draws offered, %u issued, %u skipped, %u layer-2, fake saw %lu", n, gb.drawsIssued, gb.drawsSkipped, gb.drawsLayer2, fg.draws - d0);
+    CHECK(gb.nTex == 3 && gb.nPlaceholder == 3 && gb.nUploaded == 0, "textures uploaded %u (expect 3: 0x100, 0x200, bump; all placeholders without a provider: %u)", gb.nTex, gb.nPlaceholder);
     unsigned long t0 = fg.teximage; cpa_render_submit(&ctx, &f, &be); CHECK(fg.teximage == t0, "second frame re-uploaded textures");
     (void)ups;
     cpa_gl_backend_shutdown(gbp); cpa_render_frame_free(&f); cpa_render_ctx_free(&ctx);
-    printf("frame: %u src batches -> %u draws, opaque merge ok, layer-2 uv rule ok, GL submit %u/%u\n", 4u, 3u, 2u, 3u);
+    printf("frame: %u src batches -> %u draws, opaque merge ok, layer-2 uv rule ok, GL submit %u/%u\n", 4u, 3u, 3u, 3u);
+}
+
+/* tex.flags list rule through the builder: 5 items with flags 0 / 0x08 / 0x12 / 0x20 / 0x48 (the shipped post-load values) + one item with the pre-load style 0x04 (no 0x2A bit -> opaque) */
+static void t_flagrule(void) {
+    static const uint32_t fl[6] = { 0x00, 0x08, 0x12, 0x20, 0x48, 0x04 };
+    static const uint8_t expPass[6] = { CPA_PASS_OPAQUE, CPA_PASS_TRANSLUCENT, CPA_PASS_TRANSLUCENT, CPA_PASS_TRANSLUCENT, CPA_PASS_TRANSLUCENT, CPA_PASS_OPAQUE };
+    static const uint8_t expBlend[6] = { CPA_BLEND_NONE, CPA_BLEND_ALPHA, CPA_BLEND_ALPHA, CPA_BLEND_ADD, CPA_BLEND_ALPHA, CPA_BLEND_NONE };
+    CpaScene s; memset(&s, 0, sizeof s);
+    float pos[18 * 3] = { 0 }, uv[18 * 2] = { 0 };
+    for (int t = 0; t < 6; t++) for (int v = 0; v < 3; v++) { int i = t * 3 + v; pos[i * 3] = (float)v; pos[i * 3 + 1] = 10.0f + (float)t; pos[i * 3 + 2] = (v == 2) ? 1.0f : 0.0f; }
+    CpaDrawItem it[6]; memset(it, 0, sizeof it);
+    for (int k = 0; k < 6; k++) { it[k].firstVert = (uint32_t)k * 3; it[k].vertCount = 3; it[k].texVa = 0x100 + 0x10 * (uint32_t)k; it[k].texFlags = fl[k]; it[k].texFlagsValid = 1; it[k].alphaClass = CPA_ALPHA_UNKNOWN; it[k].tileU = it[k].tileV = 1; }
+    s.pos = pos; s.uv = uv; s.nVerts = 18; s.items = it; s.nItems = 6;
+    for (int rule = 1; rule >= 0; rule--) {
+        CpaRenderCtx ctx; CpaRenderOpts o; cpa_render_opts_default(&o); o.flagRule = rule; cpa_render_ctx_init(&ctx, &s, &o);
+        CpaFrameInput in; memset(&in, 0, sizeof in);
+        float cp[3] = { 0, 0, 0 }, up[3] = { 0, 0, 1 }, fw[3] = { 0, 1, 0 }; cpa_camera_from_rows(&in.cam, cp, up, fw, 1.2f, 0.75f); in.w = 640; in.h = 480; in.fit = CPA_FIT_HORPLUS;
+        CpaRenderFrame f; CHECK(cpa_render_build_frame(&ctx, &f, &in), "build");
+        int bad = 0;
+        for (uint32_t d = 0; d < f.nDraws; d++) { int k = (int)((f.draws[d].texVa - 0x100) / 0x10); if (k < 0 || k > 5) { bad++; continue; }
+            if (rule) { if (f.draws[d].pass != expPass[k] || f.draws[d].blend != expBlend[k]) bad++; if ((f.draws[d].pass == CPA_PASS_OPAQUE) != (f.draws[d].cullBack == 1)) bad++; }
+            else if (k == 5 && f.draws[d].pass != CPA_PASS_TRANSLUCENT) bad++; /* old behaviour: unknown flags -> translucent */ }
+        CHECK(bad == 0, "flag rule %d: %d wrong draws", rule, bad);
+        CHECK(rule ? f.st.passByFlags == 6 : f.st.passByFlags == 0, "passByFlags %u", f.st.passByFlags);
+        cpa_render_frame_free(&f); cpa_render_ctx_free(&ctx);
+    }
+    printf("flag rule: 0x00 opaque, 0x08/0x12/0x48 alpha blend, 0x20 additive, 0x04 (no 0x2A bit) opaque; rule off keeps the drawlist classes\n");
+}
+
+/* wrap byte decode + substitute bump texture content + store lookups, asset free */
+static void t_store(void) {
+    uint8_t u, v;
+    /* measured against the oracle TSP bits (00, 01, 02, 04, 10, 18); 08 and 24 are INFERRED */
+    static const struct { uint8_t wb, u, v; } tab[] = { { 0x00, CPA_WRAP_CLAMP, CPA_WRAP_CLAMP }, { 0x01, CPA_WRAP_REPEAT, CPA_WRAP_REPEAT }, { 0x02, CPA_WRAP_MIRROR, CPA_WRAP_MIRROR },
+        { 0x04, CPA_WRAP_REPEAT, CPA_WRAP_CLAMP }, { 0x10, CPA_WRAP_CLAMP, CPA_WRAP_REPEAT }, { 0x18, CPA_WRAP_MIRROR, CPA_WRAP_REPEAT }, { 0x08, CPA_WRAP_MIRROR, CPA_WRAP_REPEAT }, { 0x24, CPA_WRAP_REPEAT, CPA_WRAP_MIRROR } };
+    for (unsigned i = 0; i < sizeof tab / sizeof *tab; i++) { cpa_tex_wrap_modes(tab[i].wb, &u, &v); CHECK(u == tab[i].u && v == tab[i].v, "wrap byte %02x -> %u %u", tab[i].wb, u, v); }
+    CpaTexStore st; memset(&st, 0, sizeof st);
+    const uint32_t *b0 = cpa_texstore_pixels(&st, CPA_TEXVA_BUMP_MIP), *b1 = cpa_texstore_pixels(&st, CPA_TEXVA_BUMP);
+    CHECK(b0 && b1 && b0 != b1, "bump substitutes decode");
+    if (b0 && b1) {
+        unsigned white = 0, sum0 = 0, sum1 = 0, differ = 0;
+        for (int i = 0; i < 64 * 64; i++) { white += (b0[i] & 0xFFFFFF) == 0xFFFFFF && (b1[i] & 0xFFFFFF) == 0xFFFFFF; sum0 += b0[i] >> 24; sum1 += b1[i] >> 24; differ += b0[i] != b1[i]; }
+        CHECK(white == 64 * 64, "bump texels are white (alpha carries the intensity)");
+        CHECK(sum0 / 4096 > 8 && sum0 / 4096 < 200 && sum1 / 4096 > 8 && sum1 / 4096 < 200 && differ > 3000, "bump alpha mean %u / %u, differing texels %u", sum0 / 4096, sum1 / 4096, differ);
+        printf("bump substitute: 64x64 white, mean alpha mip %u/255, non-mip %u/255\n", sum0 / 4096, sum1 / 4096);
+    }
+    CpaTexDesc d; memset(&d, 0, sizeof d);
+    CHECK(cpa_texstore_describe(&st, CPA_TEXVA_BUMP_MIP, &d) && d.width == 64 && d.mip && d.substitute && d.rgba, "describe bump mip");
+    CHECK(!cpa_texstore_describe(&st, 0x8C123456, &d), "unknown VA is not described");
+    cpa_texstore_free(&st);
 }
 
 int main(void) {
-    srand(1); t_matrices(); t_frame();
+    srand(1); t_matrices(); t_frame(); t_flagrule(); t_store();
     printf("test_render: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }
