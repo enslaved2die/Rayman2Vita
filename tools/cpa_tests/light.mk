@@ -7,7 +7,7 @@ CC      ?= cc
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Wpedantic
 ASSETS  ?= $(abspath ../../assets/dc)
 SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c ../../src/cpa/cpa_anim.c
-HDR      = $(wildcard ../../src/cpa/*.h)
+HDR      = $(wildcard ../../src/cpa/*.h) ../../src/cpa/cpa_light.c
 LEVELS  ?= Learn_10 Jail_10 Bast_10 Helic_30 Rodeo_60 Nave_20 Whale_10
 
 build/test_light: test_light.c $(SRC) $(HDR)

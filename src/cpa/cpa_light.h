@@ -65,7 +65,8 @@ typedef struct CpaLight {
     float    axis[3];               /* world-space axis the parallel light shines along: column 2 of the 3x3 at +0x28 (VERIFIED, Learn_10 etc.) */
     float    pos[3];                /* world position (matrix row 3, +0x7C) */
     float    col[4];                /* +0x8C RGBA */
-    float    param[2];              /* +8, +0xC (omni range / falloff, not used) */
+    float    param[2];              /* +8 outer range o, +0xC inner range c of an omni light (f_8c07b13e / f_8c07b29a, VERIFIED reading of the lifted code) */
+    uint8_t  noFalloff;             /* +0x9e: omni only, non-zero = pure cosine term without range test in the vertex loop (f_8c07b6e0) */
 } CpaLight;
 int cpa_light_read(const CpaImage *im, uint32_t va, CpaLight *L);
 /* Reads the guest light list (SHADOW MODE ONLY: guest RAM addresses 0x8C2DD4B4 pointer array; the count word 0x8C2DD964 is 0 between frames, so the list is read until the first
@@ -76,6 +77,28 @@ uint32_t cpa_light_read_ram_list(const CpaImage *ram, CpaLight *out, uint32_t ma
  * stored unit normal, so the transform's scale enters the dot) to the vertex accumulator v. Parallel light: col * max(0, -(nW . axis)) per channel selected by chanMode. Ambient lights add nothing per vertex (they are
  * object-wide, see cpa_light_env_from_list) and return 1. Returns 1 if the light type is implemented, 0 for omni / spot / type 5 (UNKNOWN, contribution skipped). */
 int cpa_light_accum(const CpaLight *L, const float nW[3], float v[4], CpaLightEnv *env);
+/* Object frame for per-vertex lighting: the unmirrored world matrix of the channel (CpaAnimRig.world[ch], row vectors, translation in row 3) and its 3x3 inverse. */
+typedef struct CpaLightObj { float W[16]; float inv3[9]; float scale; int ok; int cull; float cW[3], rW; } CpaLightObj;
+void cpa_light_obj_init(CpaLightObj *o, const float W[16]);
+/* Bounding sphere of the GeometricObject (f_8c038d42: radius geo+0x34 times the matrix scale, centre geo+0x38..0x40 through the matrix). When set (radius != 0) an omni light whose
+ * |lightPos - centre| - radius exceeds its outer range is skipped for the whole object (f_8c07b13e). */
+void cpa_light_obj_sphere(CpaLightObj *o, const CpaImage *im, uint32_t geo);
+/* Adds every enabled light of L[0..n) for one vertex given its LOCAL (geometry-space) position pLocal, its world position pWorld (as drawn, i.e. with the mirror) and stored normal nLocal.
+ * Parallel: as cpa_light_accum at the unit world normal. Omni (f_8c07b892; decoded from the lifted code f_8c07b13e / f_8c07b400 / f_8c07b29a / f_8c07b6e0): first the object-level cull
+ * (cpa_light_obj_sphere), then with d = |lightPos - pWorld|, s = matrix scale (max row length of the world 3x3, f_8c0163e6), o = outer range (+8), c = inner range (+0xC):
+ *   noFalloff == 0 (+0x9e == 0): needs d < o; cos = max(0, -(dLocal . n) * s / d) with dLocal = pLocal - lightLocal; atten = cos for d < c, cos * (o^2 - d^2)/(o^2 - c^2) otherwise.
+ *   noFalloff != 0 (+0x9e != 0): no normal term: atten = s for d < c (1.0 when d == 0), s * (o^2 - d^2)/(o^2 - c^2) for c <= d < o.
+ * v += atten * colour (channels by chanMode). Spot / type 5 are not ported. Returns the number of enabled lights of an unported type. */
+int cpa_light_accum_vertex(const CpaLight *L, uint32_t n, const CpaLightObj *o, const float pLocal[3], const float pWorld[3], const float nLocal[3], float v[4]);
+/* ---------------- which lights act on which object (decoded from the lifted draw path, see notes_lighting.md section 2) ----------------
+ * The game keeps a light stack (0x8C2DD4B4, count 0x8C2DD964). While a sector is drawn (f_8c05f4a0 -> f_8c05ee70 / f_8c05f326 -> f_8c05eea8) the stack holds: the sector's own light list (sector data +20, linked list of
+ * {light*, next*}), the light lists of its neighbour sectors (data +32 = array of 8-byte entries {?, sectorSO*}, count at +36), and the flagged light array (data +12 pointers, count +16, only lights with byte +0x9d & 2).
+ * Every actor of the sector (data +0: linked list of {actorSO*, next*}) is drawn with that stack (f_8c09a1ea). */
+uint32_t cpa_light_sector_lights(const CpaImage *im, uint32_t sectorSO, CpaLight *out, uint32_t max);
+/* Per-actor selection of a stack (f_8c09a1ea): SuperObject flag word +48 bit 0x20000 = unlit (no light acts); types 1 and 4 always act; omni / spot (and type 5 with its range at +0xDC) act when
+ * |lightPos - centre| < radius * scale + range, centre / radius = the SuperObject's sphere (pointer at SO+0x34: centre xyz, radius at +0xC) through the SO matrix (pointer at SO+0x24, 4x4 at +0x28).
+ * Returns the number of lights written to out (<= n). */
+uint32_t cpa_light_for_actor(const CpaImage *im, uint32_t actorSO, const CpaLight *in, uint32_t n, CpaLight *out);
 /* Object-wide part only (ambient lights): fills env->G from the list. */
 void cpa_light_env_from_list(const CpaLight *L, uint32_t n, CpaLightEnv *env);
 

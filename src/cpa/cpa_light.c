@@ -62,6 +62,7 @@ int cpa_light_read(const CpaImage *im, uint32_t va, CpaLight *L) {
     for (int j = 0; j < 3; j++) { L->axis[j] = cpa_f32(im, va + 0x28 + 4u * (3 * j + 2)); L->pos[j] = cpa_f32(im, va + 0x7C + 4u * j); }   /* column 2 of the row-major 3x3 */
     for (int j = 0; j < 4; j++) L->col[j] = cpa_f32(im, va + 0x8C + 4u * j);
     L->param[0] = cpa_f32(im, va + 8); L->param[1] = cpa_f32(im, va + 0xC);
+    cpa_rd8(im, va + 0x9E, &b); L->noFalloff = b;
     return 1;
 }
 
@@ -70,7 +71,8 @@ uint32_t cpa_light_read_ram_list(const CpaImage *ram, CpaLight *out, uint32_t ma
     for (uint32_t i = 0; i < max && i < 64; i++) {
         uint32_t p = cpa_u32(ram, 0x8C2DD4B4u + 4u * i);
         if (!cpa_is_ptr(ram, p)) break;
-        if (cpa_light_read(ram, p, &out[n])) n++;
+        int dup = 0; for (uint32_t k = 0; k < n; k++) if (out[k].va == p) dup = 1;      /* the pointer array keeps stale re-pushes of the same light: count each light once */
+        if (!dup && cpa_light_read(ram, p, &out[n])) n++;
     }
     return n;
 }
@@ -93,6 +95,112 @@ int cpa_light_accum(const CpaLight *L, const float nW[3], float v[4], CpaLightEn
         return 1;
     }
     return 0;
+}
+
+void cpa_light_obj_init(CpaLightObj *o, const float W[16]) {
+    memcpy(o->W, W, sizeof o->W); o->ok = 0; o->scale = 1.0f;
+    const float *m = W;      /* row-major 3x3 at [0..2],[4..6],[8..10] */
+    double a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+    double det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    memset(o->inv3, 0, sizeof o->inv3); o->inv3[0] = o->inv3[4] = o->inv3[8] = 1.0f;
+    { double r1 = m[4]*m[4] + m[5]*m[5] + m[6]*m[6], r2 = m[8]*m[8] + m[9]*m[9] + m[10]*m[10], r0 = a*a + b*b + c*c; double mx = r0 > r1 ? r0 : r1; if (r2 > mx) mx = r2; o->scale = (float)sqrt(mx); }
+    if (fabs(det) < 1e-12) return;
+    double id = 1.0 / det;
+    o->inv3[0] = (float)((e * i - f * h) * id); o->inv3[1] = (float)((c * h - b * i) * id); o->inv3[2] = (float)((b * f - c * e) * id);
+    o->inv3[3] = (float)((f * g - d * i) * id); o->inv3[4] = (float)((a * i - c * g) * id); o->inv3[5] = (float)((c * d - a * f) * id);
+    o->inv3[6] = (float)((d * h - e * g) * id); o->inv3[7] = (float)((b * g - a * h) * id); o->inv3[8] = (float)((a * e - b * d) * id);
+    o->ok = 1;
+}
+
+void cpa_light_obj_sphere(CpaLightObj *o, const CpaImage *im, uint32_t geo) {
+    float r = cpa_f32(im, geo + 0x34), p[3];
+    o->cull = 0; if (!(r != 0.0f)) return;
+    for (int a = 0; a < 3; a++) p[a] = cpa_f32(im, geo + 0x38 + 4u * a);
+    for (int a = 0; a < 3; a++) o->cW[a] = p[0] * o->W[a] + p[1] * o->W[4 + a] + p[2] * o->W[8 + a] + o->W[12 + a];
+    o->rW = r * o->scale; o->cull = 1;
+}
+
+static void add_chan(const CpaLight *L, float s, float v[4]) {
+    if (L->chanMode == 1) v[3] += s * L->col[3];
+    else { for (int c = 0; c < 3; c++) v[c] += s * L->col[c]; if (L->chanMode == 0) v[3] += s * L->col[3]; }
+}
+
+int cpa_light_accum_vertex(const CpaLight *L, uint32_t n, const CpaLightObj *o, const float pLocal[3], const float pWorld[3], const float nLocal[3], float v[4]) {
+    int unported = 0; float nW[3];
+    for (int a = 0; a < 3; a++) nW[a] = nLocal[0] * o->W[a] + nLocal[1] * o->W[4 + a] + nLocal[2] * o->W[8 + a];
+    { float l2 = sqrtf(nW[0] * nW[0] + nW[1] * nW[1] + nW[2] * nW[2]); if (l2 > 1e-6f) for (int a = 0; a < 3; a++) nW[a] /= l2; }
+    for (uint32_t i = 0; i < n; i++) {
+        const CpaLight *l = &L[i];
+        if (!l->enabled) continue;
+        if (l->type == CPA_LIGHT_AMBIENT) continue;
+        if (l->type == CPA_LIGHT_PARALLEL) { cpa_light_accum(l, nW, v, NULL); continue; }
+        if (l->type != CPA_LIGHT_OMNI) { unported++; continue; }
+        if (o->cull) { float e[3] = { l->pos[0] - o->cW[0], l->pos[1] - o->cW[1], l->pos[2] - o->cW[2] };
+            if (sqrtf(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]) - o->rW > l->param[0]) continue; }
+        float dw[3] = { l->pos[0] - pWorld[0], l->pos[1] - pWorld[1], l->pos[2] - pWorld[2] };
+        float d2 = dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2], oo = l->param[0] * l->param[0], cc = l->param[1] * l->param[1], at;
+        if (!(oo > d2)) continue;
+        if (l->noFalloff) {
+            if (cc > d2) at = (d2 == 0.0f) ? 1.0f : o->scale;
+            else at = (oo - d2) / (oo - cc) * o->scale;
+        } else {
+            float t[3] = { l->pos[0] - o->W[12], l->pos[1] - o->W[13], l->pos[2] - o->W[14] }, ll[3], d[3];
+            for (int a = 0; a < 3; a++) ll[a] = t[0] * o->inv3[a] + t[1] * o->inv3[3 + a] + t[2] * o->inv3[6 + a];
+            for (int a = 0; a < 3; a++) d[a] = pLocal[a] - ll[a];
+            float dn = d[0] * nLocal[0] + d[1] * nLocal[1] + d[2] * nLocal[2];
+            if (cc > d2 && d2 == 0.0f) at = 1.0f;
+            else {
+                if (!(dn < 0.0f)) continue;
+                at = -dn * o->scale / sqrtf(d2);
+                if (!(cc > d2)) at *= (oo - d2) / (oo - cc);
+            }
+        }
+        add_chan(l, at, v);
+    }
+    return unported;
+}
+
+static uint32_t push_unique(const CpaImage *im, CpaLight *out, uint32_t n, uint32_t max, uint32_t lightVa) {
+    if (n >= max) return n;
+    for (uint32_t k = 0; k < n; k++) if (out[k].va == lightVa) return n;
+    return cpa_light_read(im, lightVa, &out[n]) ? n + 1 : n;
+}
+static uint32_t push_chain(const CpaImage *im, CpaLight *out, uint32_t n, uint32_t max, uint32_t data) {
+    uint32_t node = cpa_u32(im, data + 20);
+    for (uint32_t k = 0; node && cpa_is_ptr(im, node) && k < 256; k++, node = cpa_u32(im, node + 4)) n = push_unique(im, out, n, max, cpa_u32(im, node));
+    return n;
+}
+uint32_t cpa_light_sector_lights(const CpaImage *im, uint32_t sectorSO, CpaLight *out, uint32_t max) {
+    uint32_t n = 0, d = cpa_u32(im, sectorSO + 4);
+    if (!cpa_is_ptr(im, d)) return 0;
+    n = push_chain(im, out, n, max, d);
+    { uint32_t arr = cpa_u32(im, d + 32), cnt = cpa_u32(im, d + 36) & 0xFFFF;
+      for (uint32_t i = 0; cpa_is_ptr(im, arr) && i < cnt && i < 64; i++) { uint32_t nso = cpa_u32(im, arr + 8 * i + 4), nd = cpa_is_ptr(im, nso) ? cpa_u32(im, nso + 4) : 0; if (cpa_is_ptr(im, nd)) n = push_chain(im, out, n, max, nd); } }
+    { uint32_t arr = cpa_u32(im, d + 12), cnt = cpa_u32(im, d + 16) & 0xFFFF;
+      for (uint32_t i = 0; cpa_is_ptr(im, arr) && i < cnt && i < 256; i++) { uint32_t lv = cpa_u32(im, arr + 4 * i); uint8_t fl = 0; if (cpa_is_ptr(im, lv) && cpa_rd8(im, lv + 0x9D, &fl) && (fl & 2)) n = push_unique(im, out, n, max, lv); } }
+    return n;
+}
+uint32_t cpa_light_for_actor(const CpaImage *im, uint32_t so, const CpaLight *in, uint32_t n, CpaLight *out) {
+    uint32_t m = 0, flags = cpa_u32(im, so + 48), mat = cpa_u32(im, so + 0x24), sph = cpa_u32(im, so + 0x34);
+    float P[3] = { 0, 0, 0 }, R = 0, sc = 1.0f;
+    if (flags & 0x20000u) return 0;
+    if (cpa_is_ptr(im, mat) && cpa_is_ptr(im, sph)) {
+        float M[16]; for (int i = 0; i < 16; i++) M[i] = cpa_f32(im, mat + 0x28 + 4u * i);
+        float c0[3] = { cpa_f32(im, sph), cpa_f32(im, sph + 4), cpa_f32(im, sph + 8) };
+        for (int a = 0; a < 3; a++) P[a] = c0[0] * M[a] + c0[1] * M[4 + a] + c0[2] * M[8 + a] + M[12 + a];
+        if (cpa_u32(im, mat) > 3) { float mx = 0; for (int r = 0; r < 3; r++) { float l2 = M[4*r]*M[4*r] + M[4*r+1]*M[4*r+1] + M[4*r+2]*M[4*r+2]; if (l2 > mx) mx = l2; } sc = sqrtf(mx); }
+        R = cpa_f32(im, sph + 12) * sc;
+    } else { for (uint32_t i = 0; i < n; i++) out[i] = in[i]; return n; }   /* no sphere: cannot test, keep all */
+    for (uint32_t i = 0; i < n; i++) {
+        int ok = 1;
+        if (in[i].type == CPA_LIGHT_OMNI || in[i].type == CPA_LIGHT_SPOT || in[i].type == CPA_LIGHT_TYPE5) {
+            float rng = in[i].type == CPA_LIGHT_TYPE5 ? cpa_f32(im, in[i].va + 0xDC) : in[i].param[0];
+            float d[3] = { P[0] - in[i].pos[0], P[1] - in[i].pos[1], P[2] - in[i].pos[2] }, rr = R + rng;
+            ok = rr * rr > d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        }
+        if (ok) out[m++] = in[i];
+    }
+    return m;
 }
 
 void cpa_light_env_from_list(const CpaLight *L, uint32_t n, CpaLightEnv *env) {

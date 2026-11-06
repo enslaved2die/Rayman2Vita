@@ -171,7 +171,7 @@ typedef struct {
 typedef struct {
     RB *b; uint32_t n, cap;
     float *apos, *auv; uint32_t *acol; uint32_t an, acap;      /* arena: actor / sprite vertices (acol = packed ARGB per vertex) */
-    int lighting; const CpaLight *lights; uint32_t nLights; CpaLightEnv env;   /* actor lighting inputs (cpa_light.h) */
+    int lighting; const CpaLight *lights; uint32_t nLights; CpaLightEnv env; const CpaLight *curL; uint32_t curN; CpaLightObj obj;   /* actor lighting inputs (cpa_light.h) */
     int oom;
     int flagRule, cutoutTrans; uint32_t nByFlags;
     const CpaTexStore *store;
@@ -221,6 +221,7 @@ static uint32_t actor_geo(Build *B, const CpaImage *im, uint32_t geo, const floa
     if (!cpa_rd32(im, geo, &pv) || !cpa_rd32(im, geo + 0x10, &ptypes) || !cpa_rd32(im, geo + 0x14, &pelems) || !cpa_rd32(im, geo + 0x2C, &cnt)) return 0;
     uint32_t nv = cnt & 0xFFFF, ne = cnt >> 16;
     if (!nv || nv > 20000 || !ne || ne > 256 || !cpa_is_ptr(im, pv) || !cpa_is_ptr(im, ptypes) || !cpa_is_ptr(im, pelems) || !cpa_ptr(im, pv, (size_t)nv * 12)) return 0;
+    cpa_light_obj_init(&B->obj, Wm); cpa_light_obj_sphere(&B->obj, im, geo);
     float (*vw)[3] = (float (*)[3])malloc(sizeof(float[3]) * nv); if (!vw) { B->oom = 1; return 0; }
     for (uint32_t i = 0; i < nv; i++) {
         float v[3]; for (int k = 0; k < 3; k++) if (!cpa_rdf(im, pv + i * 12 + k * 4, &v[k])) v[k] = 0;
@@ -247,11 +248,10 @@ static uint32_t actor_geo(Build *B, const CpaImage *im, uint32_t geo, const floa
                 float u = 0, v = 0; cpa_rdf(im, w[5] + ui[k] * 8u, &u); cpa_rdf(im, w[5] + ui[k] * 8u + 4, &v);
                 uint32_t o = first + got * 3 + k; memcpy(B->apos + 3 * (size_t)o, vw[vi[k]], 12); B->auv[2 * (size_t)o] = u; B->auv[2 * (size_t)o + 1] = v;
                 if (haveMat) {      /* cpa_light.h: v = sum of the parallel lights at the world-space unit normal (stored normal through the channel's world 3x3, no mirror); ambient lights are in env.G */
-                    float nl[3] = { 0, 0, 0 }, nW[3], acc[4] = { 0, 0, 0, 0 };
+                    float nl[3] = { 0, 0, 0 }, pl[3] = { 0, 0, 0 }, acc[4] = { 0, 0, 0, 0 };
                     if (pnrm) for (int a = 0; a < 3; a++) nl[a] = cpa_f32(im, pnrm + vi[k] * 12u + 4u * a);
-                    for (int a = 0; a < 3; a++) nW[a] = nl[0] * Wm[a] + nl[1] * Wm[4 + a] + nl[2] * Wm[8 + a];
-                    { float L2 = sqrtf(nW[0] * nW[0] + nW[1] * nW[1] + nW[2] * nW[2]); if (L2 > 1e-6f) for (int a = 0; a < 3; a++) nW[a] /= L2; }
-                    for (uint32_t li = 0; li < B->nLights; li++) cpa_light_accum(&B->lights[li], nW, acc, &B->env);
+                    for (int a = 0; a < 3; a++) pl[a] = cpa_f32(im, pv + vi[k] * 12u + 4u * a);
+                    cpa_light_accum_vertex(B->curL, B->curN, &B->obj, pl, vw[vi[k]], nl, acc);
                     B->acol[o] = cpa_light_argb(&lmat, &B->env, acc);
                 } else B->acol[o] = 0xFFFFFFFFu;
                 for (int j = 0; j < 3; j++) { float x = vw[vi[k]][j]; if (!box->any || x < box->mn[j]) box->mn[j] = x; if (!box->any || x > box->mx[j]) box->mx[j] = x; } box->any = 1;
@@ -348,6 +348,8 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
             if (!cpa_anim_actor_open(&A, aim, &c->tables, ra->soVa) || !cpa_anim_rig_pose(&A, ra->anim, ra->frame, O->animMode, ra->matrix, rig)) { st->actorsFailed++; continue; }
             st->actorsPosed++;
             uint32_t mark = B.n, amark = B.an; Box box; memset(&box, 0, sizeof box);
+            CpaLight actL[CPA_RENDER_MAXLIGHTS]; B.curN = cpa_light_for_actor(aim, ra->soVa, B.lights, B.nLights, actL); B.curL = actL;   /* per-actor selection of the light list (cpa_light.h) */
+            cpa_light_env_default(&B.env); cpa_light_env_from_list(actL, B.curN, &B.env);
             for (unsigned ch = 0; ch < rig->pose.nCh; ch++) {
                 int obj = rig->pose.ch[ch].obj; if (obj < 0) continue;
                 uint32_t geo = cpa_anim_obj_geo(&A, obj); if (geo) actor_geo(&B, aim, geo, rig->objM[ch], rig->world[ch], &box, &st->actorElemSkipped);

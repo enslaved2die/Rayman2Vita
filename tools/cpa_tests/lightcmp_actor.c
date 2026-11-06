@@ -77,6 +77,9 @@ static int match(const NList *l, const OTri *o, double tol, double ztol, int *pi
             if (ok) { if (pi_out) *pi_out = pi; return (int)m; } }
     return -1;
 }
+typedef struct { uint32_t so; uint32_t n; CpaLight L[64]; int have; } LSet;
+static LSet g_ls[512]; static unsigned g_nls;
+static LSet *ls_find(uint32_t so) { for (unsigned i = 0; i < g_nls; i++) if (g_ls[i].so == so) return &g_ls[i]; return NULL; }
 typedef struct { const CpaImage *im; const CpaAnimTables *T; const Cam *cam; NList *posed; } Ctx;
 static void do_actor(Ctx *c, uint32_t so) {
     CpaAnimActor A; CpaAnimCur cur; CpaAnimRig *rig; float M[16];
@@ -90,12 +93,22 @@ static void do_actor(Ctx *c, uint32_t so) {
 static void walk(Ctx *c, uint32_t va, int depth, unsigned *n) {
     if (depth > 40 || (*n)++ > 20000) return;
     uint32_t type, ch; if (!cpa_rd32(c->im, va, &type)) return;
+    if (type == 4) {          /* sector: its actor list (data +0) is drawn with the sector's light stack */
+        CpaLight *sl = malloc(64 * sizeof *sl); uint32_t ns = cpa_light_sector_lights(c->im, va, sl, 64), d = cpa_u32(c->im, va + 4);
+        uint32_t node = cpa_is_ptr(c->im, d) ? cpa_u32(c->im, d) : 0;
+        for (unsigned k = 0; node && cpa_is_ptr(c->im, node) && k < 512; k++, node = cpa_u32(c->im, node + 4)) {
+            uint32_t aso = cpa_u32(c->im, node); if (!cpa_is_ptr(c->im, aso) || ls_find(aso) || g_nls >= 512) continue;
+            LSet *e = &g_ls[g_nls++]; e->so = aso; e->have = 1; e->n = cpa_light_for_actor(c->im, aso, sl, ns, e->L);
+        }
+        free(sl);
+    }
     if (type == 2) do_actor(c, va);
     ch = cpa_u32(c->im, va + 8);
     for (unsigned k = 0; ch && k < 20000 && cpa_is_ptr(c->im, ch); k++) { walk(c, ch, depth + 1, n); ch = cpa_u32(c->im, ch + 0x14); }
 }
 static int g_check;
-typedef struct { uint32_t verts, exact, rgbExact, within2, noMat, satObs, unimplLights, other, translucentList, ambientOnlyRows, nLightSets; int maxErr; uint32_t errHist[5]; uint32_t unimplType[8]; } CTot;
+
+typedef struct { uint32_t verts, exact, rgbExact, within2, noMat, satObs, unimplLights, other, noSector, translucentList, ambientOnlyRows, nLightSets; int maxErr; uint32_t errHist[5]; uint32_t unimplType[8]; } CTot;
 static CTot g_t;
 static uint32_t pack(const float c[4]) { uint32_t v = 0; for (int i = 0; i < 4; i++) { int b = (int)lroundf(c[i] * 255.f); if (b < 0) b = 0; if (b > 255) b = 255; v = v << 8 | (uint32_t)b; } return v; }
 
@@ -127,7 +140,7 @@ int main(int argc, char **argv) {
         cam.fx = 320.0 / tan(hfov / 2.0); cam.fy = 240.0 / tan(hfov * asp / 2.0);
         CpaImage im; cpa_image_init(&im); cpa_image_add(&im, ram, n, RAM_BASE);
         NList po; memset(&po, 0, sizeof po); Ctx c = { &im, &T, &cam, &po }; unsigned wn = 0; uint32_t root; memcpy(&root, lvl + 13 * 4, 4);
-        walk(&c, root, 0, &wn);
+        g_nls = 0; walk(&c, root, 0, &wn);
         qsort(po.a, po.n, sizeof *po.a, cmp_cx);
         CpaLight lights[64]; uint32_t nl_ = cpa_light_read_ram_list(&im, lights, 64); uint8_t *done = calloc(nvert + 1, 1);
         if (g_check) { int has = 0; for (uint32_t li = 0; li < nl_; li++) if (lights[li].type != CPA_LIGHT_PARALLEL && lights[li].type != CPA_LIGHT_AMBIENT && lights[li].enabled) has = 1; g_t.nLightSets += has; }
@@ -141,11 +154,14 @@ int main(int argc, char **argv) {
                         g_t.verts++; if (s->list) g_t.translucentList++;
                         if (!cpa_light_mat_read(&im, q->vm, &lm)) { g_t.noMat++; continue; }
                         uint32_t pn = cpa_u32(&im, q->geo + 4); if (cpa_is_ptr(&im, pn)) for (int a = 0; a < 3; a++) nl[a] = cpa_f32(&im, pn + q->vi[qj] * 12u + a * 4u);
-                        for (int a = 0; a < 3; a++) nW[a] = nl[0] * q->W[a] + nl[1] * q->W[4 + a] + nl[2] * q->W[8 + a];        /* row vector * 3x3 of the channel world matrix (no mirror) */
-                        { float L2 = sqrtf(nW[0]*nW[0] + nW[1]*nW[1] + nW[2]*nW[2]); if (L2 > 1e-6f) for (int a = 0; a < 3; a++) nW[a] /= L2; }       /* INFERRED: unit world normal (90.64% exact vs 89.35% unnormalised in Learn_10) */
-                        cpa_light_env_default(&env); cpa_light_env_from_list(lights, nl_, &env);
-                        int unimpl = 0; for (uint32_t li = 0; li < nl_; li++) if (!cpa_light_accum(&lights[li], nW, vv, &env) && lights[li].enabled) { unimpl = 1; g_t.unimplType[lights[li].type & 7]++; }
+                        float pl[3] = { 0, 0, 0 }; { uint32_t pvv = cpa_u32(&im, q->geo); for (int a = 0; a < 3; a++) pl[a] = cpa_f32(&im, pvv + q->vi[qj] * 12u + a * 4u); }
+                        (void)nW; CpaLightObj ob_; cpa_light_obj_init(&ob_, getenv("LA_MIRROR") ? q->M : q->W); if (!getenv("LA_NOCULL")) cpa_light_obj_sphere(&ob_, &im, q->geo);
+                        const CpaLight *useL = lights; uint32_t useN = nl_; { LSet *ls = getenv("LA_RAMLIST") ? NULL : ls_find(q->so); if (ls) { useL = ls->L; useN = ls->n; } else g_t.noSector++; }
+                        cpa_light_env_default(&env); cpa_light_env_from_list(useL, useN, &env);
+                        int unimpl = cpa_light_accum_vertex(useL, useN, &ob_, pl, q->wp[qj], nl, vv); if (unimpl) for (uint32_t li = 0; li < nl_; li++) if (lights[li].enabled && lights[li].type != 1 && lights[li].type != 2 && lights[li].type != 4) g_t.unimplType[lights[li].type & 7]++;
                         uint32_t c = cpa_light_argb(&lm, &env, vv);
+                        if (getenv("LA_DBG2")) { float iv[3]; for (int a = 0; a < 3; a++) { float amb = lm.amb[a] + lm.dif[a] * env.G[a]; iv[a] = lm.dif[a] > 1e-6f ? ((float)((ob >> (16 - 8 * a)) & 255) / 510.f - amb) / lm.dif[a] : 0; }
+                            printf("D sc %ld so %08X geo %08X vi %u vm %08X wp(%.1f %.1f %.1f) n(%.2f %.2f %.2f) imp(%.3f %.3f %.3f) got(%.3f %.3f %.3f) ob %08X c %08X dif %.2f amb %.2f\n", sc, q->so, q->geo, q->vi[qj], q->vm, q->wp[qj][0], q->wp[qj][1], q->wp[qj][2], nl[0], nl[1], nl[2], iv[0], iv[1], iv[2], vv[0], vv[1], vv[2], ob, c, lm.dif[0], lm.amb[0]); }
                         int ch[4] = { (int)(c >> 24), (int)(c >> 16 & 255), (int)(c >> 8 & 255), (int)(c & 255) }, oc[4] = { (int)(ob >> 24), (int)(ob >> 16 & 255), (int)(ob >> 8 & 255), (int)(ob & 255) }, me = 0;
                         for (int a = 0; a < 4; a++) { int e = abs(ch[a] - oc[a]); if (e > me) me = e; }
                         if (getenv("LA_DBG") && me > 8 && g_t.verts < 400) printf("DBG vm %08X n(%.3f %.3f %.3f) nW(%.3f %.3f %.3f) v(%.3f %.3f %.3f) G(%.3f) got %08X oracle %08X amb %.3f dif %.3f nl %u\n", q->vm, nl[0], nl[1], nl[2], nW[0], nW[1], nW[2], vv[0], vv[1], vv[2], env.G[0], c, ob, lm.amb[0], lm.dif[0], nl_);
@@ -168,6 +184,7 @@ int main(int argc, char **argv) {
                level, ns, g_t.verts, g_t.translucentList, g_t.noMat, g_t.exact, 100.0 * g_t.exact / m, g_t.rgbExact, 100.0 * g_t.rgbExact / m, g_t.within2, 100.0 * g_t.within2 / m,
                g_t.errHist[0], g_t.errHist[1], g_t.errHist[2], g_t.errHist[3], g_t.errHist[4], g_t.maxErr, m - g_t.exact, g_t.unimplLights, g_t.satObs, g_t.other, g_t.nLightSets, g_t.unimplType[2], g_t.unimplType[3], g_t.unimplType[5]);
     }
+    if (g_check) printf("  [actor vertices whose actor is not in any sector list (fallback: guest light list): %u]\n", g_t.noSector);
     free(lvl);
     return 0;
 }
