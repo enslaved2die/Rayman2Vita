@@ -190,7 +190,7 @@ static void apply_tex_params(RTexEntry *e, uint32_t tsp)
 }
 
 /* GUEST: decode the texture of (tcw, tsp) from VRAM into a fresh pixel buffer (the render side uploads and frees it).  Returns the buffer or NULL.
- * For formats 0 (ARGB1555), 1 (RGB565), and 2 (ARGB4444), decodes directly into a 16-bit buffer. */
+ * For format 1 (RGB565), decodes directly into a 16-bit buffer. Alpha formats (0: ARGB1555, 2: ARGB4444) decode to 32-bit RGBA for maximum quality and VitaGL compatibility. */
 static void *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph, uint8_t *pfmt)
 {
     uint8_t *vram = hle_vram_ptr();
@@ -203,7 +203,7 @@ static void *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph, uint8_
     int fmt = (int)((tcw >> 27) & 7);
     int force_op = (fmt == 0) ? 0 : (int)((tsp >> 19) & 1);
     *pfmt = (uint8_t)fmt;
-    if (fmt <= 2) {
+    if (fmt == 1) {
         uint16_t *px16 = (uint16_t *)malloc((size_t)w * h * sizeof(uint16_t));
         if (!px16) return NULL;
         if (ta_tex_decode16(vram, 8u << 20, tcw, tsp, &env, 0, force_op, px16) == 0) {
@@ -990,9 +990,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
                     gc_alpha_test(1);
                     gc_alpha_ref(128);
                 } else {
-                    /* Discard fully transparent fragments (alpha == 0) to save blending and fillrate */
-                    gc_alpha_test(1);
-                    gc_alpha_ref(1);
+                    gc_alpha_test(0);
                 }
             } else if (list_id == TA_L_PUNCH) {
                 gc_blend(0);
@@ -1034,12 +1032,13 @@ static void vita_gl_render_frame_impl(RenderJob *job)
                 gc_tex2d(0);
             }
             /* Fog (PVR2 fogs the final post-texture colour; alpha is never touched):
-             *  - translucent (additive, untextured, or textured): pre-fog the vertex colour toward FOG_COL_RAM (or scale by (1-fog) for additive)
-             *    in a single pass before the blend, avoiding an expensive second draw pass. */
+             *  - untextured translucent: pre-fog the vertex colour toward FOG_COL_RAM before the blend (exact: no texture to modulate);
+             *  - additive translucent (dst factor ONE): fog fades toward black, so the colour is scaled by (1 - fog), no extra pass;
+             *  - textured translucent: colour left alone here, fogged by the post pass below (pre-fogging the vertex colour would MODULATE the texture by the fog colour). */
             int pre_fogged = 0;
             const int tfog_on = R2_TFOG && fog_den && (list_id == TA_L_PUNCH ? st->fog_ctrl == 0 : (st->fog_ctrl == 0 || st->fog_ctrl == 3));
             const int additive = (list_id == TA_L_TRANS && st->dst_blend == 1);
-            if (list_id == TA_L_TRANS && tfog_on) {
+            if (list_id == TA_L_TRANS && tfog_on && (additive || !tex_id)) {
                 float amax = 0.0f;
                 for (uint32_t i = 0; i < total_batch_count; i++) {
                     uint32_t vi = batch->first + i;
@@ -1080,10 +1079,10 @@ static void vita_gl_render_frame_impl(RenderJob *job)
              * transparency (opaque ARGB1555 cutout, punch-through, smooth-alpha translucent): that pass is textured with TEXTURE_ENV_MODE=BLEND and env colour = vertex
              * colour = fog colour (rgb = fog colour for every texel, a = texel alpha * vertex alpha * fog), so it keeps the main pass's cutout/alpha shape instead of painting a
              * fog-coloured box over the transparent texels.  Untextured/additive translucent were fogged above; other translucent blend modes are not fogged [ASSUMED]. */
-            const int fog_textured = tex_id && (st->shading & 3) != 2 && (list_id == TA_L_PUNCH || (list_id == TA_L_OPAQUE && st->pixel_format == 0));
+            const int fog_textured = tex_id && (st->shading & 3) != 2 && (list_id == TA_L_PUNCH || list_id == TA_L_TRANS || (list_id == TA_L_OPAQUE && st->pixel_format == 0));
             const int fog_func_ok = (gc.depth_func == (int)GL_GREATER || gc.depth_func == (int)GL_GEQUAL || gc.depth_func == (int)GL_ALWAYS);
-            const int fog_post = fog_func_ok && fog_den &&
-                (list_id == TA_L_OPAQUE ? st->fog_ctrl == 0 : list_id == TA_L_PUNCH ? tfog_on : 0);
+            const int fog_post = fog_func_ok && fog_den && !additive &&
+                (list_id == TA_L_OPAQUE ? st->fog_ctrl == 0 : list_id == TA_L_PUNCH ? tfog_on : (tfog_on && tex_id && st->dst_blend == 5));
             if (fog_post) {
                 float amax = 0.0f;
                 const int opq = (list_id == TA_L_OPAQUE);                           /* non-opaque: a = vertex alpha * fog; opaque: a = fog */
@@ -1234,7 +1233,7 @@ static void gl_warmup(void)
         for (int m = -1; m < 3; m++) WARM_DRAW(m);
     }
     if (wu & 2) {
-    gc_alpha_test(1); gc_alpha_ref(1); gc_blend(1);                  /* translucent: blend pairs with alpha discard */
+    gc_alpha_test(0); gc_blend(1);                                   /* translucent: blend pairs */
     static const GLenum pairs[][2] = { { GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA }, { GL_ONE, GL_ONE }, { GL_SRC_ALPHA, GL_ONE }, { GL_ONE, GL_ONE_MINUS_SRC_ALPHA },
                                        { GL_ZERO, GL_SRC_COLOR }, { GL_DST_COLOR, GL_ZERO }, { GL_ZERO, GL_ONE_MINUS_SRC_ALPHA }, { GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA },
                                        { GL_DST_COLOR, GL_SRC_COLOR }, { GL_ONE, GL_ZERO } };
