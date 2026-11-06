@@ -235,6 +235,23 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < s.nVerts * 3; i++) if (!isfinite(s.pos[i])) nan++;
         check_u("non-finite positions", 0, nan);
     }
+    {   /* per-vertex lighting (cpa_light.h): every draw vertex has a colour and a material index; the static IPO vertices carry an RLI */
+        uint32_t noMat = 0, rliVerts = 0, lit = 0, badMat = 0, ambOnly = 0;
+        check_true("scene has per-vertex colour arrays", s.col && s.vtxMat && s.vtxRli && s.lmat && s.nLmat > 0);
+        for (uint32_t i = 0; i < s.nItems; i++) { const CpaDrawItem *d = &s.items[i];
+            for (uint32_t v = d->firstVert; v < d->firstVert + d->vertCount; v++) {
+                if (s.vtxMat[v] >= s.nLmat) { noMat++; continue; }
+                if (s.vtxMat[v] >= s.nLmat || !s.lmat[s.vtxMat[v]].valid) badMat++;
+                int z = !(s.vtxRli[v][0] | s.vtxRli[v][1] | s.vtxRli[v][2] | s.vtxRli[v][3]);
+                if (!d->isActor) { rliVerts += !z; lit += (s.col[v] & 0xFFFFFF) != 0; } else ambOnly += z;
+            } }
+        check_u("draw vertices without a readable VisualMaterial", 0, noMat);
+        check_u("material index out of range / invalid", 0, badMat);
+        check_true("static vertices with a non-zero RLI entry exist (Learn_10: most of them)", rliVerts > s.nStaticTris);
+        check_true("most static vertices are non-black (the black ones belong to ambient-0 materials with no light)", lit * 10u >= s.nStaticTris * 3u * 9u);
+        check_true("actor-pile vertices carry no RLI (ambient-only colour)", ambOnly == s.nActorTris * 3u);
+        printf("  info: lighting: %u distinct VisualMaterials, %u static vertices with RLI, %u of %u static vertices non-black\n", s.nLmat, rliVerts, lit, s.nStaticTris * 3u);
+    }
     printf("  info: bbox static min (%.3f %.3f %.3f) max (%.3f %.3f %.3f)\n", s.bmin[0], s.bmin[1], s.bmin[2], s.bmax[0], s.bmax[1], s.bmax[2]);
     printf("  info: expected (DC_LEVEL_FORMAT.md) min (-525.019 -298.649 -133.503) max (315.546 371.472 203.169)\n");
     printf("  info: meshes %u elements %u skipped %u | items %u | distinct tex %u (flag-unclear %u, wrap-unclear %u)\n",

@@ -71,17 +71,15 @@ static void be_begin(void *user, const CpaRenderFrame *f) {
     glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_TEXTURE_COORD_ARRAY);
     glVertexPointer(3, GL_FLOAT, (int)sizeof(CpaRenderVertex), &f->verts[0].x);
     glTexCoordPointer(2, GL_FLOAT, (int)sizeof(CpaRenderVertex), &f->verts[0].u);
-#ifdef CPA_GL_HOST_FAKE
-    { static const float white[4] = { 1, 1, 1, 1 }; glEnableClientState(GL_COLOR_ARRAY); glColorPointer(4, GL_FLOAT, 0, white); }   /* the fake reads the colour array unconditionally */
-#else
-    glDisableClientState(GL_COLOR_ARRAY);
-#endif
-    glColor4f(1, 1, 1, 1);                               /* vertex colours / lighting are not decoded yet */
+    /* Per-vertex colour = the game's TA vertex ARGB (cpa_light.h), 4 unsigned bytes R,G,B,A inside CpaRenderVertex; modulates the texture (GL_MODULATE) like the TSP "modulate alpha" shading.
+     * The fake GL of the host tests reads the colour pointer unconditionally (16 bytes per vertex): the frame's vertex array has one spare vertex for that. */
+    glEnableClientState(GL_COLOR_ARRAY); glColorPointer(4, GL_UNSIGNED_BYTE, (int)sizeof(CpaRenderVertex), &f->verts[0].r);
+    glColor4f(1, 1, 1, 1);
     glFrontFace(GL_CCW); glCullFace(GL_BACK);
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL);     /* LEQUAL: layer 2 re-draws the exact base depth */
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
     glEnable(GL_TEXTURE_2D);
-    b->curTex = -1; b->blendOn = b->alphaOn = b->cullOn = -1; b->depthWrite = 1; b->curSrc = b->curDst = 0xFFFFFFFFu; b->colorA = 1.0f;
+    b->curTex = -1; b->blendOn = b->alphaOn = b->cullOn = -1; b->depthWrite = 1; b->curSrc = b->curDst = 0xFFFFFFFFu; b->colorA = 1.0f; b->colorArrayOn = 1;
 }
 
 static void be_draw(void *user, const CpaRenderFrame *f, const CpaRenderDraw *d) {
@@ -102,6 +100,8 @@ static void be_draw(void *user, const CpaRenderFrame *f, const CpaRenderDraw *d)
      * white detail/grain pattern blended over the base. We draw exactly that with a constant light direction (the decode's Q) and a constant strength (cfg.layer2Alpha); the true per-polygon
      * light direction/strength and the substitute noise (the real map is generated per boot) are NOT reproduced. */
     float ca = d->layer ? b->cfg.layer2Alpha : 1.0f;
+    if (d->layer && b->colorArrayOn) { glDisableClientState(GL_COLOR_ARRAY); b->colorArrayOn = 0; }      /* layer 2: constant colour (bump coefficients UNKNOWN) */
+    else if (!d->layer && !b->colorArrayOn) { glEnableClientState(GL_COLOR_ARRAY); b->colorArrayOn = 1; }
     if (b->colorA != ca) { glColor4f(1, 1, 1, ca); b->colorA = ca; }
     if (d->layer) b->drawsLayer2++;
     int blend = d->blend != CPA_BLEND_NONE;

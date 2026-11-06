@@ -1,6 +1,11 @@
 /* See cpa_scene.h. Logic re-stated from src/engine/r2_level_geo.c without GL or file-scope globals. */
 #include "cpa_scene.h"
 #include "cpa_anim.h"
+/* cpa_light.c is compiled INTO this translation unit unless CPA_LIGHT_SEPARATE is defined: every existing build file of the tree lists cpa_scene.c but not the new cpa_light.c,
+ * and the scene loader needs the lighting. A build that wants cpa_light.c as its own object defines CPA_LIGHT_SEPARATE and links it (never both). */
+#ifndef CPA_LIGHT_SEPARATE
+#include "cpa_light.c"
+#endif
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +45,8 @@ typedef struct {
     uint32_t nTri; int actor, chan; float *pos, *uv;
     uint8_t overlay;
     uint32_t animHead, animCount;   /* VisualMaterial texture-animation frame list (0 = none), see vm_texture() */
+    uint32_t lm;                    /* index into Ctx.lm (VisualMaterial for lighting), 0xFFFFFFFF = none */
+    int16_t *rli;                   /* 4 raw s16 per element vertex (3 per triangle), NULL = no RLI */
 } Elem;
 
 typedef struct {
@@ -52,7 +59,16 @@ typedef struct {
     int curChan;   /* >= 0 while decoding a Rayman rig part */
     CpaSprite *spr; uint32_t nSpr, capSpr;
     uint32_t *vmSeen; uint32_t nVmSeen, capVmSeen;   /* distinct VisualMaterials already counted for the animation statistics */
+    CpaLightMat *lm; uint32_t nLm, capLm;            /* distinct VisualMaterials of the exported elements (lighting inputs) */
 } Ctx;
+
+static uint32_t ctx_lm(Ctx *c, uint32_t vm) {
+    CpaLightMat m;
+    if (!vm || !cpa_light_mat_read(c->im, vm, &m)) return 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < c->nLm; i++) if (c->lm[i].vm == vm) return i;
+    if (c->nLm == c->capLm) { uint32_t nc = c->capLm ? c->capLm * 2 : 64; CpaLightMat *p = (CpaLightMat *)realloc(c->lm, nc * sizeof *p); if (!p) return 0xFFFFFFFFu; c->lm = p; c->capLm = nc; }
+    c->lm[c->nLm] = m; return c->nLm++;
+}
 
 /* Decode texture-struct flags/wrap. Wrap evidence (INFERRED, notes_levels.md): UV extents of static batches: wrap 2 has U-only
  * out-of-range UVs, wrap 1 none U-only, wrap 3 mostly both; agrees with FUN_8c03a5dc (U pair -> 2, V pair -> 1). */
@@ -123,7 +139,7 @@ int cpa_tex_anim_node(const CpaImage *im, uint32_t head, uint32_t k, uint32_t *t
  * Element type 3 (sprite; 53 in BAST_10, 32 in JAIL_10, 45 in LEARN_10, every one in an actor geometry with exactly 1 vertex and 1 element; decoded into
  * CpaScene.sprites, layout in cpa_scene.h): [0] VisualMaterial*, [1] float sizeX, [2] float sizeY. Element types other than 1 and 3 are skipped (never
  * seen in the 7 levels checked; counted in nElemSkipped). A type-3 element in any other shape than nVerts == 1 is counted in nSpriteBad and not exported. */
-static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor, uint32_t soVa) {
+static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor, uint32_t soVa, uint32_t ipoVa) {
     const CpaImage *im = c->im;
     uint32_t pv, ptypes, pelems, cnt;
     if (!cpa_rd32(im, geo + 0x00, &pv) || !cpa_rd32(im, geo + 0x10, &ptypes) || !cpa_rd32(im, geo + 0x14, &pelems) ||
@@ -181,11 +197,14 @@ static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor, uint32_t s
         }
 
         Elem E; memset(&E, 0, sizeof E);
+        E.lm = ctx_lm(c, vm);
         E.tex = tex; E.actor = isActor; E.chan = c->curChan; E.animHead = ahead; E.animCount = acount;
         if (vm) cpa_rd8(im, vm + 0x149, &E.overlay);   /* VisualMaterial+0x149: second-pass selector, see cpa_scene.h */
         E.pos = (float *)malloc(sizeof(float) * 9 * ntri);
         E.uv  = (float *)malloc(sizeof(float) * 6 * ntri);
-        if (!E.pos || !E.uv) { free(E.pos); free(E.uv); free(vw); return 0; }
+        E.rli = (int16_t *)calloc((size_t)ntri * 12, sizeof(int16_t));
+        if (!E.pos || !E.uv || !E.rli) { free(E.pos); free(E.uv); free(E.rli); free(vw); return 0; }
+        uint32_t rliN = 0, rliData = ipoVa ? cpa_light_rli(im, ipoVa, &rliN) : 0;   /* static IPO: per-vertex lighting stored in the level (cpa_light.h) */
         for (uint32_t t = 0; t < ntri; t++) {
             uint16_t vi[3], ui[3];
             int fo = 1;
@@ -197,6 +216,7 @@ static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor, uint32_t s
                 memcpy(E.pos + (E.nTri * 3 + k) * 3, vw[vi[k]], sizeof(float) * 3);
                 E.uv[(E.nTri * 3 + k) * 2 + 0] = u;
                 E.uv[(E.nTri * 3 + k) * 2 + 1] = v;
+                if (rliData && vi[k] < rliN) { int16_t raw[4]; float fv[4]; if (cpa_light_rli_entry(im, rliData, vi[k], raw, fv)) memcpy(E.rli + (E.nTri * 3 + k) * 4, raw, sizeof raw); }
             }
             E.nTri++;
         }
@@ -258,7 +278,7 @@ static void rig_build(Ctx *c, uint32_t actorVa, uint32_t soVa, const Mat *soWorl
         R->geo[ch] = geo;
         Mat id; mat_ident(&id);
         c->curChan = (int)ch;
-        if (emit_geo(c, geo, &id, 1, soVa)) R->geoCount++;
+        if (emit_geo(c, geo, &id, 1, soVa, 0)) R->geoCount++;
         c->curChan = -1;
     }
 
@@ -325,7 +345,7 @@ static void walk(Ctx *c, uint32_t va, uint32_t parent, int depth, const Mat *pg)
                     c->geoDone = (uint32_t *)realloc(c->geoDone, sizeof(uint32_t) * c->capGeoDone);
                 }
                 c->geoDone[c->nGeoDone++] = geo;
-                if (emit_geo(c, geo, &world, 1, va)) s->nActorGeos++;   /* PLACEHOLDER pose: whole actor at SO global matrix, no per-part pose */
+                if (emit_geo(c, geo, &world, 1, va, 0)) s->nActorGeos++;   /* PLACEHOLDER pose: whole actor at SO global matrix, no per-part pose */
             }
         }
     }
@@ -334,7 +354,7 @@ static void walk(Ctx *c, uint32_t va, uint32_t parent, int depth, const Mat *pg)
         uint32_t po, vs, geo;
         s->nIpo++;
         if (cpa_is_ptr(im, w[1]) && cpa_rd32(im, w[1], &po) && cpa_is_ptr(im, po) && cpa_rd32(im, po, &vs) && cpa_is_ptr(im, vs) &&
-            cpa_rd32(im, vs + 4, &geo) && cpa_is_ptr(im, geo) && emit_geo(c, geo, &world, 0, va)) { s->nIpoMesh++; s->nStaticMeshes++; }
+            cpa_rd32(im, vs + 4, &geo) && cpa_is_ptr(im, geo) && emit_geo(c, geo, &world, 0, va, w[1])) { s->nIpoMesh++; s->nStaticMeshes++; }
     }
 
     uint32_t ch = w[2], n = 0;
@@ -386,7 +406,7 @@ int cpa_scene_load(CpaScene *out, const CpaImage *img, uint32_t rootVa) {
             Elem *e = &c.el[i];
             if (e->chan >= 0 && R->part) {
                 CpaRigPart *r = &R->part[R->nPart++];
-                r->texVa = e->tex; r->nTri = e->nTri; r->chan = e->chan; r->lpos = e->pos; r->uv = e->uv;
+                r->texVa = e->tex; r->nTri = e->nTri; r->chan = e->chan; r->lpos = e->pos; r->uv = e->uv; free(e->rli); e->rli = NULL;
                 tex_decode(img, e->tex, &r->texFlags, &r->texWrapByte, &r->texFlagsValid, &r->tileU, &r->tileV, &r->wrapUnclear, &r->alphaClass);
                 r->wpos = (float *)malloc(sizeof(float) * 9 * (e->nTri ? e->nTri : 1));
                 if (r->wpos) memcpy(r->wpos, r->lpos, sizeof(float) * 9 * e->nTri);
@@ -404,6 +424,9 @@ int cpa_scene_load(CpaScene *out, const CpaImage *img, uint32_t rootVa) {
     out->uv  = (float *)malloc(sizeof(float) * 6 * (total ? total : 1));
     out->items = (CpaDrawItem *)calloc(c.nEl ? c.nEl : 1, sizeof(CpaDrawItem));
     uint8_t *done = (uint8_t *)calloc(c.nEl ? c.nEl : 1, 1);
+    out->col = (uint32_t *)malloc(sizeof(uint32_t) * (total ? total : 1) * 3);
+    out->vtxMat = (uint32_t *)malloc(sizeof(uint32_t) * (total ? total : 1) * 3);
+    out->vtxRli = (int16_t (*)[4])calloc((size_t)(total ? total : 1) * 3, sizeof(int16_t[4]));
     uint32_t nv = 0;
     /* merge elements with equal (texture, isActor, overlayMode) into one draw item (order = first occurrence) */
     for (uint32_t i = 0; i < c.nEl && out->pos && out->uv && out->items && done; i++) {
@@ -415,6 +438,10 @@ int cpa_scene_load(CpaScene *out, const CpaImage *img, uint32_t rootVa) {
             if (done[j] || c.el[j].tex != b->texVa || c.el[j].animHead != c.el[i].animHead || c.el[j].actor != b->isActor || c.el[j].overlay != b->overlayMode) continue;
             memcpy(out->pos + nv * 3, c.el[j].pos, sizeof(float) * 9 * c.el[j].nTri);
             memcpy(out->uv + nv * 2, c.el[j].uv, sizeof(float) * 6 * c.el[j].nTri);
+            if (out->vtxMat && out->vtxRli) {
+                for (uint32_t q = 0; q < c.el[j].nTri * 3; q++) out->vtxMat[nv + q] = c.el[j].lm;
+                if (c.el[j].rli) memcpy(out->vtxRli[nv], c.el[j].rli, sizeof(int16_t) * 4 * c.el[j].nTri * 3);
+            }
             nv += c.el[j].nTri * 3;
             done[j] = 1;
         }
@@ -443,8 +470,10 @@ int cpa_scene_load(CpaScene *out, const CpaImage *img, uint32_t rootVa) {
         }
         free(seen);
     }
-    for (uint32_t i = 0; i < c.nEl; i++) { free(c.el[i].pos); free(c.el[i].uv); }
+    for (uint32_t i = 0; i < c.nEl; i++) { free(c.el[i].pos); free(c.el[i].uv); free(c.el[i].rli); }
     free(c.el); free(done);
+    out->lmat = c.lm; out->nLmat = c.nLm; c.lm = NULL;
+    cpa_scene_relight(out);
     return out->nTris > 0 || out->rig.nTris > 0;
 }
 
@@ -459,7 +488,7 @@ int cpa_scene_load_dats(CpaScene *out, CpaImage *img, const uint8_t *fix, size_t
 void cpa_scene_free(CpaScene *s) {
     for (uint32_t i = 0; i < s->rig.nPart; i++) { free(s->rig.part[i].lpos); free(s->rig.part[i].uv); free(s->rig.part[i].wpos); }
     free(s->rig.part);
-    free(s->pos); free(s->uv); free(s->items); free(s->sprites);
+    free(s->pos); free(s->uv); free(s->items); free(s->sprites); free(s->col); free(s->vtxMat); free(s->vtxRli); free(s->lmat);
     memset(s, 0, sizeof *s);
 }
 
@@ -582,8 +611,20 @@ static void tex_apply_one(const CpaTexInfo *e, uint32_t *flags, uint8_t *wrapB, 
     else if (f & 0x08) *alpha = CPA_ALPHA_BLEND; else if (f == 0) *alpha = CPA_ALPHA_OPAQUE;
     *tileU = *tileV = 1; *wrapUnclear = 1;   /* the pre-load tile decode (tex_decode) is not valid for post-load wrap values: not claimed */
 }
+void cpa_scene_relight(CpaScene *s) {
+    if (!s->col || !s->vtxMat || !s->vtxRli) return;
+    CpaLightEnv env; cpa_light_env_default(&env);
+    for (uint32_t i = 0; i < s->nVerts; i++) {
+        uint32_t m = s->vtxMat[i];
+        if (m >= s->nLmat) { s->col[i] = 0xFFFFFFFFu; continue; }
+        float v[4]; for (int k = 0; k < 4; k++) v[k] = (float)s->vtxRli[i][k] * 0.00390625f;
+        s->col[i] = cpa_light_argb(&s->lmat[m], &env, v);
+    }
+}
 uint32_t cpa_scene_apply_tex(CpaScene *s, const CpaTexInfo *t, uint32_t n) {
     uint32_t u = 0;
+    for (uint32_t i = 0; i < s->nLmat; i++) { const CpaTexInfo *e = s->lmat[i].tex ? tex_find(t, n, s->lmat[i].tex) : NULL; if (e) s->lmat[i].texFlags = e->flags; }   /* lighting reads the post-load flags (additive bit) */
+    cpa_scene_relight(s);
     for (uint32_t i = 0; i < s->nItems; i++) { CpaDrawItem *d = &s->items[i]; const CpaTexInfo *e = tex_find(t, n, d->texVa); if (e) { tex_apply_one(e, &d->texFlags, &d->texWrapByte, &d->texFlagsValid, &d->tileU, &d->tileV, &d->wrapUnclear, &d->alphaClass); u++; } }
     for (uint32_t i = 0; i < s->nSprites; i++) { CpaSprite *d = &s->sprites[i]; const CpaTexInfo *e = tex_find(t, n, d->texVa); if (e) { tex_apply_one(e, &d->texFlags, NULL, &d->texFlagsValid, &d->tileU, &d->tileV, &d->wrapUnclear, &d->alphaClass); u++; } }
     for (uint32_t i = 0; i < s->rig.nPart; i++) { CpaRigPart *d = &s->rig.part[i]; const CpaTexInfo *e = tex_find(t, n, d->texVa); if (e) { tex_apply_one(e, &d->texFlags, &d->texWrapByte, &d->texFlagsValid, &d->tileU, &d->tileV, &d->wrapUnclear, &d->alphaClass); u++; } }

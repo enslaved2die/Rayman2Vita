@@ -14,7 +14,7 @@ typedef struct CpaGlConfig {
     int   drawLayer2;           /* default 1: layer-2 batches are drawn with the substitute bump texture (CPA_TEXVA_BUMP*). 0 skips them */
     int   clear;                /* default 1: clear colour+depth in begin_frame */
     float clearColor[4];
-    float layer2Alpha;          /* default 1.0: constant alpha multiplied onto the layer-2 bump texture (glColor4f). INFERRED approximation of the lighting, see be_draw */
+    float layer2Alpha;          /* default 1.0: constant alpha multiplied onto the layer-2 bump texture (glColor4f). INFERRED approximation of the lighting, see be_draw. Base draws use the per-vertex colour array */
 } CpaGlConfig;
 void cpa_gl_config_default(CpaGlConfig *c);
 
@@ -26,7 +26,7 @@ typedef struct CpaGlBackend {
     CpaGlConfig cfg;
     struct { uint32_t va; unsigned id; uint8_t wrapU, wrapV, mip, placeholder; } tex[CPA_GL_TEXSLOTS]; uint32_t nTex;   /* wrapU/V = CPA_WRAP_* currently set on the GL object */
     const CpaRenderVertex *verts;
-    int curTex, blendOn, alphaOn, cullOn, depthWrite; unsigned curSrc, curDst; int init; float colorA;
+    int curTex, blendOn, alphaOn, cullOn, depthWrite; unsigned curSrc, curDst; int init; float colorA; int colorArrayOn;   /* colorArrayOn: GL_COLOR_ARRAY (per-vertex lighting colour) enabled; off on layer-2 draws */
     uint32_t drawsIssued, drawsSkipped, drawsLayer2;
     uint32_t nUploaded, nPlaceholder;      /* textures uploaded with real pixels / with the grey placeholder (describe failed) */
     uint32_t drawsPlaceholder;             /* issued draws that sampled a placeholder texture */

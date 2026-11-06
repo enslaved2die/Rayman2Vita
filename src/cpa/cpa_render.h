@@ -15,7 +15,9 @@
  *                        only adjacent identical states are merged.
  * Textures: CpaTexStore (below) decodes the level + FIX .TEX natively (cpa_tex, VERIFIED byte-exact) and serves them through opts.describe; pass/blend follow tex.flags (flagRule), wrap modes come
  * from the .TEX header wrap byte (MEASURED against the oracle TSP bits). Layer 2 draws with a SUBSTITUTE bump texture (INFERRED) - the real per-polygon bump lighting is not reproduced.
- * NOT modelled (honest list, see shadow report): vertex colours / lighting, fog, shadows, particles/HUD quads, the real layer-2 bump coefficients and noise, animated-texture live frame
+ * Vertex colours (cpa_light.h): static geometry from the level RLI + VisualMaterial (VERIFIED, lightcmp_static: 100% of the matched vertices of 7 levels, with the additive distance fade);
+ * posed actors from the guest light list (parallel + ambient lights only; omni / spot lights UNKNOWN, measured 33-97% exact per level, see re_analysis/dc/notes_lighting.md).
+ * NOT modelled (honest list, see shadow report): omni / spot lights, fog (offset colour), shadows, particles/HUD quads, the real layer-2 bump coefficients and noise, animated-texture live frame
  * (native binds the load-time head frame), live moving static IPOs. */
 #ifndef CPA_RENDER_H
 #define CPA_RENDER_H
@@ -23,9 +25,14 @@
 #include "cpa_drawlist.h"
 #include "cpa_anim.h"
 #include "cpa_tex.h"
+#include "cpa_light.h"
 
 /* ---------------- frame output ---------------- */
-typedef struct CpaRenderVertex { float x, y, z, u, v; } CpaRenderVertex;      /* world space (raw engine axes), 20 bytes */
+typedef struct CpaRenderVertex {
+    float x, y, z, u, v;        /* world space (raw engine axes) */
+    uint8_t r, g, b, a;         /* vertex colour = the ARGB the game writes into the TA stream (cpa_light.h), unpacked; 24 bytes per vertex. Layer-2 draws carry opaque white (their real colours are the
+                                   bump coefficients, UNKNOWN); sprites carry white */
+} CpaRenderVertex;
 enum { CPA_SRC_STATIC = 0, CPA_SRC_ACTOR = 1, CPA_SRC_SPRITE = 2 };
 
 typedef struct CpaRenderDraw {
@@ -67,6 +74,7 @@ typedef struct CpaRenderFrame {
 } CpaRenderFrame;
 
 /* ---------------- inputs ---------------- */
+#define CPA_RENDER_MAXLIGHTS 16
 typedef struct CpaRenderActor {
     uint32_t soVa;              /* Actor SuperObject (type 2) */
     unsigned anim, frame;       /* animation index (H0) and absolute frame, i.e. cpa_anim_cur() of the guest */
@@ -81,6 +89,8 @@ typedef struct CpaFrameInput {
     uint32_t drawMask; int allowKind2;    /* cpa_vis draw mask (0 = default 0xFFFFFFFF) and engine debug byte == 1 */
     const CpaRenderActor *actors; uint32_t nActors;
     const CpaImage *actorImg;             /* image the actors' tables/geometry are read from: NULL = scene->img (unposed-capable DAT data only) ; the guest RAM image for live actors */
+    uint32_t nLights; CpaLight lights[CPA_RENDER_MAXLIGHTS];   /* light list for actors (cpa_light.h); empty = actors get the ambient-only colour of their material */
+    CpaLightFade fade;                    /* distance fade of additive static geometry (cpa_light.h); .enabled = 0 = off. Source of the parameters UNKNOWN (runtime state), see cpa_light.h */
 } CpaFrameInput;
 
 typedef struct CpaTexDesc {
@@ -141,6 +151,8 @@ typedef struct CpaRenderOpts {
     int flagRule;               /* default 1: pass/blend of every textured batch from tex.flags: flags & 0x2A -> translucent list (0x20 additive, else alpha blend), cutout (0x10) in the translucent pass
                                    too (cutoutAsTranslucent), everything else opaque. List rule VERIFIED: flags 0 -> list 0 (3364/3364 strips), flags != 0 -> list 2 (1832/1832) in 5 scenes; the 0x2A mask is the
                                    guest's own test in FUN_8c037700 (INFERRED from reading). Over all 9654 shipped textures flags != 0 <=> flags & 0x2A. 0 = the drawlist's alphaClass classes (older behaviour) */
+    int useLighting;            /* default 1: vertex colours from cpa_light (static: RLI + material; actors: light list). 0: every vertex opaque white (the pre-N1-lighting behaviour) */
+    int useFade;                /* default 1: apply CpaFrameInput.fade to additive static geometry */
     int animMode;               /* cpa_anim mode, default CPA_ANIM_BEST */
     float spriteHalfScale;      /* default 0.5 (sizeX/sizeY taken as full sizes; UNVERIFIED) */
     CpaTexDescribeFn describe; void *describeUser;

@@ -306,6 +306,24 @@ int main(int argc, char **argv) {
             }
             check("A3 overlayMode identical DAT vs guest RAM, static draw items in order", i == sd.nItems && j == sr.nItems && n > 0 && bad == 0, "static items=%u bad=%u", n, bad);
         }
+        {   /* per-vertex lighting inputs (cpa_light.h): the RLI of the static IPOs read from the DAT file must be what the guest holds at run time; the colours derived from it may differ only through
+             * the pre-load vs post-load texture flags of additive materials (DAT scene = pre-load flags) */
+            uint32_t i = 0, j = 0, n = 0, rliBad = 0, nz = 0, colBad = 0, matBad = 0;
+            for (;;) {
+                while (i < sd.nItems && sd.items[i].isActor) i++;
+                while (j < sr.nItems && sr.items[j].isActor) j++;
+                if (i >= sd.nItems || j >= sr.nItems || sd.items[i].vertCount != sr.items[j].vertCount) break;
+                for (uint32_t v = 0; v < sd.items[i].vertCount; v++) {
+                    uint32_t x = sd.items[i].firstVert + v, y = sr.items[j].firstVert + v; n++;
+                    rliBad += memcmp(sd.vtxRli[x], sr.vtxRli[y], 8) != 0; nz += (sd.vtxRli[x][0] | sd.vtxRli[x][1] | sd.vtxRli[x][2] | sd.vtxRli[x][3]) != 0;
+                    colBad += sd.col[x] != sr.col[y];
+                    { uint32_t mx = sd.vtxMat[x], my = sr.vtxMat[y]; matBad += (mx >= sd.nLmat) != (my >= sr.nLmat) || (mx < sd.nLmat && my < sr.nLmat && (sd.lmat[mx].flags != sr.lmat[my].flags || memcmp(sd.lmat[mx].amb, sr.lmat[my].amb, 16) || memcmp(sd.lmat[mx].dif, sr.lmat[my].dif, 16))); }
+                }
+                i++; j++;
+            }
+            check("A3 static RLI (4 x s16 per vertex) and VisualMaterial lighting fields identical DAT vs guest RAM", n > 0 && nz > 0 && rliBad == 0 && matBad == 0, "static vertices=%u nonzero RLI=%u rliBad=%u materialBad=%u", n, nz, rliBad, matBad);
+            printf("INFO  A3 static vertex colours DAT scene vs RAM scene differ at %u/%u vertices (additive materials: pre-load flags in the DAT scene)\n", colBad, n);
+        }
         if (sd.nSprites == sr.nSprites) for (uint32_t i = 0; i < sd.nSprites; i++) {
             const CpaSprite *x = &sd.sprites[i], *y = &sr.sprites[i];
             int sb = x->geoVa != y->geoVa || x->texVa != y->texVa || memcmp(&x->sizeX, &y->sizeX, 8) || memcmp(x->local, y->local, 12) || x->isActor != y->isActor;

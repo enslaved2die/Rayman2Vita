@@ -12,6 +12,7 @@
 #define CPA_SCENE_H
 
 #include "cpa_image.h"
+#include "cpa_light.h"
 
 /* SuperObject types, VERIFIED (DC_LEVEL_FORMAT.md sec 4). */
 enum { CPA_SO_WORLD = 1, CPA_SO_ACTOR = 2, CPA_SO_SECTOR = 4, CPA_SO_IPO = 0x20 };
@@ -109,6 +110,13 @@ typedef struct CpaScene {
     uint32_t     nVerts;
     CpaDrawItem *items;
     uint32_t     nItems;
+    /* Per draw-vertex colour (same indexing as pos/uv), see cpa_light.h. col = packed ARGB exactly as the game writes it into the TA vertex stream: static IPO vertices are lit from the
+     * RLI stored in the level data (VERIFIED, lightcmp_static), actor-pile vertices get the ambient-only colour (no lights, no normals: a live renderer relights actors, cpa_render.c).
+     * vtxMat/vtxRli are the inputs kept so cpa_scene_relight can recompute col after the post-load texture flags are known (cpa_scene_apply_tex does that). */
+    uint32_t    *col;             /* nVerts */
+    uint32_t    *vtxMat;          /* nVerts: index into lmat, 0xFFFFFFFF = no readable VisualMaterial (col is opaque white) */
+    int16_t    (*vtxRli)[4];      /* nVerts: raw RLI entry of the geometry vertex (zeros when the geometry has no RLI) */
+    CpaLightMat *lmat; uint32_t nLmat;   /* distinct VisualMaterials of the draw vertices */
     uint32_t     nTris;           /* all non-rig triangles (static + unposed actor) */
     uint32_t     nStaticTris, nActorTris;
     float        bmin[3], bmax[3];/* static geometry only */
@@ -129,6 +137,9 @@ typedef struct CpaScene {
     uint32_t raymanSoVa;
     CpaImage img;                 /* copy of the image view (pointers only; buffers must outlive the scene) */
 } CpaScene;
+
+/* Recomputes CpaScene.col from vtxMat / vtxRli / lmat with the default environment (cpa_light_env_default: no lights, no fade). Called by cpa_scene_load and cpa_scene_apply_tex. */
+void cpa_scene_relight(CpaScene *s);
 
 /* k-th node (0 = head) of a texture-animation frame list: texture struct VA and frame duration (float, node +4). Returns 0 if the list ends earlier or is unreadable. */
 int  cpa_tex_anim_node(const CpaImage *im, uint32_t head, uint32_t k, uint32_t *tex, float *dur);

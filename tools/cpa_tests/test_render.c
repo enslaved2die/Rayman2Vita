@@ -135,8 +135,51 @@ static void t_store(void) {
     cpa_texstore_free(&st);
 }
 
+
+/* per-vertex colours through the builder and the GL backend (asset free): scene colours reach CpaRenderVertex, layer 2 is white, the additive fade changes only alpha, useLighting = 0 gives
+ * white, the backend binds the colour array on base draws and not on layer-2 draws. The numbers of the colours themselves are checked in test_light / lightcmp_static. */
+static void t_colors(void) {
+    CpaScene s; memset(&s, 0, sizeof s);
+    float pos[9 * 3] = { 0 }, uv[9 * 2] = { 0 };
+    for (int t = 0; t < 3; t++) for (int v = 0; v < 3; v++) { int i = t * 3 + v; pos[i * 3] = (float)v; pos[i * 3 + 1] = 10.0f + 40.0f * (float)t; pos[i * 3 + 2] = (v == 2) ? 1.0f : 0.0f; }
+    CpaDrawItem it[3]; memset(it, 0, sizeof it);
+    for (int k = 0; k < 3; k++) { it[k].firstVert = (uint32_t)k * 3; it[k].vertCount = 3; it[k].texVa = 0x100 + 0x100 * (uint32_t)k; it[k].texFlagsValid = 1; it[k].tileU = it[k].tileV = 1; }
+    it[0].texFlags = 0; it[1].texFlags = 0x20; it[2].texFlags = 0; it[2].overlayMode = 1;       /* opaque / additive / opaque with a layer-2 pass */
+    uint32_t col[9], mat[9]; CpaLightMat lm[2]; memset(lm, 0, sizeof lm);
+    lm[0].valid = 1; lm[0].flags = 0x4ddc07ffu; lm[1] = lm[0]; lm[1].texFlags = 0x20;
+    for (int i = 0; i < 9; i++) { col[i] = CPA_ARGB(255, 10 + i, 20 + i, 30 + i); mat[i] = (i >= 3 && i < 6) ? 1u : 0u; }
+    s.pos = pos; s.uv = uv; s.nVerts = 9; s.items = it; s.nItems = 3; s.col = col; s.vtxMat = mat; s.lmat = lm; s.nLmat = 2;
+    CpaRenderCtx ctx; CpaRenderOpts o; cpa_render_opts_default(&o); cpa_render_ctx_init(&ctx, &s, &o);
+    CpaFrameInput in; memset(&in, 0, sizeof in);
+    float cp[3] = { 0, 0, 0 }, up[3] = { 0, 0, 1 }, fw[3] = { 0, 1, 0 }; cpa_camera_from_rows(&in.cam, cp, up, fw, 1.2f, 0.75f); in.w = 640; in.h = 480; in.fit = CPA_FIT_HORPLUS;
+    in.fade.enabled = 1; in.fade.p[0] = 0; in.fade.p[1] = 100; in.fade.p[2] = 50000; in.fade.p[3] = 0; in.fade.p[4] = 2.0f;      /* reduction 2*z: the additive triangle at depth 50 -> alpha 255-100 = 155 */
+    CpaRenderFrame f; CHECK(cpa_render_build_frame(&ctx, &f, &in), "build");
+    int plain = 0, faded = 0, l2white = 0, l2n = 0;
+    for (uint32_t d = 0; d < f.nDraws; d++) { const CpaRenderDraw *dr = &f.draws[d];
+        for (uint32_t v = 0; v < dr->count; v++) { const CpaRenderVertex *vx = &f.verts[dr->first + v];
+            if (dr->layer) { l2n++; l2white += vx->r == 255 && vx->g == 255 && vx->b == 255 && vx->a == 255; continue; }
+            if (dr->blend == CPA_BLEND_ADD) { faded += vx->a == 155 && vx->r >= 13 && vx->r <= 15; }
+            else plain += vx->a == 255 && vx->g == vx->r + 10 && vx->b == vx->r + 20; } }
+    CHECK(plain == 6 && faded == 3, "base colours reach the vertex stream: %d plain, %d faded additive (expect 6 / 3)", plain, faded);
+    CHECK(l2n == 3 && l2white == 3, "layer-2 vertices are opaque white (%d/%d)", l2white, l2n);
+    CHECK(sizeof(CpaRenderVertex) == 24, "vertex size %zu", sizeof(CpaRenderVertex));
+    { CpaDrawList dl; int okd = cpa_drawlist_build(&dl, &s, NULL); const uint32_t *c0 = okd && dl.nBatches ? cpa_batch_colors(&dl, &dl.batches[0]) : NULL;
+      CHECK(okd && dl.nBatches > 0 && c0 && c0 == s.col + dl.batches[0].firstVert && c0[0] == s.col[dl.batches[0].firstVert], "cpa_batch_colors points into CpaScene.col"); if (okd) cpa_drawlist_free(&dl); }
+    extern FakeGl fg; CpaGlBackend gb; cpa_gl_backend_init(&gb, NULL); CpaRenderBackend be; cpa_gl_backend_vtable(&gb, &be);
+    unsigned long c0 = fg.colptr; cpa_render_submit(&ctx, &f, &be);
+    CHECK(fg.colptr - c0 == 1, "one glColorPointer per frame (%lu)", fg.colptr - c0);
+    CHECK(gb.drawsLayer2 == 1 && gb.drawsIssued == f.nDraws, "all %u draws issued, layer 2 %u", f.nDraws, gb.drawsLayer2);
+    CHECK(fgr.cs_bits & (1u << (GL_COLOR_ARRAY & 7)), "the last (base, additive) draw leaves the colour array enabled after the layer-2 draw switched it off");
+    cpa_gl_backend_shutdown(&gb); cpa_render_frame_free(&f); cpa_render_ctx_free(&ctx);
+    /* lighting off: everything white, as before */
+    { CpaRenderOpts o2 = o; o2.useLighting = 0; CpaRenderCtx c2; cpa_render_ctx_init(&c2, &s, &o2); CpaRenderFrame f2; CHECK(cpa_render_build_frame(&c2, &f2, &in), "build");
+      int nw = 0; for (uint32_t v = 0; v < f2.nVerts; v++) nw += f2.verts[v].r == 255 && f2.verts[v].g == 255 && f2.verts[v].b == 255 && f2.verts[v].a == 255;
+      CHECK(nw == (int)f2.nVerts, "useLighting = 0 -> all white (%d/%u)", nw, f2.nVerts); cpa_render_frame_free(&f2); cpa_render_ctx_free(&c2); }
+    printf("colours: scene ARGB -> vertex stream, additive fade alpha, layer 2 white, colour array on base draws only\n");
+}
+
 int main(void) {
-    srand(1); t_matrices(); t_frame(); t_flagrule(); t_store();
+    srand(1); t_matrices(); t_frame(); t_flagrule(); t_store(); t_colors();
     printf("test_render: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

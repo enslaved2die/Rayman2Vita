@@ -70,6 +70,12 @@ typedef struct CpaDrawList {
     uint32_t nLayer2;
 } CpaDrawList;
 
+/* Vertex colours: a batch indexes the scene's per-vertex arrays, so its packed ARGB colours (cpa_light.h; A<<24|R<<16|G<<8|B, the TA stream word) are CpaScene.col[firstVert .. firstVert + vertCount),
+ * parallel to pos/uv (no copy). Static batches: VERIFIED against the oracle (lightcmp_static). Actor-pile batches (includeActors): ambient-only colours, no lights. Layer-2 batches reuse the base
+ * batch's range but their real colours are not these (the bump pass carries constant offset-colour coefficients, UNKNOWN per polygon, see re_analysis/dc/notes_lighting.md): renderers draw them white. */
+static inline const uint32_t *cpa_batch_colors(const CpaDrawList *dl, const CpaBatch *b) { return dl->scene->col ? dl->scene->col + b->firstVert : (const uint32_t *)0; }
+
+
 void cpa_drawlist_opts_default(CpaDrawListOpts *o);
 /* Returns 1 on success (also for an empty scene), 0 on allocation failure. */
 int  cpa_drawlist_build(CpaDrawList *dl, const CpaScene *s, const CpaDrawListOpts *opts);

@@ -16,7 +16,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-typedef struct { float sx[3], sy[3], w[3], cx; uint32_t draw; uint8_t src, layer, pass, cullBack, valid, cand, nearX, used; uint32_t va; } NT;
+typedef struct { float sx[3], sy[3], w[3], cx; uint32_t draw; uint8_t src, layer, pass, cullBack, valid, cand, nearX, used; uint32_t va, v0; } NT;     /* v0: first vertex of the triangle in the frame's vertex stream */
 static int cmp_nt(const void *a, const void *b) { float x = ((const NT *)a)->cx, y = ((const NT *)b)->cx; return x < y ? -1 : x > y; }
 
 typedef struct {
@@ -29,6 +29,7 @@ typedef struct {
     uint64_t visSecOk, visIpoOk, poolOk, poolTot, actGiven, actPosed, actDrawn, actBbox, actUnposed, actDrawn2;
     uint64_t trisActorM1, trisActorM2, trisStatic0, trisAll0;
     uint64_t tcStatic, tcMatched, tcFrag, tcMismatch;
+    uint64_t colV[2], colExact[2], colRgb[2], colW2[2], colL2skip, colErr[2][5]; int colMax[2];      /* vertex colours of matched layer-1 triangles vs the oracle's base colour; [0] static, [1] actor */
 } Agg;
 
 /* ---- real textures (cpa_texstore) and their oracle comparison ---- */
@@ -148,9 +149,9 @@ static int shadow_scene(CpaRenderCtx *ctx, const CpaScene *sc, const CpaVisTriMa
     uint64_t nStaticAll = 0; for (uint32_t it = 0; it < sc->nItems; it++) if (!sc->items[it].isActor) nStaticAll += sc->items[it].vertCount / 3; uint64_t poolExp = nStaticAll - st.v[V_POOLCULLED], poolGot = F1.st.trisStatic; int poolOk = rc == 0 && st.v[V_HAVE] && poolExp == poolGot;
 
     /* oracle triangles */
-    uint32_t no = 0, nspr = 0; OTri *ot = calloc(nvert + 1, sizeof *ot); uint64_t oList[8] = { 0 };
+    uint32_t no = 0, nspr = 0; OTri *ot = calloc(nvert + 1, sizeof *ot); uint32_t *ov0 = calloc(nvert + 1, 4); uint64_t oList[8] = { 0 };
     for (uint32_t i = 0; i < nstrip; i++) { const TaS *s = &strips[i]; if (s->sprite) { nspr++; continue; }
-        for (uint32_t k = 0; k + 2 < s->count; k++) { OTri *o = &ot[no++]; for (int j = 0; j < 3; j++) { const TaV *v = &tv[s->first + k + j]; o->sx[j] = v->x; o->sy[j] = v->y; o->z[j] = v->z; o->u[j] = v->u; o->v[j] = v->v; } o->tcw = s->tcw; o->tsp = s->tsp; o->list = s->list; if (s->list < 8) oList[s->list]++; } }
+        for (uint32_t k = 0; k + 2 < s->count; k++) { OTri *o = &ot[no]; ov0[no++] = s->first + k; for (int j = 0; j < 3; j++) { const TaV *v = &tv[s->first + k + j]; o->sx[j] = v->x; o->sy[j] = v->y; o->z[j] = v->z; o->u[j] = v->u; o->v[j] = v->v; } o->tcw = s->tcw; o->tsp = s->tsp; o->list = s->list; if (s->list < 8) oList[s->list]++; } }
 
     /* texture memory + decode environment of this scene (for the per-triangle texture comparison) and the draw-level texture checks of the native frame */
     uint8_t *vramB = NULL, *regB = NULL; size_t vramN = 0, regN = 0; TaTexEnv tenv; uint32_t tpal[1024]; PairRes pcache[2048]; int npc = 0; memset(&tenv, 0, sizeof tenv);
@@ -168,7 +169,7 @@ static int shadow_scene(CpaRenderCtx *ctx, const CpaScene *sc, const CpaVisTriMa
     uint32_t *triDraw = malloc((nn ? nn : 1) * 4);
     for (uint32_t d = 0; d < F1.nDraws; d++) for (uint32_t k = 0; k < F1.draws[d].count / 3; k++) {
         const CpaRenderDraw *dr = &F1.draws[d]; const CpaRenderVertex *v = &F1.verts[dr->first + 3 * k]; NT *q = &nt[nnt]; memset(q, 0, sizeof *q);
-        q->draw = d; q->src = F1.triSource[(dr->first + 3 * k) / 3]; q->layer = dr->layer; q->pass = dr->pass; q->cullBack = dr->cullBack; q->va = dr->texVa;
+        q->draw = d; q->v0 = dr->first + 3 * k; q->src = F1.triSource[(dr->first + 3 * k) / 3]; q->layer = dr->layer; q->pass = dr->pass; q->cullBack = dr->cullBack; q->va = dr->texVa;
         triDraw[nnt] = d; int front = 0; float cm[3][3], s3[3][3]; int pr[3];
         for (int j = 0; j < 3; j++) { float X[3] = { v[j].x, v[j].y, v[j].z }; cpa_world_to_cam(&in.cam, X, cm[j]); pr[j] = cm[j][2] >= CPA_NEAR_ZC; front += pr[j]; if (pr[j]) cpa_cam_to_screen(&prj, cm[j], s3[j]); }
         cnt[0] += 0; nnt++;
@@ -200,6 +201,17 @@ static int shadow_scene(CpaRenderCtx *ctx, const CpaScene *sc, const CpaVisTriMa
         }
         if (hit >= 0) {
             NT *q = &sorted[hit]; q->used = 1; mTot++; if (q->layer) mL2++; else mSrc[q->src]++;
+            if (!q->layer && q->src != CPA_SRC_SPRITE) {         /* vertex colours: native frame vertex perms[hp][j] <-> oracle vertex j (same permutation as the position match) */
+                int si = q->src == CPA_SRC_ACTOR;
+                for (int j = 0; j < 3; j++) {
+                    const TaV *ov = &tv[ov0[a] + j]; const CpaRenderVertex *nv2 = &F1.verts[q->v0 + perms[hp][j]];
+                    int oa = (int)lroundf(ov->base[0] * 255.f), orr = (int)lroundf(ov->base[1] * 255.f), og = (int)lroundf(ov->base[2] * 255.f), ob2 = (int)lroundf(ov->base[3] * 255.f);
+                    int off = (int)lroundf(ov->off[1] * 255.f) | (int)lroundf(ov->off[2] * 255.f) | (int)lroundf(ov->off[3] * 255.f);
+                    if (orr == 0 && og == 0 && ob2 == 0 && off) { A->colL2skip++; continue; }       /* oracle second-layer (bump) vertex paired to a base triangle: its colours are not lit colours */
+                    int e0 = abs(nv2->a - oa), e1 = abs(nv2->r - orr), e2 = abs(nv2->g - og), e3 = abs(nv2->b - ob2), me = e0; if (e1 > me) me = e1; if (e2 > me) me = e2; if (e3 > me) me = e3;
+                    A->colV[si]++; A->colExact[si] += me == 0; A->colRgb[si] += (e1 | e2 | e3) == 0; A->colW2[si] += me <= 2; A->colErr[si][me == 0 ? 0 : me == 1 ? 1 : me <= 3 ? 2 : me <= 15 ? 3 : 4]++; if (me > A->colMax[si]) A->colMax[si] = me;
+                }
+            }
             if (g_haveStore && vramB && regB && !q->layer && q->va && q->src != CPA_SRC_SPRITE) {
                 int si = q->src == CPA_SRC_ACTOR, k = -1; for (int i = 0; i < npc; i++) if (pcache[i].va == q->va && pcache[i].tcw == ot[a].tcw && pcache[i].tsp == ot[a].tsp) { k = i; break; }
                 int res; if (k >= 0) res = pcache[k].res;
@@ -250,7 +262,7 @@ static int shadow_scene(CpaRenderCtx *ctx, const CpaScene *sc, const CpaVisTriMa
     A->tcStatic += st.staticTotal; A->tcMatched += st.matched; A->tcFrag += st.frag; A->tcMismatch += st.unmBad + st.unmClip;
     (void)verbose; (void)lvl; (void)triDraw;
     free(vramB); free(regB);
-    free(triDraw); free(sorted); free(nt); free(ot); free(actors); cpa_render_frame_free(&F1); cpa_render_frame_free(&F2); cpa_render_frame_free(&F0); cpa_render_frame_free(&Fu); free(ram); free(fb);
+    free(triDraw); free(sorted); free(nt); free(ot); free(ov0); free(actors); cpa_render_frame_free(&F1); cpa_render_frame_free(&F2); cpa_render_frame_free(&F0); cpa_render_frame_free(&Fu); free(ram); free(fb);
     return 0;
 }
 
@@ -296,6 +308,9 @@ int main(int argc, char **argv) {
            A.oracleStrips * s, A.nGlc ? (double)A.glDrawsRecomp / A.nGlc : 0.0, A.nGlc ? (double)A.glStateRecomp / A.nGlc : 0.0, A.glDrawsNative * s, A.glStateNative * s, A.glBindNative * s, A.drawsUnmerged * s, A.srcBatches * s,
            (unsigned long long)A.visSecOk, (unsigned long long)A.poolTot, (unsigned long long)A.visIpoOk, (unsigned long long)A.poolTot, (unsigned long long)A.poolOk, (unsigned long long)A.poolTot,
            A.actGiven * s, A.actPosed * s, A.actDrawn * s, A.actDrawn2 * s, A.actBbox * s, A.actUnposed * s, A.trisActorM1 * s, A.trisActorM2 * s);
+    printf("COLORCHK %s | vertex colours of matched layer-1 triangles vs the oracle base ARGB (frame vertex perms[hp][j] <-> oracle vertex j): static %llu vertices: exact %.3f%%, rgb exact %.3f%%, within 2 %.3f%%, max error %d, hist 0/1/2-3/4-15/>=16 = %llu/%llu/%llu/%llu/%llu | actor %llu vertices: exact %.3f%%, rgb exact %.3f%%, within 2 %.3f%%, max error %d, hist %llu/%llu/%llu/%llu/%llu | oracle bump-layer vertices skipped %llu\n", level,
+           (unsigned long long)A.colV[0], A.colV[0] ? 100.0 * A.colExact[0] / A.colV[0] : 0.0, A.colV[0] ? 100.0 * A.colRgb[0] / A.colV[0] : 0.0, A.colV[0] ? 100.0 * A.colW2[0] / A.colV[0] : 0.0, A.colMax[0], (unsigned long long)A.colErr[0][0], (unsigned long long)A.colErr[0][1], (unsigned long long)A.colErr[0][2], (unsigned long long)A.colErr[0][3], (unsigned long long)A.colErr[0][4],
+           (unsigned long long)A.colV[1], A.colV[1] ? 100.0 * A.colExact[1] / A.colV[1] : 0.0, A.colV[1] ? 100.0 * A.colRgb[1] / A.colV[1] : 0.0, A.colV[1] ? 100.0 * A.colW2[1] / A.colV[1] : 0.0, A.colMax[1], (unsigned long long)A.colErr[1][0], (unsigned long long)A.colErr[1][1], (unsigned long long)A.colErr[1][2], (unsigned long long)A.colErr[1][3], (unsigned long long)A.colErr[1][4], (unsigned long long)A.colL2skip);
     printf("PASSMATRIX %s (matched, layer-1 only; rows native pass opaque/cutout/translucent, cols oracle list 0 opaque / 2 translucent / 4 punch): static [%llu %llu %llu | %llu %llu %llu | %llu %llu %llu] actor [%llu %llu %llu | %llu %llu %llu | %llu %llu %llu]\n", level,
            (unsigned long long)A.xt[0][0][0], (unsigned long long)A.xt[0][0][2], (unsigned long long)A.xt[0][0][4], (unsigned long long)A.xt[0][1][0], (unsigned long long)A.xt[0][1][2], (unsigned long long)A.xt[0][1][4], (unsigned long long)A.xt[0][2][0], (unsigned long long)A.xt[0][2][2], (unsigned long long)A.xt[0][2][4],
            (unsigned long long)A.xt[1][0][0], (unsigned long long)A.xt[1][0][2], (unsigned long long)A.xt[1][0][4], (unsigned long long)A.xt[1][1][0], (unsigned long long)A.xt[1][1][2], (unsigned long long)A.xt[1][1][4], (unsigned long long)A.xt[1][2][0], (unsigned long long)A.xt[1][2][2], (unsigned long long)A.xt[1][2][4]);
