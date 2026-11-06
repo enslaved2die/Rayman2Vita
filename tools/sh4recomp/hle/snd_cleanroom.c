@@ -870,3 +870,6 @@ __attribute__((constructor)) static void cleanroom_start_pull_test(void) {
     pthread_t th; pthread_create(&th, 0, cleanroom_pull_thread, 0); pthread_detach(th);
 }
 #endif
+
+/* snd_trace_close: called by vita_main.c at exit. snd.c (AICA emulator) owns a trace file; this cleanroom module has none, so this is a no-op that keeps the link working with USE_CLEANROOM_AUDIO=1. */
+void snd_trace_close(void) {}
