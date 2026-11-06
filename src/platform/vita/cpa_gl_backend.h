@@ -14,12 +14,16 @@ typedef struct CpaGlConfig {
     int   drawLayer2;           /* default 1: layer-2 batches are drawn with the substitute bump texture (CPA_TEXVA_BUMP*). 0 skips them */
     int   clear;                /* default 1: clear colour+depth in begin_frame */
     float clearColor[4];
+    int   hudReanchor;          /* default 1: HUD pass on a wider-than-4:3 HORPLUS viewport re-anchors every quad by its anchor class (cpa_hud_reanchor_x, DESIGN - only the 4:3 identity is oracle-verified); 0 = centre the 640-wide block */
     float layer2Alpha;          /* default 1.0: constant alpha multiplied onto the layer-2 bump texture (glColor4f). INFERRED approximation of the lighting, see be_draw. Base draws use the per-vertex colour array */
 } CpaGlConfig;
 void cpa_gl_config_default(CpaGlConfig *c);
 
 /* Pure math, host-testable: column-major GL matrices for the oracle camera model at a viewport (cpa_proj_init semantics, any CpaFit). */
 void cpa_gl_build_matrices(const CpaCamera *cam, int w, int h, CpaFit fit, float farZ, float proj[16], float modelview[16]);
+
+/* Pure math, host-testable: column-major ortho matrix of the HUD pass, x in [0, 480*aspect] -> NDC -1..1 (left to right), y in [0,480] -> NDC +1..-1 (top to bottom), z = 0. */
+void cpa_gl_build_hud_matrix(float aspect, float proj[16]);
 
 #define CPA_GL_TEXSLOTS 4096
 typedef struct CpaGlBackend {
@@ -30,6 +34,8 @@ typedef struct CpaGlBackend {
     uint32_t drawsIssued, drawsSkipped, drawsLayer2;
     uint32_t nUploaded, nPlaceholder;      /* textures uploaded with real pixels / with the grey placeholder (describe failed) */
     uint32_t drawsPlaceholder;             /* issued draws that sampled a placeholder texture */
+    CpaRenderVertex *hudV; uint32_t hudCap;   /* scratch for the 2D pass (6 vertices per quad + 1 spare) */
+    uint32_t hudDraws, hudSkipped;         /* HUD quads drawn / skipped (texture never uploaded) in the last frame */
 } CpaGlBackend;
 void cpa_gl_backend_init(CpaGlBackend *b, const CpaGlConfig *cfg);   /* cfg NULL = defaults; backend may be reused for many frames */
 void cpa_gl_backend_shutdown(CpaGlBackend *b);                       /* deletes textures */

@@ -157,7 +157,7 @@ int cpa_render_ctx_init(CpaRenderCtx *c, const CpaScene *scene, const CpaRenderO
 }
 void cpa_render_ctx_free(CpaRenderCtx *c) { if (c->haveTmap) cpa_vis_trimap_free(&c->tmap); free(c->texSeen); memset(c, 0, sizeof *c); }
 void cpa_render_ctx_forget_textures(CpaRenderCtx *c) { c->nTexSeen = 0; }
-void cpa_render_frame_free(CpaRenderFrame *f) { free(f->verts); free(f->draws); free(f->triSource); memset(f, 0, sizeof *f); }
+void cpa_render_frame_free(CpaRenderFrame *f) { free(f->verts); free(f->draws); free(f->triSource); free(f->hud); memset(f, 0, sizeof *f); }
 
 /* ---------------- internal batch ---------------- */
 typedef struct {
@@ -443,6 +443,18 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
             free(t); }
     }
     st->passByFlags = B.nByFlags;
+    if (in->hud && in->hud->n) {   /* 2D pass: pass/blend/wrap per quad (cpa_hud.h rules) */
+        out->hud = (CpaRenderHud *)calloc(in->hud->n, sizeof *out->hud);
+        if (out->hud) for (uint32_t i = 0; i < in->hud->n; i++) {
+            CpaRenderHud *h = &out->hud[out->nHud++]; h->q = in->hud->q[i];
+            uint32_t fl = 0, minA = 255; int tr, ad; const CpaTexEntry *e = c->store ? cpa_texstore_find(c->store, h->q.texVa) : NULL;
+            for (int k = 0; k < 4; k++) { uint32_t a = h->q.argb[k] >> 24; if (a < minA) minA = a; }
+            if (e) { fl = e->flags; h->wrapU = e->wrapU; h->wrapV = e->wrapV; } else { h->wrapU = h->wrapV = CPA_WRAP_CLAMP; if (c->store) st->hudTexMissing++; }
+            cpa_hud_pass(fl, minA, &tr, &ad);
+            h->pass = tr ? CPA_PASS_TRANSLUCENT : CPA_PASS_OPAQUE; h->blend = tr ? (ad ? CPA_BLEND_ADD : CPA_BLEND_ALPHA) : CPA_BLEND_NONE;
+            st->hudQuads++; st->hudTranslucent += tr; st->hudAdditive += ad;
+        }
+    }
     free(idx); free(B.b); free(B.apos); free(B.auv); free(B.acol);
     return 1;
 }
@@ -464,6 +476,20 @@ uint32_t cpa_render_submit(CpaRenderCtx *c, const CpaRenderFrame *f, const CpaRe
         }
         if (be->draw) be->draw(be->user, f, d);
         n++;
+    }
+    if (f->nHud && be->draw_hud) {
+        for (uint32_t i = 0; i < f->nHud; i++) {
+            uint32_t va = f->hud[i].q.texVa; if (!va || !be->upload_texture) continue;
+            uint32_t k = 0; while (k < c->nTexSeen && c->texSeen[k] != va) k++;
+            if (k == c->nTexSeen) {
+                if (c->nTexSeen == c->capTexSeen) { uint32_t nc = c->capTexSeen ? c->capTexSeen * 2 : 256; uint32_t *p = (uint32_t *)realloc(c->texSeen, nc * 4); if (p) { c->texSeen = p; c->capTexSeen = nc; } }
+                if (c->nTexSeen < c->capTexSeen) c->texSeen[c->nTexSeen++] = va;
+                CpaTexDesc t; memset(&t, 0, sizeof t); t.texVa = va;
+                if (c->opts.describe) c->opts.describe(c->opts.describeUser, va, &t);
+                t.texVa = va; be->upload_texture(be->user, &t);
+            }
+        }
+        be->draw_hud(be->user, f);
     }
     if (be->end_frame) be->end_frame(be->user);
     return n;

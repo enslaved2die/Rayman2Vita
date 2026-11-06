@@ -30,6 +30,7 @@ typedef struct {
     uint64_t trisActorM1, trisActorM2, trisStatic0, trisAll0;
     uint64_t tcStatic, tcMatched, tcFrag, tcMismatch;
     uint64_t colV[2], colExact[2], colRgb[2], colW2[2], colL2skip, colErr[2][5]; int colMax[2];      /* vertex colours of matched layer-1 triangles vs the oracle's base colour; [0] static, [1] actor */
+    uint64_t hudOracle, hudNative, hudGeom, hudPassAg, hudWrapAg, hudWrapTot;   /* native HUD pass (cpa_hud through cpa_render): oracle z>=100 strips, native quads, quads whose 4 vertices equal an oracle strip (0.1 px), of those: pass == oracle list / wrap == oracle TSP */
 } Agg;
 
 /* ---- real textures (cpa_texstore) and their oracle comparison ---- */
@@ -128,6 +129,7 @@ static int shadow_scene(CpaRenderCtx *ctx, const CpaScene *sc, const CpaVisTriMa
     CpaFrameInput in; CpaRenderActor *actors = NULL; uint32_t nUnposed = 0;
     if (!cpa_render_input_from_ram(&in, &actors, &nUnposed, &rimg, sc, &ctx->tables)) { printf("SHADOW %s %ld SKIPPED (no valid camera in RAM)\n", level, scene); free(ram); free(fb); return 1; }
 
+    CpaHudFrame hud; memset(&hud, 0, sizeof hud); if (cpa_hud_build(&hud, &rimg, NULL)) in.hud = &hud;
     /* the variants */
     CpaRenderFrame F1, F2, F0, Fu; int ok = 1;
     ctx->opts.actorMode = 1; ctx->opts.sortTranslucent = 1; ctx->opts.mergeOpaque = 1; ok &= cpa_render_build_frame(ctx, &F1, &in);
@@ -251,6 +253,17 @@ static int shadow_scene(CpaRenderCtx *ctx, const CpaScene *sc, const CpaVisTriMa
     printf("SHADOWCHK %s %ld | vis sector==ta_compare %s, vis IPO count==ta_compare %s | static pool native %llu vs ta_compare (static %u - vis-culled %u) %llu => %s | ta_compare(vis-cull) matched %u clipfrag %u mismatch %u of %u static | actor tris: mode1 %u mode2 %u mode0 %u | layer2 tris %u\n",
            level, scene, secOk ? "yes" : "NO", ipoOk ? "yes" : "NO", (unsigned long long)poolGot, st.staticTotal, st.v[V_POOLCULLED], (unsigned long long)poolExp, poolOk ? "EQUAL" : "DIFFERENT", st.matched, st.frag, st.unmBad + st.unmClip, st.staticTotal, F1.st.trisActor, F2.st.trisActor, F0.st.trisActor, F1.st.trisLayer2);
 
+    {   /* HUD pass check against the oracle's z >= 100 strips (geometry 0.1 px, then list and TSP wrap of the matched strip) */
+        uint64_t hO = 0, hG = 0, hP = 0, hW = 0; unsigned char *used = (unsigned char *)calloc(nstrip + 1, 1);
+        for (uint32_t i = 0; i < nstrip; i++) { if (strips[i].count == 4 && strips[i].first + 4 <= nvert) { int hz = 1; for (int k = 0; k < 4; k++) if (tv[strips[i].first + k].z < 100.0f) hz = 0; hO += hz; } }
+        for (uint32_t qi = 0; qi < F1.nHud; qi++) { const CpaRenderHud *h = &F1.hud[qi];
+            for (uint32_t i = 0; i < nstrip && used; i++) { if (used[i] || strips[i].count != 4 || strips[i].first + 4 > nvert) continue; const TaV *v = &tv[strips[i].first]; int ok = 1; for (int k = 0; k < 4; k++) if (v[k].z < 100.0f || fabsf(v[k].x - h->q.x[k]) > 0.1f || fabsf(v[k].y - h->q.y[k]) > 0.1f) ok = 0;
+                if (!ok) continue; used[i] = 1; hG++; hP += ((strips[i].list == 2) == (h->pass == CPA_PASS_TRANSLUCENT));
+                { uint32_t tsp = strips[i].tsp; int cu = (tsp >> 16) & 1, cv = (tsp >> 15) & 1, fu = (tsp >> 18) & 1, fv = (tsp >> 17) & 1; uint8_t wu = cu ? CPA_WRAP_CLAMP : fu ? CPA_WRAP_MIRROR : CPA_WRAP_REPEAT, wv = cv ? CPA_WRAP_CLAMP : fv ? CPA_WRAP_MIRROR : CPA_WRAP_REPEAT; if (h->wrapU == wu && h->wrapV == wv) hW++; A->hudWrapTot++; }
+                break; } }
+        A->hudOracle += hO; A->hudNative += F1.nHud; A->hudGeom += hG; A->hudPassAg += hP; A->hudWrapAg += hW; free(used);
+        if (hO || F1.nHud) printf("SHADOWHUD %s %ld | oracle HUD strips %llu | native HUD quads %u | geometry-equal %llu, of those pass == oracle list %llu\n", level, scene, (unsigned long long)hO, F1.nHud, (unsigned long long)hG, (unsigned long long)hP);
+    }
     A->scenes++; A->oracleTris += no; A->oracleStrips += nstrip - nspr; A->oracleSpriteStrips += nspr; for (int i = 0; i < 8; i++) A->oList[i] += oList[i];
     A->natSub += nnt; A->natCand += cnt[4] + cnt[1]; A->natMatched += matchedCand; A->natNear += cnt[1]; A->natBack += cnt[2]; A->natOff += cnt[3]; A->natBehind += cnt[0];
     for (int i = 0; i < 3; i++) { A->natSrc[i] += srcN[i]; A->natCandSrc[i] += candSrc[i]; A->matchSrc[i] += mSrc[i]; } A->natL2 += l2N; A->natCandL2 += candL2; A->matchL2 += mL2; A->matchedTotal += mTot;
@@ -262,7 +275,7 @@ static int shadow_scene(CpaRenderCtx *ctx, const CpaScene *sc, const CpaVisTriMa
     A->tcStatic += st.staticTotal; A->tcMatched += st.matched; A->tcFrag += st.frag; A->tcMismatch += st.unmBad + st.unmClip;
     (void)verbose; (void)lvl; (void)triDraw;
     free(vramB); free(regB);
-    free(triDraw); free(sorted); free(nt); free(ot); free(ov0); free(actors); cpa_render_frame_free(&F1); cpa_render_frame_free(&F2); cpa_render_frame_free(&F0); cpa_render_frame_free(&Fu); free(ram); free(fb);
+    free(triDraw); free(sorted); free(nt); free(ot); free(ov0); free(actors); cpa_hud_frame_free(&hud); cpa_render_frame_free(&F1); cpa_render_frame_free(&F2); cpa_render_frame_free(&F0); cpa_render_frame_free(&Fu); free(ram); free(fb);
     return 0;
 }
 
@@ -308,6 +321,8 @@ int main(int argc, char **argv) {
            A.oracleStrips * s, A.nGlc ? (double)A.glDrawsRecomp / A.nGlc : 0.0, A.nGlc ? (double)A.glStateRecomp / A.nGlc : 0.0, A.glDrawsNative * s, A.glStateNative * s, A.glBindNative * s, A.drawsUnmerged * s, A.srcBatches * s,
            (unsigned long long)A.visSecOk, (unsigned long long)A.poolTot, (unsigned long long)A.visIpoOk, (unsigned long long)A.poolTot, (unsigned long long)A.poolOk, (unsigned long long)A.poolTot,
            A.actGiven * s, A.actPosed * s, A.actDrawn * s, A.actDrawn2 * s, A.actBbox * s, A.actUnposed * s, A.trisActorM1 * s, A.trisActorM2 * s);
+    printf("HUDCHK %s | HUD through cpa_render (RAM pools -> CpaHudFrame -> CpaRenderFrame, texture flags from the store): oracle HUD strips %llu, native quads %llu, geometry-equal %llu (%.2f%% of oracle), of those pass equals the oracle list %llu (%.2f%%), wrap equals the oracle TSP %llu/%llu\n", level,
+           (unsigned long long)A.hudOracle, (unsigned long long)A.hudNative, (unsigned long long)A.hudGeom, A.hudOracle ? 100.0 * A.hudGeom / A.hudOracle : 100.0, (unsigned long long)A.hudPassAg, A.hudGeom ? 100.0 * A.hudPassAg / A.hudGeom : 100.0, (unsigned long long)A.hudWrapAg, (unsigned long long)A.hudWrapTot);
     printf("COLORCHK %s | vertex colours of matched layer-1 triangles vs the oracle base ARGB (frame vertex perms[hp][j] <-> oracle vertex j): static %llu vertices: exact %.3f%%, rgb exact %.3f%%, within 2 %.3f%%, max error %d, hist 0/1/2-3/4-15/>=16 = %llu/%llu/%llu/%llu/%llu | actor %llu vertices: exact %.3f%%, rgb exact %.3f%%, within 2 %.3f%%, max error %d, hist %llu/%llu/%llu/%llu/%llu | oracle bump-layer vertices skipped %llu\n", level,
            (unsigned long long)A.colV[0], A.colV[0] ? 100.0 * A.colExact[0] / A.colV[0] : 0.0, A.colV[0] ? 100.0 * A.colRgb[0] / A.colV[0] : 0.0, A.colV[0] ? 100.0 * A.colW2[0] / A.colV[0] : 0.0, A.colMax[0], (unsigned long long)A.colErr[0][0], (unsigned long long)A.colErr[0][1], (unsigned long long)A.colErr[0][2], (unsigned long long)A.colErr[0][3], (unsigned long long)A.colErr[0][4],
            (unsigned long long)A.colV[1], A.colV[1] ? 100.0 * A.colExact[1] / A.colV[1] : 0.0, A.colV[1] ? 100.0 * A.colRgb[1] / A.colV[1] : 0.0, A.colV[1] ? 100.0 * A.colW2[1] / A.colV[1] : 0.0, A.colMax[1], (unsigned long long)A.colErr[1][0], (unsigned long long)A.colErr[1][1], (unsigned long long)A.colErr[1][2], (unsigned long long)A.colErr[1][3], (unsigned long long)A.colErr[1][4], (unsigned long long)A.colL2skip);

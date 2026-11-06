@@ -26,6 +26,7 @@
 #include "cpa_anim.h"
 #include "cpa_tex.h"
 #include "cpa_light.h"
+#include "cpa_hud.h"
 
 /* ---------------- frame output ---------------- */
 typedef struct CpaRenderVertex {
@@ -62,10 +63,17 @@ typedef struct CpaRenderStats {
     uint32_t texturesMissing, drawsTexMissing;                       /* with a CpaTexStore attached: distinct texVa (and draws using one) that do not resolve to a .TEX chunk (layer 2 excluded) */
     uint32_t passByFlags;                                            /* source batches whose pass/blend came from tex.flags (flag rule) instead of the drawlist's alphaClass */
     uint32_t haveVis, visSector, visNIpos;
+    uint32_t hudQuads, hudTranslucent, hudAdditive, hudTexMissing;   /* HUD pass: quads, of those translucent / additive, and quads whose texture does not resolve in the store */
 } CpaRenderStats;
+
+/* HUD quad as submitted to the backend's 2D pass: the cpa_hud quad plus the state the guest's 2D path gives it. Drawn AFTER all 3D passes in the 640x480 virtual ortho space
+ * (x right, y down), no depth test, vertex order A,B,C,D = triangle strip, in list order (= guest submission order). pass/blend from the texture flags and vertex alpha
+ * (cpa_hud_pass: translucent iff flags & 0x2A or alpha < 0.98; additive iff flags & 0x20); wrap from the texture store (clamp when unknown). */
+typedef struct CpaRenderHud { CpaHudQuad q; uint8_t pass, blend, wrapU, wrapV; } CpaRenderHud;
 
 typedef struct CpaRenderFrame {
     CpaCamera cam; int w, h; CpaFit fit;
+    CpaRenderHud *hud; uint32_t nHud;            /* HUD quads (2D pass), empty when CpaFrameInput.hud was NULL */
     CpaRenderVertex *verts; uint32_t nVerts;
     CpaRenderDraw *draws; uint32_t nDraws;
     uint8_t *triSource;                          /* per triangle (vertex index / 3): CPA_SRC_*; diagnostics, one byte per triangle */
@@ -93,6 +101,7 @@ typedef struct CpaFrameInput {
     const CpaImage *actorImg;             /* image the actors' tables/geometry are read from: NULL = scene->img (unposed-capable DAT data only) ; the guest RAM image for live actors */
     uint32_t nLights; CpaLight lights[CPA_RENDER_MAXLIGHTS];   /* light list for actors (cpa_light.h); empty = actors get the ambient-only colour of their material */
     float sceneAlpha; int hasSceneAlpha;  /* g = guest 0x8C2E24CC (distance-fade alpha of the visibility test, cpa_light_dist_alpha) for the actors with SuperObject-flag 0x200000; hasSceneAlpha = 0 -> 1.0 */
+    const CpaHudFrame *hud;               /* optional 2D layer (cpa_hud_build of the same RAM image); copied into the frame. NULL = no HUD */
     CpaLightFade fade;                    /* distance fade of additive static geometry (cpa_light.h); .enabled = 0 = off. Source of the parameters UNKNOWN (runtime state), see cpa_light.h */
 } CpaFrameInput;
 
@@ -169,6 +178,7 @@ typedef struct CpaRenderBackend {
     void (*begin_frame)(void *user, const CpaRenderFrame *f);
     void (*upload_texture)(void *user, const CpaTexDesc *t);              /* once per texVa until forgotten */
     void (*draw)(void *user, const CpaRenderFrame *f, const CpaRenderDraw *d);
+    void (*draw_hud)(void *user, const CpaRenderFrame *f);               /* optional: the whole 2D pass (f->hud[0..nHud)), called after the last 3D draw; textures are uploaded before the call */
     void (*end_frame)(void *user);
 } CpaRenderBackend;
 

@@ -2,9 +2,10 @@
 #include <vitaGL.h>
 #include "cpa_gl_backend.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
-void cpa_gl_config_default(CpaGlConfig *c) { memset(c, 0, sizeof *c); c->farZ = 4000.0f; c->drawLayer2 = 1; c->clear = 1; c->clearColor[3] = 1.0f; c->layer2Alpha = 1.0f; }
+void cpa_gl_config_default(CpaGlConfig *c) { memset(c, 0, sizeof *c); c->farZ = 4000.0f; c->drawLayer2 = 1; c->clear = 1; c->clearColor[3] = 1.0f; c->layer2Alpha = 1.0f; c->hudReanchor = 1; }
 
 void cpa_gl_build_matrices(const CpaCamera *cam, int w, int h, CpaFit fit, float farZ, float proj[16], float mv[16]) {
     CpaProj p; cpa_proj_init(&p, cam, w, h, fit);
@@ -34,7 +35,7 @@ void cpa_gl_backend_init(CpaGlBackend *b, const CpaGlConfig *cfg) {
 }
 void cpa_gl_backend_shutdown(CpaGlBackend *b) {
     for (uint32_t i = 0; i < CPA_GL_TEXSLOTS; i++) if (b->tex[i].va) { GLuint id = b->tex[i].id; glDeleteTextures(1, &id); }
-    memset(b->tex, 0, sizeof b->tex); b->nTex = 0;
+    memset(b->tex, 0, sizeof b->tex); b->nTex = 0; free(b->hudV); b->hudV = NULL; b->hudCap = 0;
 }
 
 static int wrap_enum(unsigned m) { return m == CPA_WRAP_CLAMP ? GL_CLAMP_TO_EDGE : m == CPA_WRAP_MIRROR ? GL_MIRRORED_REPEAT : GL_REPEAT; }
@@ -114,8 +115,54 @@ static void be_draw(void *user, const CpaRenderFrame *f, const CpaRenderDraw *d)
     if (b->depthWrite != dw) { glDepthMask(dw ? GL_TRUE : GL_FALSE); b->depthWrite = dw; }
     glDrawArrays(GL_TRIANGLES, (int)d->first, (int)d->count); b->drawsIssued++;
 }
+void cpa_gl_build_hud_matrix(float aspect, float P[16]) {
+    float wv = 480.0f * aspect; memset(P, 0, 16 * sizeof(float));
+    P[0] = 2.0f / wv; P[5] = -2.0f / 480.0f; P[10] = 1.0f; P[12] = -1.0f; P[13] = 1.0f; P[15] = 1.0f;
+}
+
+/* 2D pass: the guest's TA screen (640x480 virtual, y down, no depth) over the viewport. 4:3 viewport = the oracle layout (VERIFIED quad geometry/texture/colour/list, hud_compare); other aspects: DESIGN. */
+static void be_draw_hud(void *user, const CpaRenderFrame *f) {
+    CpaGlBackend *b = (CpaGlBackend *)user; float P[16], aspect = 4.0f / 3.0f; int vx = 0, vw = f->w;
+    b->hudDraws = b->hudSkipped = 0;
+    if (!f->nHud || f->w <= 0 || f->h <= 0) return;
+    if (f->fit == CPA_FIT_PILLARBOX43) { vw = (int)((float)f->h * 4.0f / 3.0f + 0.5f); if (vw > f->w) vw = f->w; vx = (f->w - vw) / 2; }
+    else if (f->fit == CPA_FIT_HORPLUS) { aspect = (float)f->w / (float)f->h; if (aspect < 4.0f / 3.0f) aspect = 4.0f / 3.0f; }
+    if ((uint32_t)(f->nHud * 6 + 1) > b->hudCap) { uint32_t nc = f->nHud * 6 + 1; CpaRenderVertex *p = (CpaRenderVertex *)realloc(b->hudV, nc * sizeof *p); if (!p) return; b->hudV = p; b->hudCap = nc; }
+    cpa_gl_build_hud_matrix(aspect, P);
+    glViewport(vx, 0, vw, f->h);
+    glMatrixMode(GL_PROJECTION); glLoadMatrixf(P); glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+    glDisable(GL_DEPTH_TEST); set_cap(GL_CULL_FACE, &b->cullOn, 0); set_cap(GL_ALPHA_TEST, &b->alphaOn, 0);
+    if (b->depthWrite != 0) { glDepthMask(GL_FALSE); b->depthWrite = 0; }
+    if (!b->colorArrayOn) { glEnableClientState(GL_COLOR_ARRAY); b->colorArrayOn = 1; }
+    glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glVertexPointer(3, GL_FLOAT, (int)sizeof(CpaRenderVertex), &b->hudV[0].x);
+    glTexCoordPointer(2, GL_FLOAT, (int)sizeof(CpaRenderVertex), &b->hudV[0].u);
+    glColorPointer(4, GL_UNSIGNED_BYTE, (int)sizeof(CpaRenderVertex), &b->hudV[0].r);
+    if (b->colorA != 1.0f) { glColor4f(1, 1, 1, 1); b->colorA = 1.0f; }
+    for (uint32_t i = 0; i < f->nHud; i++) {
+        const CpaRenderHud *h = &f->hud[i]; const CpaHudQuad *q = &h->q;
+        int s = q->texVa ? tex_find(b, q->texVa) : -1;
+        if (q->texVa && s < 0) { b->hudSkipped++; continue; }
+        CpaRenderVertex *v = &b->hudV[0];
+        static const int ord[6] = { 0, 1, 2, 1, 3, 2 };            /* strip A,B,C,D = triangles (A,B,C),(B,C,D) */
+        float dx = 0;
+        if (aspect > 4.0f / 3.0f + 1e-4f) dx = b->cfg.hudReanchor ? cpa_hud_reanchor_x(0.0f, q->anchor, aspect) : (480.0f * aspect - 640.0f) * 0.5f;
+        for (int k = 0; k < 6; k++) {
+            int j = ord[k]; v[k].x = q->x[j] + dx; v[k].y = q->y[j]; v[k].z = 0.0f; v[k].u = q->u[j]; v[k].v = q->v[j];
+            v[k].a = (uint8_t)(q->argb[j] >> 24); v[k].r = (uint8_t)(q->argb[j] >> 16); v[k].g = (uint8_t)(q->argb[j] >> 8); v[k].b = (uint8_t)q->argb[j];
+        }
+        if (q->texVa) {
+            if (b->curTex != s) { glBindTexture(GL_TEXTURE_2D, b->tex[s].id); b->curTex = s; }
+            if (b->tex[s].wrapU != h->wrapU) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_enum(h->wrapU)); b->tex[s].wrapU = h->wrapU; }
+            if (b->tex[s].wrapV != h->wrapV) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_enum(h->wrapV)); b->tex[s].wrapV = h->wrapV; }
+        }
+        int blend = h->blend != CPA_BLEND_NONE; set_cap(GL_BLEND, &b->blendOn, blend);
+        if (blend) { unsigned dst = h->blend == CPA_BLEND_ADD ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA; if (b->curSrc != GL_SRC_ALPHA || b->curDst != dst) { glBlendFunc(GL_SRC_ALPHA, dst); b->curSrc = GL_SRC_ALPHA; b->curDst = dst; } }
+        glDrawArrays(GL_TRIANGLES, 0, 6); b->hudDraws++;
+    }
+}
 static void be_end(void *user) { (void)user; }
 
 void cpa_gl_backend_vtable(CpaGlBackend *b, CpaRenderBackend *out) {
-    memset(out, 0, sizeof *out); out->user = b; out->begin_frame = be_begin; out->upload_texture = be_upload; out->draw = be_draw; out->end_frame = be_end;
+    memset(out, 0, sizeof *out); out->user = b; out->begin_frame = be_begin; out->upload_texture = be_upload; out->draw = be_draw; out->draw_hud = be_draw_hud; out->end_frame = be_end;
 }

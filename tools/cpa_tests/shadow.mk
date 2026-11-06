@@ -9,7 +9,7 @@ ASSETS  ?= $(abspath ../../assets/dc)
 SH4      = ../sh4recomp
 TA       = $(SH4)/hle/tests_ta
 FAKEGL   = $(TA)/fakegl
-SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c ../../src/cpa/cpa_anim.c ../../src/cpa/cpa_camera.c ../../src/cpa/cpa_drawlist.c ../../src/cpa/cpa_vis.c ../../src/cpa/cpa_tex.c ../../src/cpa/cpa_render.c
+SRC      = ../../src/cpa/cpa_image.c ../../src/cpa/cpa_scene.c ../../src/cpa/cpa_anim.c ../../src/cpa/cpa_camera.c ../../src/cpa/cpa_drawlist.c ../../src/cpa/cpa_vis.c ../../src/cpa/cpa_tex.c ../../src/cpa/cpa_hud.c ../../src/cpa/cpa_render.c
 GLB      = ../../src/platform/vita/cpa_gl_backend.c
 HDR      = $(wildcard ../../src/cpa/*.h) ../../src/platform/vita/cpa_gl_backend.h shadow_glext.h
 GLFLAGS  = -std=gnu11 -O2 -Wall -Wextra -Wno-unused-function -include shadow_glext.h -I$(FAKEGL)

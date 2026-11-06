@@ -198,8 +198,42 @@ static void t_sprite_color(void) {
     printf("sprite colours: CpaSprite.col -> vertex stream (white with lighting off)\n");
 }
 
+
+/* HUD pass (asset free): three cpa_hud quads (opaque level-texture style, translucent alpha 0.784, additive portrait) go through the builder (pass/blend/wrap rules) and the GL backend's 2D pass:
+ * draw_hud is called once after the 3D draws, one glDrawArrays per quad, the 3D draw counts are unchanged, and the ortho matrix maps the 640x480 virtual corners to the NDC corners. */
+static void t_hud(void) {
+    CpaScene s; memset(&s, 0, sizeof s); float pos[9] = { 0 }, uv[6] = { 0 }; CpaDrawItem it; memset(&it, 0, sizeof it);
+    it.vertCount = 3; it.texVa = 0x100; it.alphaClass = CPA_ALPHA_OPAQUE; it.tileU = it.tileV = 1; pos[1] = 10; pos[4] = 10; pos[7] = 10; pos[5] = 1; pos[8] = 1; s.pos = pos; s.uv = uv; s.nVerts = 3; s.items = &it; s.nItems = 1;
+    CpaRenderCtx ctx; CpaRenderOpts o; cpa_render_opts_default(&o); cpa_render_ctx_init(&ctx, &s, &o);
+    CpaHudFrame hf; memset(&hf, 0, sizeof hf); hf.q = (CpaHudQuad *)calloc(3, sizeof(CpaHudQuad)); hf.n = hf.cap = 3;
+    for (int i = 0; i < 3; i++) { CpaHudQuad *q = &hf.q[i]; q->x[0] = q->x[1] = 10.0f + 100.0f * (float)i; q->x[2] = q->x[3] = q->x[0] + 64.0f; q->y[0] = q->y[2] = 20.0f; q->y[1] = q->y[3] = 84.0f; q->v[0] = q->v[2] = 1.0f;
+        q->u[2] = q->u[3] = 1.0f; q->z = 512.0f; q->texVa = 0x9000u + (uint32_t)i; uint32_t a = i == 0 ? 0xFFu : 0xC8u; for (int k = 0; k < 4; k++) q->argb[k] = (a << 24) | 0xFFFFFFu; }
+    CpaFrameInput in; memset(&in, 0, sizeof in); float cp[3] = { 0, 0, 0 }, up[3] = { 0, 0, 1 }, fw[3] = { 0, 1, 0 }; cpa_camera_from_rows(&in.cam, cp, up, fw, 1.2f, 0.75f); in.w = 640; in.h = 480; in.fit = CPA_FIT_HORPLUS; in.hud = &hf;
+    CpaRenderFrame f; CHECK(cpa_render_build_frame(&ctx, &f, &in), "build with hud");
+    CHECK(f.nHud == 3 && f.st.hudQuads == 3, "hud quads in frame: %u", f.nHud);
+    /* no texture store attached: flags unknown (0) -> opaque iff alpha >= 0.98 */
+    CHECK(f.hud[0].pass == CPA_PASS_OPAQUE && f.hud[0].blend == CPA_BLEND_NONE && f.hud[1].pass == CPA_PASS_TRANSLUCENT && f.hud[1].blend == CPA_BLEND_ALPHA && f.st.hudTranslucent == 2, "hud pass: %u/%u %u/%u", f.hud[0].pass, f.hud[0].blend, f.hud[1].pass, f.hud[1].blend);
+    CHECK(f.hud[0].wrapU == CPA_WRAP_CLAMP && f.hud[0].wrapV == CPA_WRAP_CLAMP, "hud default wrap clamp");
+    CpaGlBackend gb; cpa_gl_backend_init(&gb, NULL); CpaRenderBackend be; cpa_gl_backend_vtable(&gb, &be);
+    extern FakeGl fg; unsigned long d0 = fg.draws; uint32_t n = cpa_render_submit(&ctx, &f, &be);
+    CHECK(n == 1 && gb.drawsIssued == 1 && gb.hudDraws == 3 && gb.hudSkipped == 0 && fg.draws - d0 == 4, "3D draws %u issued %u, hud drawn %u skipped %u, fake saw %lu draw calls (expect 1 + 3)", n, gb.drawsIssued, gb.hudDraws, gb.hudSkipped, fg.draws - d0);
+    CHECK(gb.nTex == 4, "hud textures uploaded once each (+ the 3D one): %u", gb.nTex);
+    unsigned long t0 = fg.teximage; cpa_render_submit(&ctx, &f, &be); CHECK(fg.teximage == t0, "second frame re-uploaded hud textures");
+    cpa_gl_backend_shutdown(&gb); cpa_render_frame_free(&f);
+    /* ortho matrix: corners of the virtual screen -> NDC corners; 16:9 widens x only */
+    float P[16]; cpa_gl_build_hud_matrix(4.0f / 3.0f, P);
+    CHECK(fabsf(P[0] * 0 + P[12] + 1.0f) < 1e-6f && fabsf(P[5] * 0 + P[13] - 1.0f) < 1e-6f && fabsf(P[0] * 640.0f + P[12] - 1.0f) < 1e-5f && fabsf(P[5] * 480.0f + P[13] + 1.0f) < 1e-5f, "hud ortho 4:3 corners");
+    cpa_gl_build_hud_matrix(16.0f / 9.0f, P); CHECK(fabsf(P[0] * (480.0f * 16.0f / 9.0f) + P[12] - 1.0f) < 1e-5f, "hud ortho 16:9 right edge");
+    /* 16:9 viewport: the same quad moves by its anchor (left 0, centre +106.7, right +213.3 px of virtual space) */
+    in.w = 1280; in.h = 720; CpaRenderFrame f2; hf.q[0].anchor = CPA_HUD_RIGHT; hf.q[1].anchor = CPA_HUD_CENTER; hf.q[2].anchor = CPA_HUD_LEFT;
+    CHECK(cpa_render_build_frame(&ctx, &f2, &in), "build 16:9"); cpa_gl_backend_init(&gb, NULL); cpa_gl_backend_vtable(&gb, &be); cpa_render_ctx_forget_textures(&ctx); cpa_render_submit(&ctx, &f2, &be);
+    CHECK(gb.hudDraws == 3 && fabsf(gb.hudV[0].x - (hf.q[2].x[0])) < 1e-3f, "16:9 anchored: left quad unshifted (last drawn vertex x %.2f vs %.2f)", gb.hudV[0].x, hf.q[2].x[0]);
+    cpa_gl_backend_shutdown(&gb); cpa_render_frame_free(&f2); cpa_render_ctx_free(&ctx); free(hf.q);
+    printf("hud pass: 3 quads, opaque/translucent by alpha without a store, 2D pass after the 3D draws (1 + 3 GL draws), textures uploaded once, ortho corners and 16:9 anchors ok\n");
+}
+
 int main(void) {
-    srand(1); t_matrices(); t_frame(); t_flagrule(); t_store(); t_colors(); t_sprite_color();
+    srand(1); t_matrices(); t_frame(); t_flagrule(); t_store(); t_colors(); t_sprite_color(); t_hud();
     printf("test_render: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }
