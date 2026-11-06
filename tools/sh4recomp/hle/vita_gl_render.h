@@ -43,8 +43,6 @@ typedef struct VitaGlPfFrame {
 const VitaGlPfFrame *vita_gl_pf_frame(void);
 
 void vita_gl_texture_cache_clear(void);
-void vita_gl_set_render_scale(int scale_pct);
-int  vita_gl_get_render_scale(void);
 
 #ifdef __cplusplus
 }

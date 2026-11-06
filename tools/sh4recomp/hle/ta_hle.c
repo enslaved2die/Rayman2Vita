@@ -57,58 +57,21 @@ static const char *config_path = "config.ini";
 #endif
 
 static int config_loaded = 0;
-static int s_fps_limit = 60;
-static int s_render_scale_cfg = 100;
-static void config_load(void);
-static void config_save(void);
-
-void r2_set_fps_limit(int fps) {
-    if (fps != 30 && fps != 60) fps = 60;
-    s_fps_limit = fps;
-    config_save();
-}
-
-int r2_get_fps_limit(void) {
-    if (!config_loaded) config_load();
-    return s_fps_limit;
-}
-
-void r2_set_render_scale(int scale_pct) {
-    if (scale_pct != 67 && scale_pct != 75 && scale_pct != 100) scale_pct = 100;
-    s_render_scale_cfg = scale_pct;
-    vita_gl_set_render_scale(scale_pct);
-    config_save();
-}
-
-int r2_get_render_scale(void) {
-    if (!config_loaded) config_load();
-    return s_render_scale_cfg;
-}
 
 static void config_load(void) {
     if (config_loaded) return;
     config_loaded = 1;
     wide_pref = 1;
-    s_fps_limit = 60;
-    s_render_scale_cfg = 100;
     FILE *f = fopen(config_path, "r");
-    if (!f) {
-        vita_gl_set_render_scale(s_render_scale_cfg);
-        return;
-    }
+    if (!f) return;
     char line[128];
     while (fgets(line, sizeof(line), f)) {
         int v;
         if (sscanf(line, "widescreen = %d", &v) == 1 || sscanf(line, "widescreen=%d", &v) == 1) {
             wide_pref = v ? 1 : 0;
-        } else if (sscanf(line, "fps_limit = %d", &v) == 1 || sscanf(line, "fps_limit=%d", &v) == 1) {
-            s_fps_limit = (v == 30) ? 30 : 60;
-        } else if (sscanf(line, "render_scale = %d", &v) == 1 || sscanf(line, "render_scale=%d", &v) == 1) {
-            if (v == 67 || v == 75 || v == 100) s_render_scale_cfg = v;
         }
     }
     fclose(f);
-    vita_gl_set_render_scale(s_render_scale_cfg);
 }
 
 static void config_save(void) {
@@ -117,8 +80,7 @@ static void config_save(void) {
         hle_log("[ta] wide: failed to open %s for writing", config_path);
         return;
     }
-    fprintf(f, "[video]\nwidescreen = %d\nfps_limit = %d\nrender_scale = %d\n",
-            wide_pref ? 1 : 0, s_fps_limit, s_render_scale_cfg);
+    fprintf(f, "[video]\nwidescreen = %d\n", wide_pref ? 1 : 0);
     fclose(f);
 }
 

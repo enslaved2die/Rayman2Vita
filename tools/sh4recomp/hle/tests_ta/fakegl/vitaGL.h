@@ -98,6 +98,5 @@ static inline void glReadPixels(int a, int b, int c, int d, GLenum e, GLenum f, 
 static inline void glFinish(void) {}
 static inline GLenum glGetError(void) { return 0; }
 static inline void vglInitExtended(int a, int b, int c, int d, int e) { (void)a; (void)b; (void)c; (void)d; (void)e; }
-static inline GLboolean vglSwapResolution(int w, int h) { (void)w; (void)h; return GL_TRUE; }
 void fgr_end_frame(void);
 static inline void vglSwapBuffers(GLboolean b) { (void)b; fgr_end_frame(); }

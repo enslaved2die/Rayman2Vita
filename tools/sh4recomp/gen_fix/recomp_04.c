@@ -1,8 +1,4 @@
 #include "recomp_decls.h"
-void r2_set_fps_limit(int fps);
-int  r2_get_fps_limit(void);
-void r2_set_render_scale(int scale_pct);
-int  r2_get_render_scale(void);
 void f_8c02e280(SH4Ctx *c) {
   R(0)=0x8c02e320u;
   fp_ld(c,5,R(0));
@@ -14439,26 +14435,12 @@ void f_8c0305b8(SH4Ctx *c) {
   if(c->t) goto L8c03063e;
   {  goto L8c030644; }
 L8c030620:;
-  /* Toggle framerate between 60 FPS and 30 FPS */
-  {
-    int cur_fps = r2_get_fps_limit();
-    int new_fps = (cur_fps == 60) ? 30 : 60;
-    r2_set_fps_limit(new_fps);
-    if (new_fps == 60) {
-      R(4) = 60u;
-      R(2) = 0x8c010ae0u;
-      { c->pr = 0x8c03062cu; f_8c010ae0(c); }
-    } else {
-      R(4) = 50u;
-      R(2) = 0x8c010ab8u;
-      { c->pr = 0x8c030636u; f_8c010ab8(c); }
-    }
-    /* Cycle render scale on video mode change: 100% -> 75% -> 67% -> 100% */
-    int cur_scale = r2_get_render_scale();
-    int new_scale = (cur_scale == 100) ? 75 : (cur_scale == 75) ? 67 : 100;
-    r2_set_render_scale(new_scale);
-  }
-  goto L8c030636;
+  R(0)=R(4);
+  c->t=(int32_t)R(0)==60;
+  if(!c->t) goto L8c030630;
+  R(2)=0x8c010ae0u;
+  { c->pr=0x8c03062cu;  f_8c010ae0(c); }
+  {  goto L8c030636; }
 L8c030630:;
   R(2)=0x8c010ab8u;
   { c->pr=0x8c030636u;  f_8c010ab8(c); }
