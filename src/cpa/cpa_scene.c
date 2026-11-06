@@ -47,6 +47,7 @@ typedef struct {
     uint32_t animHead, animCount;   /* VisualMaterial texture-animation frame list (0 = none), see vm_texture() */
     uint32_t lm;                    /* index into Ctx.lm (VisualMaterial for lighting), 0xFFFFFFFF = none */
     int16_t *rli;                   /* 4 raw s16 per element vertex (3 per triangle), NULL = no RLI */
+    uint16_t *vidx; uint32_t geo;   /* rig parts only: geometry vertex index per triangle vertex, GeometricObject */
 } Elem;
 
 typedef struct {
@@ -175,7 +176,7 @@ static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor, uint32_t s
             { uint32_t ah, ac; int nm, bd; tex3 = vm_texture(im, vm3, &ah, &ac, &nm, &bd); vm_anim_stats(c, vm3, ah, nm, bd); }
             if (c->nSpr == c->capSpr) { c->capSpr = c->capSpr ? c->capSpr * 2 : 64; c->spr = (CpaSprite *)realloc(c->spr, sizeof(CpaSprite) * c->capSpr); if (!c->spr) { c->capSpr = c->nSpr = 0; free(vw); return 0; } }
             CpaSprite *sp = &c->spr[c->nSpr++]; memset(sp, 0, sizeof *sp);
-            memcpy(sp->pos, vw[0], sizeof sp->pos); sp->sizeX = sx; sp->sizeY = sy; sp->texVa = tex3; sp->isActor = (uint8_t)isActor; sp->geoVa = geo; sp->soVa = soVa;
+            memcpy(sp->pos, vw[0], sizeof sp->pos); sp->sizeX = sx; sp->sizeY = sy; sp->texVa = tex3; sp->isActor = (uint8_t)isActor; sp->geoVa = geo; sp->soVa = soVa; sp->vm = vm3; sp->col = 0xFFFFFFFFu;
             for (int k = 0; k < 3; k++) cpa_rdf(im, pv + 4u * k, &sp->local[k]);
             { uint8_t wb; tex_decode(im, tex3, &sp->texFlags, &wb, &sp->texFlagsValid, &sp->tileU, &sp->tileV, &sp->wrapUnclear, &sp->alphaClass); }
             continue;
@@ -203,7 +204,8 @@ static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor, uint32_t s
         E.pos = (float *)malloc(sizeof(float) * 9 * ntri);
         E.uv  = (float *)malloc(sizeof(float) * 6 * ntri);
         E.rli = (int16_t *)calloc((size_t)ntri * 12, sizeof(int16_t));
-        if (!E.pos || !E.uv || !E.rli) { free(E.pos); free(E.uv); free(E.rli); free(vw); return 0; }
+        if (c->curChan >= 0) { E.vidx = (uint16_t *)calloc((size_t)ntri * 3, sizeof(uint16_t)); E.geo = geo; }
+        if (!E.pos || !E.uv || !E.rli || (c->curChan >= 0 && !E.vidx)) { free(E.pos); free(E.uv); free(E.rli); free(E.vidx); free(vw); return 0; }
         uint32_t rliN = 0, rliData = ipoVa ? cpa_light_rli(im, ipoVa, &rliN) : 0;   /* static IPO: per-vertex lighting stored in the level (cpa_light.h) */
         for (uint32_t t = 0; t < ntri; t++) {
             uint16_t vi[3], ui[3];
@@ -214,6 +216,7 @@ static int emit_geo(Ctx *c, uint32_t geo, const Mat *wm, int isActor, uint32_t s
                 float u = 0, v = 0;
                 cpa_rdf(im, w[5] + ui[k] * 8u, &u); cpa_rdf(im, w[5] + ui[k] * 8u + 4, &v);
                 memcpy(E.pos + (E.nTri * 3 + k) * 3, vw[vi[k]], sizeof(float) * 3);
+                if (E.vidx) E.vidx[E.nTri * 3 + k] = vi[k];
                 E.uv[(E.nTri * 3 + k) * 2 + 0] = u;
                 E.uv[(E.nTri * 3 + k) * 2 + 1] = v;
                 if (rliData && vi[k] < rliN) { int16_t raw[4]; float fv[4]; if (cpa_light_rli_entry(im, rliData, vi[k], raw, fv)) memcpy(E.rli + (E.nTri * 3 + k) * 4, raw, sizeof raw); }
@@ -407,6 +410,7 @@ int cpa_scene_load(CpaScene *out, const CpaImage *img, uint32_t rootVa) {
             if (e->chan >= 0 && R->part) {
                 CpaRigPart *r = &R->part[R->nPart++];
                 r->texVa = e->tex; r->nTri = e->nTri; r->chan = e->chan; r->lpos = e->pos; r->uv = e->uv; free(e->rli); e->rli = NULL;
+                r->geoVa = e->geo; r->lmIdx = e->lm; r->vidx = e->vidx; e->vidx = NULL;
                 tex_decode(img, e->tex, &r->texFlags, &r->texWrapByte, &r->texFlagsValid, &r->tileU, &r->tileV, &r->wrapUnclear, &r->alphaClass);
                 r->wpos = (float *)malloc(sizeof(float) * 9 * (e->nTri ? e->nTri : 1));
                 if (r->wpos) memcpy(r->wpos, r->lpos, sizeof(float) * 9 * e->nTri);
@@ -470,7 +474,7 @@ int cpa_scene_load(CpaScene *out, const CpaImage *img, uint32_t rootVa) {
         }
         free(seen);
     }
-    for (uint32_t i = 0; i < c.nEl; i++) { free(c.el[i].pos); free(c.el[i].uv); free(c.el[i].rli); }
+    for (uint32_t i = 0; i < c.nEl; i++) { free(c.el[i].pos); free(c.el[i].uv); free(c.el[i].rli); free(c.el[i].vidx); }
     free(c.el); free(done);
     out->lmat = c.lm; out->nLmat = c.nLm; c.lm = NULL;
     cpa_scene_relight(out);
@@ -486,7 +490,7 @@ int cpa_scene_load_dats(CpaScene *out, CpaImage *img, const uint8_t *fix, size_t
 }
 
 void cpa_scene_free(CpaScene *s) {
-    for (uint32_t i = 0; i < s->rig.nPart; i++) { free(s->rig.part[i].lpos); free(s->rig.part[i].uv); free(s->rig.part[i].wpos); }
+    for (uint32_t i = 0; i < s->rig.nPart; i++) { free(s->rig.part[i].lpos); free(s->rig.part[i].uv); free(s->rig.part[i].wpos); free(s->rig.part[i].vidx); free(s->rig.part[i].col); }
     free(s->rig.part);
     free(s->pos); free(s->uv); free(s->items); free(s->sprites); free(s->col); free(s->vtxMat); free(s->vtxRli); free(s->lmat);
     memset(s, 0, sizeof *s);
@@ -508,6 +512,8 @@ void cpa_rig_pose(CpaScene *s, float ft) {
     if (!rg) return;
     if (!cpa_anim_rig_pose(&A, (unsigned)R->anim, frame, CPA_ANIM_BEST, R->world, rg)) { free(rg); return; }
     for (int k = 0; k < 3; k++) { R->pmin[k] = 1e30f; R->pmax[k] = -1e30f; }
+    for (unsigned ch = 0; ch < rg->pose.nCh && ch < CPA_RIG_MAXCH; ch++) memcpy(R->chW[ch], rg->world[ch], sizeof R->chW[ch]);
+    R->posed = 1;
     for (uint32_t i = 0; i < R->nPart; i++) {
         CpaRigPart *r = &R->part[i];
         if (!r->wpos || r->chan < 0 || (unsigned)r->chan >= rg->pose.nCh || r->chan >= CPA_RIG_MAXCH) continue;
@@ -518,6 +524,53 @@ void cpa_rig_pose(CpaScene *s, float ft) {
         }
     }
     free(rg);
+}
+
+
+/* ---------- lighting of the rig and of the sprites (cpa_light.h) ---------- */
+#define SCENE_MAXLIGHTS 64
+uint32_t cpa_rig_light(CpaScene *s, const CpaLight *lights, uint32_t nLights, float sceneAlpha) {
+    CpaRig *R = &s->rig; const CpaImage *im = &s->img; uint32_t lit = 0;
+    if (!R->valid || !R->posed) return 0;
+    CpaLight sel[SCENE_MAXLIGHTS]; CpaLightEnv env;
+    if (nLights > SCENE_MAXLIGHTS) nLights = SCENE_MAXLIGHTS;
+    uint32_t nSel = cpa_light_for_actor(im, R->soVa, lights, nLights, sel);
+    cpa_light_env_default(&env); cpa_light_env_from_list(sel, nSel, &env); cpa_light_actor_alpha(im, R->soVa, sceneAlpha, &env);
+    R->objAlpha = env.objAlpha;
+    for (uint32_t i = 0; i < R->nPart; i++) {
+        CpaRigPart *r = &R->part[i];
+        if (!r->lpos || !r->wpos || !r->vidx || r->chan < 0 || r->chan >= CPA_RIG_MAXCH || !r->nTri) continue;
+        if (!r->col) r->col = (uint32_t *)malloc(sizeof(uint32_t) * 3u * r->nTri);
+        if (!r->col) continue;
+        CpaLightMat lm; int haveMat = r->lmIdx < s->nLmat; if (haveMat) lm = s->lmat[r->lmIdx];
+        CpaLightObj ob; cpa_light_obj_init(&ob, R->chW[r->chan]); cpa_light_obj_sphere(&ob, im, r->geoVa);
+        uint32_t pn = cpa_u32(im, r->geoVa + 4); if (!cpa_is_ptr(im, pn)) pn = 0;
+        for (uint32_t v = 0; v < r->nTri * 3; v++) {
+            if (!haveMat) { r->col[v] = 0xFFFFFFFFu; continue; }
+            float nl[3] = { 0, 0, 0 }, acc[4] = { 0, 0, 0, 0 };
+            if (pn) for (int a = 0; a < 3; a++) nl[a] = cpa_f32(im, pn + (uint32_t)r->vidx[v] * 12u + 4u * (uint32_t)a);
+            cpa_light_accum_vertex(sel, nSel, &ob, r->lpos + 3 * (size_t)v, r->wpos + 3 * (size_t)v, nl, acc);
+            r->col[v] = cpa_light_argb(&lm, &env, acc); lit++;
+        }
+    }
+    return lit;
+}
+
+uint32_t cpa_sprites_light(CpaScene *s, const CpaLight *lights, uint32_t nLights, float sceneAlpha) {
+    const CpaImage *im = &s->img; uint32_t lit = 0;
+    if (nLights > SCENE_MAXLIGHTS) nLights = SCENE_MAXLIGHTS;
+    for (uint32_t i = 0; i < s->nSprites; i++) {
+        CpaSprite *sp = &s->sprites[i]; CpaLightMat lm; CpaLight sel[SCENE_MAXLIGHTS]; CpaLightEnv env; float acc[4] = { 0, 0, 0, 0 }, nz[3] = { 0, 0, 0 };
+        sp->col = 0xFFFFFFFFu;
+        if (!cpa_light_mat_read(im, sp->vm, &lm)) continue;
+        lm.texFlags = sp->texFlags;                                    /* the scene keeps the decoded flags per sprite */
+        uint32_t nSel = cpa_light_for_actor(im, sp->soVa, lights, nLights, sel);
+        cpa_light_env_default(&env); cpa_light_env_from_list(sel, nSel, &env); cpa_light_actor_alpha(im, sp->soVa, sceneAlpha, &env);
+        { float W[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }; CpaLightObj ob; cpa_light_obj_init(&ob, W);
+          cpa_light_accum_vertex(sel, nSel, &ob, sp->pos, sp->pos, nz, acc); }
+        sp->col = cpa_light_argb(&lm, &env, acc); lit++;
+    }
+    return lit;
 }
 
 

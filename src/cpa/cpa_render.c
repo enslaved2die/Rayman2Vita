@@ -172,6 +172,7 @@ typedef struct {
     RB *b; uint32_t n, cap;
     float *apos, *auv; uint32_t *acol; uint32_t an, acap;      /* arena: actor / sprite vertices (acol = packed ARGB per vertex) */
     int lighting; const CpaLight *lights; uint32_t nLights; CpaLightEnv env; const CpaLight *curL; uint32_t curN; CpaLightObj obj;   /* actor lighting inputs (cpa_light.h) */
+    const CpaLightFade *fade; const CpaCamera *cam;   /* actor distance fade (additive actor materials; applied to actors in every level, see notes_lighting.md section 6) */
     int oom;
     int flagRule, cutoutTrans; uint32_t nByFlags;
     const CpaTexStore *store;
@@ -253,6 +254,8 @@ static uint32_t actor_geo(Build *B, const CpaImage *im, uint32_t geo, const floa
                     for (int a = 0; a < 3; a++) pl[a] = cpa_f32(im, pv + vi[k] * 12u + 4u * a);
                     cpa_light_accum_vertex(B->curL, B->curN, &B->obj, pl, vw[vi[k]], nl, acc);
                     B->acol[o] = cpa_light_argb(&lmat, &B->env, acc);
+                    if (B->fade && B->fade->enabled && B->cam) { const CpaCamera *cm = B->cam; float zc = (float)((double)cm->fwd[0] * (vw[vi[k]][0] - cm->pos[0]) + (double)cm->fwd[1] * (vw[vi[k]][1] - cm->pos[1]) + (double)cm->fwd[2] * (vw[vi[k]][2] - cm->pos[2]));
+                        B->acol[o] = cpa_light_fade_argb_env(B->fade, &lmat, &B->env, B->acol[o], zc); }
                 } else B->acol[o] = 0xFFFFFFFFu;
                 for (int j = 0; j < 3; j++) { float x = vw[vi[k]][j]; if (!box->any || x < box->mn[j]) box->mn[j] = x; if (!box->any || x > box->mx[j]) box->mx[j] = x; } box->any = 1;
             }
@@ -301,6 +304,7 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
     Build B; memset(&B, 0, sizeof B); B.flagRule = O->flagRule; B.cutoutTrans = O->cutoutAsTranslucent; B.store = c->store;
     B.lighting = O->useLighting; B.lights = in->lights; B.nLights = in->nLights > CPA_RENDER_MAXLIGHTS ? CPA_RENDER_MAXLIGHTS : in->nLights;
     cpa_light_env_default(&B.env); cpa_light_env_from_list(in->lights, B.nLights, &B.env);
+    if (O->useFade) { B.fade = &in->fade; B.cam = &in->cam; }
 
     /* 1. visibility */
     CpaVisFrustum fr; CpaVis vis; CpaVisCull cull; int haveVis = 0, haveCull = 0; uint32_t *drawnActors = NULL; uint32_t nDrawnActors = 0;
@@ -348,13 +352,18 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
             if (!cpa_anim_actor_open(&A, aim, &c->tables, ra->soVa) || !cpa_anim_rig_pose(&A, ra->anim, ra->frame, O->animMode, ra->matrix, rig)) { st->actorsFailed++; continue; }
             st->actorsPosed++;
             uint32_t mark = B.n, amark = B.an; Box box; memset(&box, 0, sizeof box);
-            CpaLight actL[CPA_RENDER_MAXLIGHTS]; B.curN = cpa_light_for_actor(aim, ra->soVa, B.lights, B.nLights, actL); B.curL = actL;   /* per-actor selection of the light list (cpa_light.h) */
+            CpaLight actL[CPA_RENDER_MAXLIGHTS], secL[CPA_RENDER_MAXLIGHTS]; const CpaLight *stack = B.lights; uint32_t nStack = B.nLights;
+            if (B.lighting && ra->sectorSO) { uint32_t ns = cpa_light_sector_lights(aim, ra->sectorSO, secL, CPA_RENDER_MAXLIGHTS); if (ns) { stack = secL; nStack = ns; } }   /* the sector's own stack (VERIFIED) beats the stale RAM array */
+            B.curN = cpa_light_for_actor(aim, ra->soVa, stack, nStack, actL); B.curL = actL;   /* per-actor selection of the light list (cpa_light.h) */
             cpa_light_env_default(&B.env); cpa_light_env_from_list(actL, B.curN, &B.env);
+            cpa_light_actor_alpha(aim, ra->soVa, in->hasSceneAlpha ? in->sceneAlpha : 1.0f, &B.env);   /* objAlpha / draw bit 3 of f_8c05f7a0 */
+            int transList = !(B.env.drawFlags & 8u) && B.env.objAlpha < 0.98f;                      /* translucent list decision, recomp_05 f_8c037xxx: bit 3 clear and objAlpha < 0.98 */
             for (unsigned ch = 0; ch < rig->pose.nCh; ch++) {
                 int obj = rig->pose.ch[ch].obj; if (obj < 0) continue;
                 uint32_t geo = cpa_anim_obj_geo(&A, obj); if (geo) actor_geo(&B, aim, geo, rig->objM[ch], rig->world[ch], &box, &st->actorElemSkipped);
             }
             if (!box.any || !cpa_vis_box_test(&fr, box.mn, box.mx)) { B.n = mark; B.an = amark; st->actorsBboxCulled++; continue; }
+            if (transList) for (uint32_t q = mark; q < B.n; q++) { RB *rb = &B.b[q]; rb->pass = CPA_PASS_TRANSLUCENT; rb->blend = CPA_BLEND_ALPHA; rb->alphaTest = 0; rb->cullBack = 0; }
             st->actorsDrawn++; st->actorBatches += B.n - mark;
         }
         free(rig);
@@ -365,7 +374,8 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
         const CpaDrawSprite *sp = &dl.sprites[i]; float q[12]; cpa_sprite_quad(&in->cam, sp, O->spriteHalfScale, q);
         if (!arena_reserve(&B, 6)) break;
         static const int tri[6] = { 0, 1, 2, 1, 3, 2 }; static const float quv[4][2] = { {0, 0}, {1, 0}, {0, 1}, {1, 1} };
-        for (int k = 0; k < 6; k++) { uint32_t o = B.an + (uint32_t)k; B.acol[o] = 0xFFFFFFFFu; memcpy(B.apos + 3 * (size_t)o, q + 3 * tri[k], 12); B.auv[2 * (size_t)o] = quv[tri[k]][0]; B.auv[2 * (size_t)o + 1] = quv[tri[k]][1]; }
+        uint32_t scol = (B.lighting && sp->src < S->nSprites) ? S->sprites[sp->src].col : 0xFFFFFFFFu;   /* cpa_sprites_light() result, white when not lit */
+        for (int k = 0; k < 6; k++) { uint32_t o = B.an + (uint32_t)k; B.acol[o] = scol; memcpy(B.apos + 3 * (size_t)o, q + 3 * tri[k], 12); B.auv[2 * (size_t)o] = quv[tri[k]][0]; B.auv[2 * (size_t)o + 1] = quv[tri[k]][1]; }
         RB *r = rb_new(&B); if (!r) break;
         r->first = B.an; r->count = 6; B.an += 6; r->arena = 1; r->source = CPA_SRC_SPRITE; r->texVa = sp->texVa; r->pass = sp->pass; r->blend = sp->blend; r->alphaTest = sp->alphaTest;
         r->cullBack = 0; r->wrapU = sp->wrapU; r->wrapV = sp->wrapV; st->spriteQuads++;
@@ -472,16 +482,25 @@ uint32_t cpa_render_submit(CpaRenderCtx *c, const CpaRenderFrame *f, const CpaRe
 #define VA_MASK 0x8C123B68u
 #define VA_FLAG_DBG 0x8C124740u
 
-typedef struct { CpaRenderActor *a; uint32_t n, cap, unposed; const CpaImage *im; const CpaAnimTables *T; } Walk;
+typedef struct { CpaRenderActor *a; uint32_t n, cap, unposed; const CpaImage *im; const CpaAnimTables *T; uint32_t map[1024][2]; uint32_t nmap; } Walk;
 static void ram_walk(Walk *W, uint32_t so, int depth, unsigned *budget) {
     if (depth > 40 || (*budget)++ > 20000) return;
     uint32_t type; if (!cpa_rd32(W->im, so, &type)) return;
+    if (type == CPA_SO_SECTOR) {            /* actor list of the sector (data +0: linked list of {actorSO*, next*}); the first sector that lists an actor is kept */
+        uint32_t d = cpa_u32(W->im, so + 4), node = cpa_is_ptr(W->im, d) ? cpa_u32(W->im, d) : 0;
+        for (unsigned k = 0; node && cpa_is_ptr(W->im, node) && k < 512; k++, node = cpa_u32(W->im, node + 4)) {
+            uint32_t aso = cpa_u32(W->im, node); int dup = 0;
+            if (!cpa_is_ptr(W->im, aso)) continue;
+            for (uint32_t m = 0; m < W->nmap; m++) if (W->map[m][0] == aso) dup = 1;
+            if (!dup && W->nmap < 1024) { W->map[W->nmap][0] = aso; W->map[W->nmap][1] = so; W->nmap++; }
+        }
+    }
     if (type == CPA_SO_ACTOR) {
         CpaAnimActor A; CpaAnimCur cur; float M[16];
         if (cpa_anim_actor_open(&A, W->im, W->T, so) && cpa_anim_read_matrix(W->im, cpa_u32(W->im, so + 0x24), M)) {
             if (A.chanList && cpa_anim_cur(&A, &cur)) {
                 if (W->n == W->cap) { uint32_t nc = W->cap ? W->cap * 2 : 128; CpaRenderActor *p = (CpaRenderActor *)realloc(W->a, nc * sizeof *p); if (!p) return; W->a = p; W->cap = nc; }
-                CpaRenderActor *r = &W->a[W->n++]; r->soVa = so; r->anim = cur.animIdx; r->frame = cur.frame; memcpy(r->matrix, M, 64);
+                CpaRenderActor *r = &W->a[W->n++]; r->sectorSO = 0; r->soVa = so; r->anim = cur.animIdx; r->frame = cur.frame; memcpy(r->matrix, M, 64);
             } else W->unposed++;
         }
     }
@@ -507,6 +526,7 @@ int cpa_render_input_from_ram(CpaFrameInput *in, CpaRenderActor **actors, uint32
     in->drawMask = cpa_u32(ram, VA_MASK); in->allowKind2 = (cpa_u32(ram, VA_FLAG_DBG) & 0xFF) == 1;
     Walk W; memset(&W, 0, sizeof W); W.im = ram; W.T = T; unsigned budget = 0;
     if (sc->img.nReg > 0) ram_walk(&W, cpa_u32(&sc->img, sc->img.reg[0].base + 13 * 4), 0, &budget);
+    for (uint32_t a = 0; a < W.n; a++) for (uint32_t m = 0; m < W.nmap; m++) if (W.map[m][0] == W.a[a].soVa) { W.a[a].sectorSO = W.map[m][1]; break; }
     *actors = W.a; in->actors = W.a; in->nActors = W.n; if (nUnposed) *nUnposed = W.unposed;
     in->nLights = cpa_light_read_ram_list(ram, in->lights, CPA_RENDER_MAXLIGHTS);      /* light list + distance-fade block of the guest (cpa_light.h; the fade enable flag is not decoded, see notes_lighting.md) */
     cpa_light_fade_from_ram(ram, &in->fade);

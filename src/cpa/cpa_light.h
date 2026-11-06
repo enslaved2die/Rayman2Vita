@@ -84,11 +84,14 @@ void cpa_light_obj_init(CpaLightObj *o, const float W[16]);
  * |lightPos - centre| - radius exceeds its outer range is skipped for the whole object (f_8c07b13e). */
 void cpa_light_obj_sphere(CpaLightObj *o, const CpaImage *im, uint32_t geo);
 /* Adds every enabled light of L[0..n) for one vertex given its LOCAL (geometry-space) position pLocal, its world position pWorld (as drawn, i.e. with the mirror) and stored normal nLocal.
- * Parallel: as cpa_light_accum at the unit world normal. Omni (f_8c07b892; decoded from the lifted code f_8c07b13e / f_8c07b400 / f_8c07b29a / f_8c07b6e0): first the object-level cull
+ * Parallel: f_8c07be60 arithmetic: a = light axis through the unit-row 3x3 of the channel world matrix (fma order of the guest), sd = n_local . a (n_local NOT renormalised), v -= sd * col when the
+ * sign bit of sd is set (INFERRED: unit rows; the guest multiplies the object matrix with the gbr+72 matrix, which is not modelled). Omni (f_8c07b892; decoded from the lifted code f_8c07b13e / f_8c07b400 / f_8c07b29a / f_8c07b6e0): first the object-level cull
  * (cpa_light_obj_sphere), then with d = |lightPos - pWorld|, s = matrix scale (max row length of the world 3x3, f_8c0163e6), o = outer range (+8), c = inner range (+0xC):
  *   noFalloff == 0 (+0x9e == 0): needs d < o; cos = max(0, -(dLocal . n) * s / d) with dLocal = pLocal - lightLocal; atten = cos for d < c, cos * (o^2 - d^2)/(o^2 - c^2) otherwise.
  *   noFalloff != 0 (+0x9e != 0): no normal term: atten = s for d < c (1.0 when d == 0), s * (o^2 - d^2)/(o^2 - c^2) for c <= d < o.
- * v += atten * colour (channels by chanMode). Spot / type 5 are not ported. Returns the number of enabled lights of an unported type. */
+ * v += atten * colour (channels by chanMode). Spot / type 5 are NOT ported: no sector light stack of any of the 73 level DATs contains one (census `light.mk light-census`, VERIFIED); the lifted
+ * handlers f_8c07b9a0 / f_8c07ba18 (spot: cull as omni by +8, cone data +0x18/+0x1C) and f_8c07c540 / f_8c07c3fa (type 5: range^2 = (+0xDC)^2, per-vertex light-space test) are only partly decoded.
+ * Returns the number of enabled lights of an unported type. */
 int cpa_light_accum_vertex(const CpaLight *L, uint32_t n, const CpaLightObj *o, const float pLocal[3], const float pWorld[3], const float nLocal[3], float v[4]);
 /* ---------------- which lights act on which object (decoded from the lifted draw path, see notes_lighting.md section 2) ----------------
  * The game keeps a light stack (0x8C2DD4B4, count 0x8C2DD964). While a sector is drawn (f_8c05f4a0 -> f_8c05ee70 / f_8c05f326 -> f_8c05eea8) the stack holds: the sector's own light list (sector data +20, linked list of
@@ -102,6 +105,21 @@ uint32_t cpa_light_for_actor(const CpaImage *im, uint32_t actorSO, const CpaLigh
 /* Object-wide part only (ambient lights): fills env->G from the list. */
 void cpa_light_env_from_list(const CpaLight *L, uint32_t n, CpaLightEnv *env);
 
+/* ---------------- object transparency (objAlpha) of an actor draw ----------------
+ * VERIFIED by reading the lifted code (recomp_09 f_8c05f7a0, the actor draw; recomp_01/02/13/18 callers of the setter f_8c0388c0): *0x8C143AB0 points to the 0x34-byte light-material block; its word 0
+ * is objAlpha = clamp(x / 255, 0, 1) written by the setter f_8c0388c0(x) (getter f_8c0388ea = objAlpha * 255). f_8c05f7a0, for every actor SuperObject so (draw-flag argument R6 = all ones for a normal draw):
+ *   F = [[[so+4]+4]+32]                                  (f_8c05689e, flag word of the actor's engine object)
+ *   F & 0x200000        : x = sceneAlpha * [so+0x38]   (sceneAlpha = float at 0x8C2E24CC via f_8c084808, 1.0 in every capture except Jail_10 where it is 0 and the bit is not set), draw bit 3 cleared
+ *   else [so+44] & 8 == 0: x = [so+0x38] (float), draw bit 3 cleared
+ *   else                 : objAlpha unchanged (1.0), draw flags |= 0xF8000000 (no effect on bits 3 / 26).
+ * The previous objAlpha is restored after the draw. objAlpha > 0.98 with bit 3 cleared still yields alpha 255 in cpa_light_argb; below that the draw goes to the translucent TA list.
+ * [so+0x38] is SuperObject state (initial value from the level data, changed by script/AI code: the setters of SetTransparency); the native engine supplies it from the SuperObject. */
+void cpa_light_actor_alpha(const CpaImage *im, uint32_t actorSO, float sceneAlpha, CpaLightEnv *env);
+/* sceneAlpha (global 0x8C2E24CC) is written by the object visibility test f_8c08480e (called from the sector actor loop, flags bit 0x20) from the distance-fade block at 0x8C0C85E4: D (far), E (width), k (slope):
+ * with fr5 = view-space depth of the actor sphere centre minus radius*scale: D == 0 -> 1.0 (no fade); fr5 > D -> 0 and the object is not drawn; fr5 <= D - E -> 1.0; else 1 - (fr5 - D + E) * k.
+ * Code-read INFERRED (D is 0 in every capture and g = 1 reproduces the oracle; the RAM word at the end of a frame is stale: 0 / 0.07 in Whale_10 while the drawn actors fit g = 1). */
+float cpa_light_dist_alpha(float depthMinusRadius, float D, float E, float k);
+
 /* ---------------- distance fade of additive geometry ---------------- */
 typedef struct CpaLightFade {
     int   enabled;
@@ -114,6 +132,8 @@ typedef struct CpaLightFade {
 int cpa_light_fade_alpha(const CpaLightFade *f, float zc, float objAlpha, int drawBit3);
 /* Applies the fade to a packed colour (only alpha changes) when f->enabled and the material is additive (texFlags & 0x20). */
 uint32_t cpa_light_fade_argb(const CpaLightFade *f, const CpaLightMat *m, uint32_t argb, float zc, float objAlpha);
+/* Same with the draw flags of the call (actors: draw bit 3 is cleared by cpa_light_actor_alpha, so objAlpha limits the faded alpha); env->objAlpha / env->drawFlags & material flags decide the bit. */
+uint32_t cpa_light_fade_argb_env(const CpaLightFade *f, const CpaLightMat *m, const CpaLightEnv *env, uint32_t argb, float zc);
 /* SHADOW MODE ONLY: reads the fade block from guest RAM (0x8C140EA4 flag, 0x8C140EA8 / 0x8C140EC0 blocks). Returns 1 if the block describes a fade (p1 > p0). */
 int cpa_light_fade_from_ram(const CpaImage *ram, CpaLightFade *f);
 

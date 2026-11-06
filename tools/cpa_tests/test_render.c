@@ -178,8 +178,28 @@ static void t_colors(void) {
     printf("colours: scene ARGB -> vertex stream, additive fade alpha, layer 2 white, colour array on base draws only\n");
 }
 
+
+/* lit sprite colour (CpaSprite.col from cpa_sprites_light) reaches the vertex stream; unlit (white) when lighting is off */
+static void t_sprite_color(void) {
+    CpaScene s; memset(&s, 0, sizeof s);
+    CpaSprite sp; memset(&sp, 0, sizeof sp); sp.pos[0] = 0; sp.pos[1] = 50; sp.pos[2] = 0; sp.sizeX = sp.sizeY = 2.0f; sp.texVa = 0x100; sp.texFlagsValid = 1; sp.tileU = sp.tileV = 1; sp.alphaClass = CPA_ALPHA_BLEND; sp.col = 0x80402010u;
+    s.sprites = &sp; s.nSprites = 1;
+    CpaRenderOpts o; cpa_render_opts_default(&o); CpaRenderCtx ctx; cpa_render_ctx_init(&ctx, &s, &o);
+    CpaFrameInput in; memset(&in, 0, sizeof in);
+    float cp[3] = { 0, 0, 0 }, up[3] = { 0, 0, 1 }, fw[3] = { 0, 1, 0 }; cpa_camera_from_rows(&in.cam, cp, up, fw, 1.2f, 0.75f); in.w = 640; in.h = 480; in.fit = CPA_FIT_HORPLUS;
+    CpaRenderFrame f; CHECK(cpa_render_build_frame(&ctx, &f, &in), "build");
+    int ok = 0; for (uint32_t v = 0; v < f.nVerts; v++) ok += f.verts[v].a == 0x80 && f.verts[v].r == 0x40 && f.verts[v].g == 0x20 && f.verts[v].b == 0x10;
+    CHECK(f.nVerts == 6 && ok == 6, "sprite quad carries CpaSprite.col (%d/%u)", ok, f.nVerts);
+    cpa_render_frame_free(&f);
+    CpaRenderOpts o2 = o; o2.useLighting = 0; CpaRenderCtx c2; cpa_render_ctx_init(&c2, &s, &o2); CpaRenderFrame f2; CHECK(cpa_render_build_frame(&c2, &f2, &in), "build");
+    int w = 0; for (uint32_t v = 0; v < f2.nVerts; v++) w += f2.verts[v].r == 255 && f2.verts[v].a == 255;
+    CHECK(w == (int)f2.nVerts && f2.nVerts == 6, "sprite colour ignored when lighting is off (%d)", w);
+    cpa_render_frame_free(&f2); cpa_render_ctx_free(&c2); cpa_render_ctx_free(&ctx);
+    printf("sprite colours: CpaSprite.col -> vertex stream (white with lighting off)\n");
+}
+
 int main(void) {
-    srand(1); t_matrices(); t_frame(); t_flagrule(); t_store(); t_colors();
+    srand(1); t_matrices(); t_frame(); t_flagrule(); t_store(); t_colors(); t_sprite_color();
     printf("test_render: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

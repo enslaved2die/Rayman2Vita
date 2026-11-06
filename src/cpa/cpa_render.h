@@ -16,7 +16,7 @@
  * Textures: CpaTexStore (below) decodes the level + FIX .TEX natively (cpa_tex, VERIFIED byte-exact) and serves them through opts.describe; pass/blend follow tex.flags (flagRule), wrap modes come
  * from the .TEX header wrap byte (MEASURED against the oracle TSP bits). Layer 2 draws with a SUBSTITUTE bump texture (INFERRED) - the real per-polygon bump lighting is not reproduced.
  * Vertex colours (cpa_light.h): static geometry from the level RLI + VisualMaterial (VERIFIED, lightcmp_static: 100% of the matched vertices of 7 levels, with the additive distance fade);
- * posed actors from the guest light list (parallel + ambient lights only; omni / spot lights UNKNOWN, measured 33-97% exact per level, see re_analysis/dc/notes_lighting.md).
+ * posed actors from the sector light stack (parallel, ambient and omni lights, per-actor selection and object transparency objAlpha, 83-100% exact ARGB per level; spot / type-5 lights: code-read port, no capture contains one), see re_analysis/dc/notes_lighting.md.
  * NOT modelled (honest list, see shadow report): omni / spot lights, fog (offset colour), shadows, particles/HUD quads, the real layer-2 bump coefficients and noise, animated-texture live frame
  * (native binds the load-time head frame), live moving static IPOs. */
 #ifndef CPA_RENDER_H
@@ -79,6 +79,8 @@ typedef struct CpaRenderActor {
     uint32_t soVa;              /* Actor SuperObject (type 2) */
     unsigned anim, frame;       /* animation index (H0) and absolute frame, i.e. cpa_anim_cur() of the guest */
     float    matrix[16];        /* actor-to-world, row vectors (the guest's global matrix of the SuperObject, SO+0x24) */
+    uint32_t sectorSO;          /* Sector SuperObject (type 4) whose actor list (data+0) holds this actor, 0 = unknown. When set (and actorImg readable), the actor is lit by cpa_light_sector_lights(sectorSO)
+                                   + cpa_light_for_actor instead of filtering the frame's RAM light list (VERIFIED selection, notes_lighting.md section 5). cpa_render_input_from_ram fills it */
 } CpaRenderActor;
 
 typedef struct CpaFrameInput {
@@ -90,6 +92,7 @@ typedef struct CpaFrameInput {
     const CpaRenderActor *actors; uint32_t nActors;
     const CpaImage *actorImg;             /* image the actors' tables/geometry are read from: NULL = scene->img (unposed-capable DAT data only) ; the guest RAM image for live actors */
     uint32_t nLights; CpaLight lights[CPA_RENDER_MAXLIGHTS];   /* light list for actors (cpa_light.h); empty = actors get the ambient-only colour of their material */
+    float sceneAlpha; int hasSceneAlpha;  /* g = guest 0x8C2E24CC (distance-fade alpha of the visibility test, cpa_light_dist_alpha) for the actors with SuperObject-flag 0x200000; hasSceneAlpha = 0 -> 1.0 */
     CpaLightFade fade;                    /* distance fade of additive static geometry (cpa_light.h); .enabled = 0 = off. Source of the parameters UNKNOWN (runtime state), see cpa_light.h */
 } CpaFrameInput;
 

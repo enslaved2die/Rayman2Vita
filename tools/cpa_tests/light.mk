@@ -2,6 +2,7 @@
 #   make -f light.mk test-light                                  : asset-free unit tests of cpa_light (formulas, RLI reader, fade, light accumulation)
 #   make -f light.mk light-static ASSETS=/path/to/assets/dc      : oracle comparison of the static-geometry vertex colours on the captures in build/ta2_<LEVEL>/ (no oracle run)
 #   make -f light.mk light-actor  ASSETS=/path/to/assets/dc      : oracle comparison of posed-actor vertex colours (parallel + ambient lights from the guest light list)
+#   make -f light.mk light-census ASSETS=...                      : light types in the sector stacks of every level DAT (LA_DATLIGHTS)
 # cpa_light.c is compiled into cpa_scene.c (see the comment there); it is not listed separately.
 CC      ?= cc
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -Wpedantic
@@ -28,4 +29,7 @@ build/lightcmp_actor: lightcmp_actor.c $(SRC) $(HDR)
 light-actor: build/lightcmp_actor
 	@for L in $(LEVELS); do ./build/lightcmp_actor build/ta2_$$L $(ASSETS)/DCDATA --level $$L --all --check; done
 
-.PHONY: test-light light-static light-actor
+light-census: build/lightcmp_actor
+	@for L in $$(ls $(ASSETS)/DCDATA); do if [ -f $(ASSETS)/DCDATA/$$L/$$L.DAT ]; then LA_DATLIGHTS=1 ./build/lightcmp_actor build/ta2_Learn_10 $(ASSETS)/DCDATA --level $$L 2>/dev/null | grep DATLIGHTS; fi; done; true
+
+.PHONY: test-light light-static light-actor light-census

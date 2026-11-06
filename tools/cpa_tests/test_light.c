@@ -105,8 +105,65 @@ static void t_fade(void) {
     f.enabled = 0; CHECK(cpa_light_fade_argb(&f, &ma, 0xFFFFFFFFu, 489.2f, 1.0f) == 0xFFFFFFFFu, "disabled fade");
 }
 
+/* ---------- object transparency, distance alpha, exact parallel arithmetic, fade with draw flags ---------- */
+static void t_actor_alpha(void) {
+    static uint8_t ram[0x1000]; memset(ram, 0, sizeof ram);
+    CpaImage im; cpa_image_init(&im); cpa_image_add(&im, ram, sizeof ram, BASE);
+    /* SuperObject @0x100: +4 -> data @0x200, data+4 -> @0x300, @0x300+32 = flag word F; SO+44, SO+0x38 float */
+    put32(ram, 0x104, BASE + 0x200); put32(ram, 0x204, BASE + 0x300);
+    CpaLightEnv e;
+    /* so44 bit 3 set (opaque): untouched */
+    put32(ram, 0x12C, 0xFFFFFFFFu); putf(ram, 0x138, 127.0f); put32(ram, 0x320, 0);
+    cpa_light_env_default(&e); cpa_light_actor_alpha(&im, BASE + 0x100, 1.0f, &e); CHECK(e.objAlpha == 1.0f && e.drawFlags == 0xFFFFFFFFu, "opaque actor keeps objAlpha 1 (%g)", e.objAlpha);
+    /* so44 bit 3 clear: objAlpha = [so+0x38] / 255, draw bit 3 cleared (Helic_30 / Nave_20 hero: 127 -> 0.498, TA alpha byte 0x7E) */
+    put32(ram, 0x12C, 0xFFFEFFF7u);
+    cpa_light_env_default(&e); cpa_light_actor_alpha(&im, BASE + 0x100, 1.0f, &e);
+    CHECK(fabsf(e.objAlpha - 0.49803922f) < 1e-6f && !(e.drawFlags & 8), "translucent actor objAlpha %.6f drawFlags %08x", e.objAlpha, e.drawFlags);
+    CpaLightMat mb = mat(0.1f, 0.5f, 0x4ddc07ffu, 0); float z4[4] = { 0, 0, 0, 0 };
+    uint32_t c = cpa_light_argb(&mb, &e, z4); CHECK((c >> 24) == 0x7E, "translucent hero alpha %02x (oracle 7E)", c >> 24);
+    putf(ram, 0x138, 255.0f); cpa_light_env_default(&e); cpa_light_actor_alpha(&im, BASE + 0x100, 1.0f, &e);
+    c = cpa_light_argb(&mb, &e, z4); CHECK(e.objAlpha > 0.98f && (c >> 24) == 255, "alpha 255 stays opaque (%.8g, %02x; 255 * (1/255f) is just below 1)", e.objAlpha, c >> 24);
+    putf(ram, 0x138, 400.0f); cpa_light_env_default(&e); cpa_light_actor_alpha(&im, BASE + 0x100, 1.0f, &e); CHECK(e.objAlpha == 1.0f, "clamped to 1 (%.8g)", e.objAlpha);
+    putf(ram, 0x138, -5.0f); cpa_light_env_default(&e); cpa_light_actor_alpha(&im, BASE + 0x100, 1.0f, &e); CHECK(e.objAlpha == 0.0f, "clamped to 0");
+    /* F & 0x200000: distance-fade alpha g times [so+0x38]; bit 3 of so44 is irrelevant */
+    put32(ram, 0x12C, 0xFFFFFFFFu); put32(ram, 0x320, 0x200000u); putf(ram, 0x138, 255.0f);
+    cpa_light_env_default(&e); cpa_light_actor_alpha(&im, BASE + 0x100, 0.25f, &e); CHECK(fabsf(e.objAlpha - 0.25f) < 1e-6f && !(e.drawFlags & 8), "g = 0.25 -> objAlpha %g", e.objAlpha);
+    cpa_light_env_default(&e); cpa_light_actor_alpha(&im, BASE + 0x100, 1.0f, &e); CHECK(e.objAlpha > 0.98f, "g = 1 -> opaque (%.8g)", e.objAlpha);
+    /* distance alpha of the visibility test */
+    CHECK(cpa_light_dist_alpha(500.f, 0.f, 0.f, 0.1f) == 1.0f, "D == 0 -> no fade");
+    CHECK(cpa_light_dist_alpha(1000.f, 800.f, 100.f, 0.01f) == 0.0f, "beyond D -> 0");
+    CHECK(cpa_light_dist_alpha(600.f, 800.f, 100.f, 0.01f) == 1.0f, "before D - E -> 1");
+    CHECK(fabsf(cpa_light_dist_alpha(750.f, 800.f, 100.f, 0.01f) - 0.5f) < 1e-6f, "midway -> %g", cpa_light_dist_alpha(750.f, 800.f, 100.f, 0.01f));
+    /* fade with the draw flags of an actor: draw bit 3 cleared + objAlpha 0.25 caps the faded alpha at trunc(0.25 * 255) = 63 */
+    CpaLightFade f; memset(&f, 0, sizeof f); f.enabled = 1; f.p[0] = 0; f.p[1] = 100; f.p[2] = 50000; f.p[3] = 0; f.p[4] = 0.0f;
+    CpaLightMat ma = mat(1.0f, 1.0f, 0x45dc03ffu, 0x20);
+    cpa_light_env_default(&e); e.objAlpha = 0.25f; e.drawFlags &= ~8u;
+    CHECK((cpa_light_fade_argb_env(&f, &ma, &e, 0xFFFFFFFFu, 50.f) >> 24) == 63, "fade capped by objAlpha: %u", cpa_light_fade_argb_env(&f, &ma, &e, 0xFFFFFFFFu, 50.f) >> 24);
+    cpa_light_env_default(&e); e.objAlpha = 0.25f;
+    CHECK((cpa_light_fade_argb_env(&f, &ma, &e, 0xFFFFFFFFu, 50.f) >> 24) == 255, "draw bit 3 set: objAlpha ignored (%u)", cpa_light_fade_argb_env(&f, &ma, &e, 0xFFFFFFFFu, 50.f) >> 24);
+}
+
+static void t_parallel_exact(void) {
+    CpaLight L; memset(&L, 0, sizeof L); L.type = CPA_LIGHT_PARALLEL; L.enabled = 1; L.axis[2] = -1.0f; for (int i = 0; i < 4; i++) L.col[i] = 0.5f * (float)(i + 1);
+    float W[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }; CpaLightObj o; cpa_light_obj_init(&o, W);
+    float p[3] = { 0, 0, 0 }, nUp[3] = { 0, 0, 1 }, v[4] = { 0, 0, 0, 0 };
+    CHECK(cpa_light_accum_vertex(&L, 1, &o, p, p, nUp, v) == 0 && v[0] == 0.5f && v[1] == 1.0f && v[2] == 1.5f && v[3] == 2.0f, "facing normal gets the whole colour (%g %g %g %g)", v[0], v[1], v[2], v[3]);
+    float nDn[3] = { 0, 0, -1 }, v2[4] = { 0, 0, 0, 0 }; cpa_light_accum_vertex(&L, 1, &o, p, p, nDn, v2); CHECK(v2[0] == 0 && v2[3] == 0, "back-facing normal gets nothing");
+    float W2[16] = { 3, 0, 0, 0, 0, 3, 0, 0, 0, 0, 3, 0, 0, 0, 0, 1 }; CpaLightObj o2; cpa_light_obj_init(&o2, W2); float v3[4] = { 0, 0, 0, 0 };
+    cpa_light_accum_vertex(&L, 1, &o2, p, p, nUp, v3); CHECK(v3[0] == 0.5f, "matrix scale does not scale the light (rows are normalised): %g", v3[0]);
+    /* rotated object: 90 degrees about x maps local +y to world +z; the light shines along -z so a local normal +y faces it */
+    float R[16] = { 1, 0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1 }; CpaLightObj o3; cpa_light_obj_init(&o3, R); float ny[3] = { 0, 1, 0 }, v4[4] = { 0, 0, 0, 0 };
+    cpa_light_accum_vertex(&L, 1, &o3, p, p, ny, v4); CHECK(fabsf(v4[0] - 0.5f) < 1e-6f, "rotated object: local +y normal faces the light (%g)", v4[0]);
+    /* channel modes: alpha only / RGB only */
+    L.chanMode = 1; float v5[4] = { 0, 0, 0, 0 }; cpa_light_accum_vertex(&L, 1, &o, p, p, nUp, v5); CHECK(v5[0] == 0 && v5[3] == 2.0f, "mode 1 = alpha only");
+    L.chanMode = 2; float v6[4] = { 0, 0, 0, 0 }; cpa_light_accum_vertex(&L, 1, &o, p, p, nUp, v6); CHECK(v6[0] == 0.5f && v6[3] == 0, "mode 2 = RGB only");
+    /* spot / type-5 lights are reported as not ported (decode of f_8c07ba18 / f_8c07c540 not completed) */
+    CpaLight sp = L; sp.type = CPA_LIGHT_SPOT; sp.chanMode = 0; float v7[4] = { 0, 0, 0, 0 };
+    CHECK(cpa_light_accum_vertex(&sp, 1, &o, p, p, nUp, v7) == 1 && v7[0] == 0, "spot light is counted as unported and adds nothing");
+}
+
 int main(void) {
-    t_material(); t_rli_and_lights(); t_fade();
+    t_material(); t_rli_and_lights(); t_fade(); t_actor_alpha(); t_parallel_exact();
     printf("test_light: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

@@ -17,6 +17,24 @@ int cpa_light_mat_read(const CpaImage *im, uint32_t vm, CpaLightMat *m) {
     m->valid = 1; return 1;
 }
 
+void cpa_light_actor_alpha(const CpaImage *im, uint32_t so, float sceneAlpha, CpaLightEnv *e) {
+    uint32_t d = cpa_u32(im, so + 4), d2 = cpa_is_ptr(im, d) ? cpa_u32(im, d + 4) : 0, F = cpa_is_ptr(im, d2) ? cpa_u32(im, d2 + 32) : 0;
+    float x = 0.0f; int tr = 0;
+    if (F & 0x200000u) { x = sceneAlpha * cpa_f32(im, so + 0x38); tr = 1; }
+    else if (!(cpa_u32(im, so + 44) & 8u)) { x = cpa_f32(im, so + 0x38); tr = 1; }
+    if (!tr) return;
+    x *= 0.003921568393707275f;                                   /* 1/255 as the float constant at 0x8C038948 */
+    e->objAlpha = x > 1.0f ? 1.0f : x < 0.0f ? 0.0f : x;
+    e->drawFlags &= ~8u;
+}
+
+float cpa_light_dist_alpha(float fr5, float D, float E, float k) {
+    if (D == 0.0f) return 1.0f;
+    if (fr5 > D) return 0.0f;
+    if (!(fr5 > D - E)) return 1.0f;
+    return 1.0f - (fr5 - D + E) * k;
+}
+
 void cpa_light_env_default(CpaLightEnv *e) { memset(e, 0, sizeof *e); e->objAlpha = 1.0f; e->drawFlags = 0xFFFFFFFFu; }
 
 /* f_8c038abe + the packer family (f_8c07dc28 / f_8c07d948 ...). Float operations in the guest's order; fmac is fused (the host oracle uses fmaf). */
@@ -126,14 +144,20 @@ static void add_chan(const CpaLight *L, float s, float v[4]) {
 }
 
 int cpa_light_accum_vertex(const CpaLight *L, uint32_t n, const CpaLightObj *o, const float pLocal[3], const float pWorld[3], const float nLocal[3], float v[4]) {
-    int unported = 0; float nW[3];
-    for (int a = 0; a < 3; a++) nW[a] = nLocal[0] * o->W[a] + nLocal[1] * o->W[4 + a] + nLocal[2] * o->W[8 + a];
-    { float l2 = sqrtf(nW[0] * nW[0] + nW[1] * nW[1] + nW[2] * nW[2]); if (l2 > 1e-6f) for (int a = 0; a < 3; a++) nW[a] /= l2; }
+    int unported = 0;
     for (uint32_t i = 0; i < n; i++) {
         const CpaLight *l = &L[i];
         if (!l->enabled) continue;
         if (l->type == CPA_LIGHT_AMBIENT) continue;
-        if (l->type == CPA_LIGHT_PARALLEL) { cpa_light_accum(l, nW, v, NULL); continue; }
+        if (l->type == CPA_LIGHT_PARALLEL) {
+            /* f_8c07be60 arithmetic (fma order of the guest): a = axis through the object 3x3 with unit rows (INFERRED: row-normalised fits 96.8% vs 92.6% unnormalised / 93.9% single scale on Learn_10;
+             * the guest's matrix product is object-matrix x gbr+72 matrix, the latter not modelled), sd = n_local . a, v -= sd * col only when the sign bit of sd is set. */
+            float Wn[12]; const float *W = o->W, *x = l->axis;
+            for (int r = 0; r < 3; r++) { float ln = sqrtf(W[4*r]*W[4*r] + W[4*r+1]*W[4*r+1] + W[4*r+2]*W[4*r+2]); if (ln < 1e-6f || fabsf(ln - 1.0f) < 2e-4f) ln = 1.0f; for (int k = 0; k < 3; k++) Wn[4*r+k] = W[4*r+k] / ln; }
+            float ax = fmaf(x[2], Wn[2], fmaf(x[0], Wn[0], Wn[1] * x[1])), ay = fmaf(x[2], Wn[6], fmaf(x[0], Wn[4], Wn[5] * x[1])), az = fmaf(x[2], Wn[10], fmaf(x[0], Wn[8], Wn[9] * x[1]));
+            float sd = fmaf(nLocal[2], az, fmaf(nLocal[1], ay, nLocal[0] * ax));
+            if (signbit(sd)) { if (l->chanMode == 1) v[3] -= sd * l->col[3]; else { for (int c = 0; c < 3; c++) v[c] -= sd * l->col[c]; if (l->chanMode == 0) v[3] -= sd * l->col[3]; } }
+            continue; }
         if (l->type != CPA_LIGHT_OMNI) { unported++; continue; }
         if (o->cull) { float e[3] = { l->pos[0] - o->cW[0], l->pos[1] - o->cW[1], l->pos[2] - o->cW[2] };
             if (sqrtf(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]) - o->rW > l->param[0]) continue; }
@@ -222,6 +246,13 @@ int cpa_light_fade_alpha(const CpaLightFade *f, float zc, float objAlpha, int dr
 uint32_t cpa_light_fade_argb(const CpaLightFade *f, const CpaLightMat *m, uint32_t argb, float zc, float objAlpha) {
     if (!f || !f->enabled || !(m->texFlags & 0x20)) return argb;
     int a = cpa_light_fade_alpha(f, zc, objAlpha, (m->flags & 8) != 0);
+    if (a < 0) a = 0; if (a > 255) a = 255;
+    return (argb & 0x00FFFFFFu) | ((uint32_t)a << 24);
+}
+
+uint32_t cpa_light_fade_argb_env(const CpaLightFade *f, const CpaLightMat *m, const CpaLightEnv *env, uint32_t argb, float zc) {
+    if (!f || !f->enabled || !(m->texFlags & 0x20)) return argb;
+    int a = cpa_light_fade_alpha(f, zc, env->objAlpha, (m->flags & env->drawFlags & 8) != 0);
     if (a < 0) a = 0; if (a > 255) a = 255;
     return (argb & 0x00FFFFFFu) | ((uint32_t)a << 24);
 }

@@ -68,6 +68,10 @@ typedef struct CpaRigPart {
     float   *lpos;                /* 9 floats / tri, channel-local space (static) */
     float   *uv;                  /* 6 floats / tri */
     float   *wpos;                /* 9 floats / tri, world space after cpa_rig_pose() */
+    uint32_t geoVa;               /* GeometricObject of the part (vertex normals at geo+4, bounding sphere geo+0x34) */
+    uint32_t lmIdx;               /* index into CpaScene.lmat (VisualMaterial of the element), 0xFFFFFFFF = none */
+    uint16_t *vidx;               /* 3 geometry vertex indices / tri (lighting needs the stored vertex normal) */
+    uint32_t *col;                /* 3 packed ARGB / tri after cpa_rig_light(), NULL before (cpa_light.h) */
 } CpaRigPart;
 
 typedef struct CpaRig {
@@ -84,6 +88,9 @@ typedef struct CpaRig {
     int      placement;           /* 0 = SO global matrix; 1 = header-word-25 block matrix (INFERRED spawn) */
     CpaRigPart *part; uint32_t nPart, nTris;
     float    pmin[3], pmax[3];    /* world bbox of last pose */
+    int      posed;               /* cpa_rig_pose() has run: chW below is valid */
+    float    chW[CPA_RIG_MAXCH][16];/* per channel UNMIRRORED world matrix of the last pose (CpaAnimRig.world[ch]; the matrix the lighting uses, cpa_light.h) */
+    float    objAlpha;            /* object transparency of the last cpa_rig_light() (1 = opaque, cpa_light_actor_alpha) */
 } CpaRig;
 
 /* Sprite element (GeometricObject element type 3). One per element. Layout evidenced on 130 elements in 3 levels (Bast_10 53, Jail_10 32, Learn_10 45; all in
@@ -101,6 +108,8 @@ typedef struct CpaSprite {
     uint32_t geoVa;
     float    local[3];       /* the vertex before the SO matrix (geometry-local) */
     uint32_t soVa;           /* SuperObject the walk was at when it first reached this geometry (actor geometries are de-duplicated: other owners are not listed) */
+    uint32_t vm;             /* VisualMaterial (element[0]) */
+    uint32_t col;            /* packed ARGB after cpa_sprites_light() (0xFFFFFFFF before). UNVERIFIED: the oracle captures contain no sprite strips */
 } CpaSprite;
 
 typedef struct CpaScene {
@@ -156,6 +165,16 @@ void cpa_scene_free(CpaScene *s);
 /* Evaluate Rayman's animation at fractional frame ft in [firstFrame, firstFrame+nFrames-1] and fill rig part wpos.
  * Structure (table walk, quaternion decode, key/next-key t) VERIFIED against decompile; slerp/lerp itself INFERRED. */
 void cpa_rig_pose(CpaScene *s, float ft);
+
+/* Lights Rayman's rig parts through cpa_light (same arithmetic as the posed actors of cpa_render / lightcmp_actor): lights = the sector stack of Rayman's sector
+ * (cpa_light_sector_lights) or any list; the per-actor selection (cpa_light_for_actor on R->soVa), the ambient G, the object transparency (cpa_light_actor_alpha with sceneAlpha,
+ * 1.0 when unknown) and the per-vertex accumulation (parallel + omni, world matrix = the unmirrored channel matrix of the last cpa_rig_pose) fill part[i].col (3 ARGB per
+ * triangle, same layout as wpos) and rig.objAlpha. Needs cpa_rig_pose() first (returns 0 otherwise). Returns the number of lit vertices.
+ * VERIFIED only through the shared code path: cpa_light is checked on the posed actors of the TA captures (lightcmp_actor), this function re-uses it on the DAT's rig geometry. */
+uint32_t cpa_rig_light(CpaScene *s, const CpaLight *lights, uint32_t nLights, float sceneAlpha);
+/* Lights the type-3 sprite elements: ambient G of the selected lights and positional (no-normal) omni terms at the sprite position, v from lights with a zero normal. UNVERIFIED (no
+ * oracle sprite strips). Fills sprites[i].col. Returns the number lit. */
+uint32_t cpa_sprites_light(CpaScene *s, const CpaLight *lights, uint32_t nLights, float sceneAlpha);
 
 /* ---- .TEX post-load texture state ------------------------------------------------------------------------------------------------------------------------------
  * The guest TEX loader (FUN_8c039f80 -> FUN_8c03a502 per texture, lifted in tools/sh4recomp/gen_fix/recomp_05.c) rewrites the texture struct from the .TEX file:

@@ -78,6 +78,7 @@ static int match(const NList *l, const OTri *o, double tol, double ztol, int *pi
     return -1;
 }
 typedef struct { uint32_t so; uint32_t n; CpaLight L[64]; int have; } LSet;
+static unsigned g_ltype[8], g_stype[8];
 static LSet g_ls[512]; static unsigned g_nls;
 static LSet *ls_find(uint32_t so) { for (unsigned i = 0; i < g_nls; i++) if (g_ls[i].so == so) return &g_ls[i]; return NULL; }
 typedef struct { const CpaImage *im; const CpaAnimTables *T; const Cam *cam; NList *posed; } Ctx;
@@ -94,11 +95,11 @@ static void walk(Ctx *c, uint32_t va, int depth, unsigned *n) {
     if (depth > 40 || (*n)++ > 20000) return;
     uint32_t type, ch; if (!cpa_rd32(c->im, va, &type)) return;
     if (type == 4) {          /* sector: its actor list (data +0) is drawn with the sector's light stack */
-        CpaLight *sl = malloc(64 * sizeof *sl); uint32_t ns = cpa_light_sector_lights(c->im, va, sl, 64), d = cpa_u32(c->im, va + 4);
+        CpaLight *sl = malloc(64 * sizeof *sl); uint32_t ns = cpa_light_sector_lights(c->im, va, sl, 64), d = cpa_u32(c->im, va + 4); if (getenv("LA_TYPES")) for (uint32_t k = 0; k < ns; k++) g_stype[sl[k].type & 7]++;
         uint32_t node = cpa_is_ptr(c->im, d) ? cpa_u32(c->im, d) : 0;
         for (unsigned k = 0; node && cpa_is_ptr(c->im, node) && k < 512; k++, node = cpa_u32(c->im, node + 4)) {
-            uint32_t aso = cpa_u32(c->im, node); if (!cpa_is_ptr(c->im, aso) || ls_find(aso) || g_nls >= 512) continue;
-            LSet *e = &g_ls[g_nls++]; e->so = aso; e->have = 1; e->n = cpa_light_for_actor(c->im, aso, sl, ns, e->L);
+            uint32_t aso = cpa_u32(c->im, node); if (getenv("LA_SECT") && cpa_is_ptr(c->im, aso)) { printf("S sector %08X actor %08X nlights %u:", va, aso, ns); for (uint32_t q = 0; q < ns; q++) printf(" %08X/t%d/e%d/c(%.2f %.2f %.2f)", sl[q].va, sl[q].type, sl[q].enabled, sl[q].col[0], sl[q].col[1], sl[q].col[2]); printf("\n"); } if (!cpa_is_ptr(c->im, aso) || ls_find(aso) || g_nls >= 512) continue;
+            LSet *e = &g_ls[g_nls++]; e->so = aso; e->have = 1; e->n = cpa_light_for_actor(c->im, aso, sl, ns, e->L); if (getenv("LA_TYPES")) for (uint32_t k = 0; k < e->n; k++) g_ltype[e->L[k].type & 7]++;
         }
         free(sl);
     }
@@ -128,6 +129,15 @@ int main(int argc, char **argv) {
     char lvlp[1100], up[64]; snprintf(up, sizeof up, "%s", level); for (char *c = up; *c; c++) *c = (char)toupper((unsigned char)*c); snprintf(lvlp, sizeof lvlp, "%s/%s/%s.DAT", dcdata, up, up);
     uint8_t *lvl; size_t lvlN; if (!cpa_read_file(lvlp, &lvl, &lvlN)) return 2;
     CpaAnimTables T; if (!cpa_anim_tables_from_header(lvl, lvlN, &T)) return 2;
+    if (getenv("LA_DATLIGHTS")) {      /* census of the light types in all sector stacks of the level DAT (not only the 12 captured scenes) */
+        CpaImage di; cpa_image_init(&di); unsigned cnt[8] = { 0 }, nsect = 0, bud = 0; static uint32_t stk[8192]; unsigned sp = 0; uint32_t seen[512]; unsigned nseen = 0;
+        if (cpa_image_add_dat(&di, CPA_DAT_LEVEL, lvl, lvlN)) { uint32_t rt; memcpy(&rt, lvl + 13 * 4, 4); stk[sp++] = rt;
+            while (sp && bud++ < 200000) { uint32_t so = stk[--sp]; if (!cpa_is_ptr(&di, so)) continue;
+                if (cpa_u32(&di, so) == 4) { CpaLight tmp[64]; uint32_t n = cpa_light_sector_lights(&di, so, tmp, 64); nsect++;
+                    for (uint32_t i = 0; i < n; i++) { int dup = 0; for (unsigned k = 0; k < nseen; k++) dup |= seen[k] == tmp[i].va; if (!dup && nseen < 512) { seen[nseen++] = tmp[i].va; cnt[tmp[i].type & 7]++; } } }
+                uint32_t ch = cpa_u32(&di, so + 8); for (unsigned k = 0; ch && k < 4000 && cpa_is_ptr(&di, ch) && sp < 8100; k++) { stk[sp++] = ch; ch = cpa_u32(&di, ch + 0x14); } } }
+        printf("DATLIGHTS %s sectors %u distinct lights: parallel %u omni %u spot %u ambient %u type5 %u\n", level, nsect, cnt[1], cnt[2], cnt[3], cnt[4], cnt[5]);
+    }
     for (int si = 0; si < ns; si++) {
         long sc = scenes[si]; char p[1100]; size_t n; long rs = sc - 1;
         snprintf(p, sizeof p, "%s/ram_%ld.bin", capdir, rs); FILE *t = fopen(p, "rb"); if (t) fclose(t); else rs = sc;
@@ -157,9 +167,12 @@ int main(int argc, char **argv) {
                         float pl[3] = { 0, 0, 0 }; { uint32_t pvv = cpa_u32(&im, q->geo); for (int a = 0; a < 3; a++) pl[a] = cpa_f32(&im, pvv + q->vi[qj] * 12u + a * 4u); }
                         (void)nW; CpaLightObj ob_; cpa_light_obj_init(&ob_, getenv("LA_MIRROR") ? q->M : q->W); if (!getenv("LA_NOCULL")) cpa_light_obj_sphere(&ob_, &im, q->geo);
                         const CpaLight *useL = lights; uint32_t useN = nl_; { LSet *ls = getenv("LA_RAMLIST") ? NULL : ls_find(q->so); if (ls) { useL = ls->L; useN = ls->n; } else g_t.noSector++; }
-                        cpa_light_env_default(&env); cpa_light_env_from_list(useL, useN, &env);
+                        cpa_light_env_default(&env); cpa_light_env_from_list(useL, useN, &env); if (!getenv("LA_NOALPHA")) cpa_light_actor_alpha(&im, q->so, (getenv("LA_RAMG") ? cpa_f32(&im, 0x8C2E24CCu) : 1.0f), &env);
                         int unimpl = cpa_light_accum_vertex(useL, useN, &ob_, pl, q->wp[qj], nl, vv); if (unimpl) for (uint32_t li = 0; li < nl_; li++) if (lights[li].enabled && lights[li].type != 1 && lights[li].type != 2 && lights[li].type != 4) g_t.unimplType[lights[li].type & 7]++;
                         uint32_t c = cpa_light_argb(&lm, &env, vv);
+                        if (!getenv("LA_NOFADE")) { CpaLightFade fd; if (cpa_light_fade_from_ram(&im, &fd)) { float zc = (float)(cam.F[0] * (q->wp[qj][0] - cam.C[0]) + cam.F[1] * (q->wp[qj][1] - cam.C[1]) + cam.F[2] * (q->wp[qj][2] - cam.C[2])); c = cpa_light_fade_argb_env(&fd, &lm, &env, c, zc); } }
+                        if (getenv("LA_DBG3") && c != ob) { uint32_t d1 = cpa_u32(&im, q->so + 4), d2 = cpa_is_ptr(&im, d1) ? cpa_u32(&im, d1 + 4) : 0, F = cpa_is_ptr(&im, d2) ? cpa_u32(&im, d2 + 32) : 0;
+                            printf("A sc %ld so %08X so44 %08X so48 %08X F %08X a38 %g objA %g list %u vm %08X vmflags %08X tex %08X ob %08X got %08X\n", sc, q->so, cpa_u32(&im, q->so + 44), cpa_u32(&im, q->so + 48), F, cpa_f32(&im, q->so + 0x38), env.objAlpha, s->list, q->vm, lm.flags, lm.texFlags, ob, c); }
                         if (getenv("LA_DBG2")) { float iv[3]; for (int a = 0; a < 3; a++) { float amb = lm.amb[a] + lm.dif[a] * env.G[a]; iv[a] = lm.dif[a] > 1e-6f ? ((float)((ob >> (16 - 8 * a)) & 255) / 510.f - amb) / lm.dif[a] : 0; }
                             printf("D sc %ld so %08X geo %08X vi %u vm %08X wp(%.1f %.1f %.1f) n(%.2f %.2f %.2f) imp(%.3f %.3f %.3f) got(%.3f %.3f %.3f) ob %08X c %08X dif %.2f amb %.2f\n", sc, q->so, q->geo, q->vi[qj], q->vm, q->wp[qj][0], q->wp[qj][1], q->wp[qj][2], nl[0], nl[1], nl[2], iv[0], iv[1], iv[2], vv[0], vv[1], vv[2], ob, c, lm.dif[0], lm.amb[0]); }
                         int ch[4] = { (int)(c >> 24), (int)(c >> 16 & 255), (int)(c >> 8 & 255), (int)(c & 255) }, oc[4] = { (int)(ob >> 24), (int)(ob >> 16 & 255), (int)(ob >> 8 & 255), (int)(ob & 255) }, me = 0;
@@ -185,6 +198,7 @@ int main(int argc, char **argv) {
                g_t.errHist[0], g_t.errHist[1], g_t.errHist[2], g_t.errHist[3], g_t.errHist[4], g_t.maxErr, m - g_t.exact, g_t.unimplLights, g_t.satObs, g_t.other, g_t.nLightSets, g_t.unimplType[2], g_t.unimplType[3], g_t.unimplType[5]);
     }
     if (g_check) printf("  [actor vertices whose actor is not in any sector list (fallback: guest light list): %u]\n", g_t.noSector);
+    if (getenv("LA_TYPES")) printf("  sector stacks: par %u omni %u spot %u amb %u t5 %u\n", g_stype[1], g_stype[2], g_stype[3], g_stype[4], g_stype[5]); printf("  light types in per-actor lists (count over actors): par %u omni %u spot %u amb %u t5 %u\n", g_ltype[1], g_ltype[2], g_ltype[3], g_ltype[4], g_ltype[5]);
     free(lvl);
     return 0;
 }

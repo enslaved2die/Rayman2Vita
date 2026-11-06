@@ -149,6 +149,45 @@ int main(int argc, char **argv) {
         }
     }
 
+    printf("lighting of the rig and of the sprites through cpa_light (cpa_rig_light / cpa_sprites_light):\n");
+    {
+        static CpaLight pool[256]; uint32_t np = 0, nsect = 0;
+        /* every sector SuperObject (type 4) of the level: collect its light stack (cpa_light_sector_lights), de-duplicated */
+        uint32_t stack[4096]; uint32_t sp = 0, budget = 0;
+        stack[sp++] = cpa_u32(&img, img.reg[0].base + 13 * 4);
+        while (sp && budget++ < 100000) {
+            uint32_t so = stack[--sp]; if (!cpa_is_ptr(&img, so)) continue;
+            if (cpa_u32(&img, so) == CPA_SO_SECTOR) { CpaLight tmp[64]; uint32_t n = cpa_light_sector_lights(&img, so, tmp, 64); nsect++;
+                for (uint32_t i = 0; i < n; i++) { int dup = 0; for (uint32_t k = 0; k < np; k++) dup |= pool[k].va == tmp[i].va; if (!dup && np < 256) pool[np++] = tmp[i]; } }
+            uint32_t ch = cpa_u32(&img, so + 8);
+            for (unsigned k = 0; ch && k < 4000 && cpa_is_ptr(&img, ch) && sp < 4090; k++) { stack[sp++] = ch; ch = cpa_u32(&img, ch + 0x14); }
+        }
+        printf("  info: %u sectors, %u distinct lights in their stacks\n", nsect, np);
+        check_true("the level DAT holds sector light lists", nsect > 0 && np > 0);
+        cpa_rig_pose(&s, (float)s.rig.firstFrame);
+        check_true("rig parts are not lit before cpa_rig_light", s.rig.part[0].col == NULL);
+        uint32_t litNone = cpa_rig_light(&s, NULL, 0, 1.0f);
+        check_u("cpa_rig_light(no lights) lights every rig vertex", s.rig.nTris * 3ul, litNone);
+        uint32_t amb = 0, white = 0, nv0 = 0; uint32_t *ambCol = (uint32_t *)malloc(sizeof(uint32_t) * (s.rig.nTris * 3u + 1)); uint32_t q = 0;
+        for (uint32_t i = 0; i < s.rig.nPart; i++) for (uint32_t v = 0; v < s.rig.part[i].nTri * 3; v++) { uint32_t c = s.rig.part[i].col[v]; ambCol[q++] = c; nv0++; white += c == 0xFFFFFFFFu; amb += (c >> 24) != 0; }
+        check_true("no-light colours are material colours (not all opaque white placeholders)", white < nv0 && amb == nv0);
+        uint32_t litAll = cpa_rig_light(&s, pool, np, 1.0f);
+        check_u("cpa_rig_light(sector lights) lights every rig vertex", s.rig.nTris * 3ul, litAll);
+        uint32_t brighter = 0, darker = 0; q = 0;
+        for (uint32_t i = 0; i < s.rig.nPart; i++) for (uint32_t v = 0; v < s.rig.part[i].nTri * 3; v++, q++) {
+            uint32_t c = s.rig.part[i].col[v], a = ambCol[q];
+            int dr = (int)((c >> 16) & 255) - (int)((a >> 16) & 255); brighter += dr > 0; darker += dr < 0; }
+        check_true("lights brighten rig vertices and darken none (parallel/omni/ambient only add)", brighter > 0 && darker == 0);
+        check_true("object transparency of Rayman at rest is opaque", s.rig.objAlpha > 0.98f);
+        printf("  info: rig vertices %u: brighter than ambient-only %u\n", s.rig.nTris * 3u, brighter);
+        free(ambCol);
+        uint32_t ls = cpa_sprites_light(&s, pool, np, 1.0f);
+        check_u("sprites lit", s.nSprites, ls);
+        uint32_t spWhite = 0, spAdd = 0, spNon = 0; for (uint32_t i = 0; i < s.nSprites; i++) { spWhite += s.sprites[i].col == 0xFFFFFFFFu; spAdd += (s.sprites[i].texFlags & 0x20) != 0; spNon += (s.sprites[i].col >> 24) == 0; }
+        printf("  info: sprites %u: additive %u, white result %u\n", s.nSprites, spAdd, spWhite);
+        check_true("additive sprite materials take the constant-colour branch (white), all others are lit colours", spWhite >= spAdd && spNon == 0);
+    }
+
     printf("second texture layer (VisualMaterial+0x149 overlayMode) and sprites (element type 3):\n");
     {   /* expected numbers counted independently by a Python walk of the same DAT (IPO -> PO -> VisualSet -> Geo -> type-1 elements -> GameMaterial -> VisualMaterial byte +0x149) */
         uint32_t tri[4] = { 0, 0, 0, 0 }, items[4] = { 0, 0, 0, 0 }, bad = 0;
