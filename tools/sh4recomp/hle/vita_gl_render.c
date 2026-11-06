@@ -25,6 +25,9 @@
 #include "ta.h"
 #include "texmap.h"
 #include "perf.h"
+#ifdef R2_NATIVE_GFX
+#include "native_hook.h"
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -102,6 +105,7 @@ typedef struct RenderJob {
     TaFrame *frame;                     /* owned by the job: freed by the render side after drawing (NULL until parsed when raw != NULL) */
     TaRaw *raw; uint32_t shad_scale;    /* deferred parse: captured packets, parsed by the render thread; FPU_SHAD_SCALE as of STARTRENDER */
     int is_fb; uint32_t fb_off;         /* direct frame-buffer presentation job (swirl / loading vignet) */
+    void *native;                       /* R2_NATIVE_GFX: NatJob built by native_hook_frame (NULL = draw the TA frame as usual) */
     int is_cap;                         /* scene-capture job: read the presented (front) buffer back into s_scene565 (base image of the swirl transition) */
     uint32_t regs[2048];                /* PVR register file 0x5F8000..0x5F9FFF at STARTRENDER (palette RAM at word 0x400, fog table at 0x80 ...) */
     float bg[3][4]; uint32_t bg_isp, bg_tsp, bg_tcw; int have_bg;   /* ISP_BACKGND plane (lives in VRAM) */
@@ -1217,6 +1221,10 @@ static int s_job_next;                              /* guest: next ring slot to 
 static int s_rt_on;                                 /* 1: render thread running */
 
 /* GUEST: build the job for `frame`: textures, register snapshot, background plane, wide flag */
+#ifdef R2_NATIVE_GFX
+static void *s_pending_native;      /* guest thread: handed to the next prepare_job */
+void vita_gl_set_pending_native(void *job) { s_pending_native = job; }
+#endif
 static RenderJob *prepare_job(TaFrame *frame, TaRaw *raw, uint32_t shad)
 {
     RenderJob *j = &s_jobs[s_job_next];
@@ -1224,6 +1232,11 @@ static RenderJob *prepare_job(TaFrame *frame, TaRaw *raw, uint32_t shad)
     s_gframe_no++;
     j->is_fb = 0; j->fb_off = 0; j->is_cap = 0;
     j->frame = frame; j->raw = raw; j->shad_scale = shad; j->nops = 0; j->nrefs = 0;
+#ifdef R2_NATIVE_GFX
+    j->native = s_pending_native; s_pending_native = NULL;
+#else
+    j->native = NULL;
+#endif
     memcpy(j->regs, hle_pvr_regs(), sizeof j->regs);
     j->have_bg = hle_ta_background(j->bg, &j->bg_isp, &j->bg_tsp, &j->bg_tcw);
     j->wide = hle_ta_wide_active();
@@ -1371,6 +1384,16 @@ static void render_job_exec(RenderJob *j)
 #endif
         return;
     }
+#ifdef R2_NATIVE_GFX
+    if (j->native) {      /* native renderer draws this frame instead of the TA strips; the guest texture ops still run so the TA path's texture cache stays consistent */
+        s_frame_no++; vita_gl_perf.frames++;
+        render_exec_ops(j); gc_reset();
+        native_hook_render(j->native); j->native = NULL;
+        s_cur_tex = (GLuint)-1; gc_reset();
+        if (fp_saved != j->fpmode) fp_set(fp_saved);
+        return;
+    }
+#endif
     vita_gl_render_frame_impl(j);
     if (fp_saved != j->fpmode) fp_set(fp_saved);
 #if R2_PERF

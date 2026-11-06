@@ -17,6 +17,7 @@ APP_VER         := 01.00
 
 BUILD_DIR       := build_vita
 RECOMP_DIR      := tools/sh4recomp
+CPA_DIR         := src/cpa
 HGEN            := $(RECOMP_DIR)/gen_fix
 HLE_DIR         := $(RECOMP_DIR)/hle
 
@@ -145,6 +146,21 @@ SND_SRC         ?= $(HLE_DIR)/snd_cleanroom.c
 EXTRA_OBJS      += $(BUILD_DIR)/snd_vita.o
 else
 SND_SRC         ?= $(wildcard $(HLE_DIR)/snd.c)
+endif
+
+# NATIVE renderer (src/cpa + cpa_gl_backend): linked in by default, active only when the empty file ux0:data/rayman2/NATIVE_GFX exists (NATIVE_GFX=0 at build time leaves it out entirely)
+.DEFAULT_GOAL  := all
+NATIVE_GFX      ?= 1
+ifeq ($(NATIVE_GFX),1)
+CFLAGS          += -DR2_NATIVE_GFX -I$(CPA_DIR)
+# cpa_light.c is #included by cpa_scene.c
+CPA_SRCS        := image scene vis anim render hud tex camera drawlist
+NATIVE_OBJS     := $(patsubst %,$(BUILD_DIR)/cpa_%.o,$(CPA_SRCS)) $(BUILD_DIR)/cpa_gl_backend.o $(BUILD_DIR)/hle_native_hook.o
+EXTRA_OBJS      += $(NATIVE_OBJS)
+$(BUILD_DIR)/cpa_%.o: $(CPA_DIR)/cpa_%.c $(wildcard $(CPA_DIR)/*.h) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/cpa_gl_backend.o: src/platform/vita/cpa_gl_backend.c $(wildcard $(CPA_DIR)/*.h) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
 endif
 
 # Generated recompilation translation units

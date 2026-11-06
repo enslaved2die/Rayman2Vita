@@ -12,6 +12,9 @@
 #include "ta.h"
 #include "perf.h"
 #include "texmap.h"
+#ifdef R2_NATIVE_GFX
+#include "native_hook.h"
+#endif
 #if defined(__vita__) || defined(R2_HOST_GL)
 #include "vita_gl_render.h"      /* R2_HOST_GL: host build that runs the real vita_gl_render.c against hle/tests_ta/fakegl (see tests_ta/Makefile `rungl`) */
 #endif
@@ -308,6 +311,9 @@ static void on_startrender(SH4Ctx *c) {
     }
 #endif
 #if defined(__vita__) || defined(R2_HOST_GL)
+#ifdef R2_NATIVE_GFX
+    vita_gl_set_pending_native(native_hook_frame());
+#endif
     if (vita_gl_rt_active()) { vita_gl_present_frame(f); return; }      /* render thread owns f from here */
     vita_gl_render_frame(f);
     vita_gl_swap();
@@ -364,6 +370,9 @@ static void on_startrender_d(SH4Ctx *c) {
     TaRaw *r;
     if (rawq_n) { r = rawq[0]; memmove(rawq, rawq + 1, (--rawq_n) * sizeof rawq[0]); }
     else r = ta_cap_take(&tacap);
+#ifdef R2_NATIVE_GFX
+    vita_gl_set_pending_native(native_hook_frame());
+#endif
     vita_gl_present_raw(r, hle_reg_get(0xA05F8074u));      /* FPU_SHAD_SCALE as of STARTRENDER */
 }
 #else
