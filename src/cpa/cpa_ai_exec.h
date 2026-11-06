@@ -26,20 +26,37 @@
 #define CPA_AI_E_UNSUPPORTED 1   /* opcode/type outside the decoded subset */
 #define CPA_AI_E_MEM         2   /* address outside the image / bad structure */
 #define CPA_AI_E_DEPTH       3
+#define CPA_AI_E_LOG         4   /* write log buffer overflow */
 
 enum { CPA_AI_TAG_INT = 6, CPA_AI_TAG_FLOAT = 8, CPA_AI_TAG_VOID = 0x14, CPA_AI_TAG_VEC = 0x15, CPA_AI_TAG_PERSO = 0xB };
 
 typedef struct CpaAiVal { uint32_t w[3]; uint32_t tag; } CpaAiVal;
 
+typedef struct CpaAiWr { uint32_t va, old; uint8_t len; } CpaAiWr;   /* one logged guest write (old value, 1/2/4 bytes) */
+
 typedef struct CpaAiEnv {
     uint8_t *mem; uint32_t base; size_t n;   /* writable image */
     uint32_t selfSo;                         /* "obj" handed to the handlers: the SuperObject of the running actor */
     uint32_t mainActorPtrVa;                 /* VA of the global holding the main-actor SuperObject (guest 0x8C123CF0); 0 = MainActor evaluates to Nobody */
-    int allowWrite;                          /* 0: assignment operators are reported unsupported (pure evaluation) */
+    int allowWrite;                          /* 0: every statement with a side effect (assignment, procedure, If/Else skip cache, runner) is reported unsupported */
+    /* Guest globals read/written by the statement layer (VA, 0 = absent: reads give 0, writes are dropped). cpa_ai_env_dc() fills the Dreamcast addresses. */
+    uint32_t gFlag;      /* 0x8C0C7D34 byte: statement flags set by procedures (f_8c072f52); the procedure dispatcher clears it, then copies it & ~4 into out[0] */
+    uint32_t gFrameCtr;  /* 0x8C0C608C signed byte: frame counter tested by If2/If4/If8/If16 */
+    uint32_t gOverride;  /* 0x8C0C76FC one-shot perso override (set by operator 24); only consumed by the custom-bit procedures here */
+    uint32_t gStep0, gStep1;   /* 0x8C2DD1B0 / 0x8C2DD1B1 bytes: single-step state of the runner (f_8c07320a); 0x20/1 in every dump = stepping off */
+    uint32_t gFrame;     /* 0x8C2DD1D4 pointer to the running behaviour frame (+4 receives the current node when gTrack != 0) */
+    uint32_t gTrack;     /* 0x8C0C7C88 byte */
+    uint32_t gCmpClr;    /* 0x8C0C5194 word cleared by a comport change */
+    /* Optional write log (caller-owned buffer) so a failed or compared run can be rolled back. */
+    CpaAiWr *wlog; uint32_t wlogCap, wlogN; int wlogOn, wlogOverflow;
     uint32_t unsupType, unsupId;             /* last unsupported node (type, param) */
 } CpaAiEnv;
 
 void cpa_ai_env_init(CpaAiEnv *e, uint8_t *mem, size_t n, uint32_t base);
+void cpa_ai_env_dc(CpaAiEnv *e);                       /* set the Dreamcast global addresses above and mainActorPtrVa */
+void cpa_ai_log_begin(CpaAiEnv *e, CpaAiWr *buf, uint32_t cap);   /* start logging writes into buf */
+void cpa_ai_log_rollback(CpaAiEnv *e);                 /* undo every logged write (newest first) and clear the log */
+void cpa_ai_log_clear(CpaAiEnv *e);
 
 int  cpa_ai_rd32(const CpaAiEnv *e, uint32_t va, uint32_t *o);
 int  cpa_ai_wr32(CpaAiEnv *e, uint32_t va, uint32_t v);
@@ -53,6 +70,10 @@ int  cpa_ai_dsg_block(const CpaAiEnv *e, uint32_t so, uint32_t *start, uint32_t 
 
 /* Node helpers (12-byte nodes: +0 param, +8 u16 skip cache, +0xA depth, +0xB type). */
 uint32_t cpa_ai_skip(const CpaAiEnv *e, uint32_t node);        /* node after the subtree of `node`; 0 on error */
+
+/* Run the statement list starting at `node` exactly like the guest statement runner f_8c073266: execute node after node (each handler returns the next node)
+ * until the flags demand a stop. out->w[0] = final flags (0x10 = reached the terminator, 8 = comport changed, ...), out->tag = 0x14, *next = node the guest returns. */
+int  cpa_ai_run(CpaAiEnv *e, uint32_t node, CpaAiVal *out, uint32_t *next);
 
 /* Evaluate the subtree at `node`. Returns CPA_AI_E_*. *next = node after the subtree (what the guest handler returns in R0). */
 int  cpa_ai_eval(CpaAiEnv *e, uint32_t node, CpaAiVal *out, uint32_t *next);
