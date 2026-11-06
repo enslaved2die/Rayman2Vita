@@ -15,6 +15,7 @@
  */
 #include "vmu.h"
 #include "pad.h"
+#include "ta.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -307,6 +308,8 @@ static void h_curslot(SH4Ctx *c) {                                    /* FUN_8c0
 }
 
 /* ---------------------------------------------------------------- DC-only UI */
+#define HLE_MENU_STR_BUF 0x8C0098F0u      /* 64 bytes scratch buffer for dynamic menu strings */
+
 static void h_text(SH4Ctx *c) {                                       /* FUN_8c082fa0(id): text getter; ids that make no sense on a console without web access */
     uint32_t id = c->r[4], pr = c->pr; hle_orig(c, 0x8C082FA0u); c->pr = pr;
     if (g_trace && hle_is_ram(c->r[0])) {                              /* R2_VMU_TRACE=1: log the save/VMU/vibration message ids (405..440, 710..717) once per 30 frames, other ids when they change (menus ask every frame) */
@@ -317,6 +320,18 @@ static void h_text(SH4Ctx *c) {                                       /* FUN_8c0
         if (log) hle_log("[vmu] f%lu text %u \"%.60s\" pr=%08x", hle_frame_count, id, (const char *)hle_ptr(c->r[0]), pr);
     }
     if (id == 369u) { *hle_ptr(HLE_VMU_EMPTYSTR) = 0; c->r[0] = HLE_VMU_EMPTYSTR; }   /* "Rayman II Web site" */
+    else if (id == 389u) {
+        /* Options menu title/label for Resolution / Render Scale */
+        int scale = r2_get_render_scale();
+        snprintf((char *)hle_ptr(HLE_MENU_STR_BUF), 48, "SCALE: %d%%", scale);
+        c->r[0] = HLE_MENU_STR_BUF;
+    }
+    else if (id == 397u || id == 398u) {
+        /* Options menu framerate toggle (50Hz / 60Hz replacement) */
+        int fps = r2_get_fps_limit();
+        snprintf((char *)hle_ptr(HLE_MENU_STR_BUF), 48, "FPS: %d", fps);
+        c->r[0] = HLE_MENU_STR_BUF;
+    }
 }
 
 /* ---------------------------------------------------------------- public */

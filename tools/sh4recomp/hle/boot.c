@@ -5,6 +5,7 @@
 #include "perf.h"
 #include "swflag.h"
 #include "r2prof.h"
+#include "ta.h"
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -738,6 +739,23 @@ static void render_wait_pump(SH4Ctx *c) {
 }
 static void h_render_wait(SH4Ctx *c) { uint32_t pr = c->pr; render_wait_pump(c); hle_orig(c, 0x8C0385D8); c->pr = pr; }
 static void h_render_wait2(SH4Ctx *c) { uint32_t pr = c->pr; render_wait_pump(c); hle_orig(c, 0x8C0386E0); c->pr = pr; }
+static void h_kamui_setvsync(SH4Ctx *c) {       /* 0x8C0D6C20: kmSetVSync(divider) */
+    uint32_t pr = c->pr;
+    int fps = r2_get_fps_limit();
+    if (fps == 30 && c->r[4] == 1) {
+        c->r[4] = 2;
+    }
+    hle_orig(c, 0x8C0D6C20);
+    c->pr = pr;
+    if (fps == 30) {
+        /* Ensure divider in Kamui sys struct (0x8C2ECF08 + 0x7F4) is at least 1 (divider-1) */
+        uint32_t base = 0x8C2ECF08u;
+        if (LD32(base + 0x7F4) < 1) {
+            ST32(base + 0x7F4, 1);
+        }
+    }
+}
+
 static void h_sprintf_spy(SH4Ctx *c) {
     uint32_t dst = c->r[4], fmt = c->r[5], pr = c->pr;
     char f[160]; snprintf(f, sizeof f, "%.150s", hle_cstr(fmt));
@@ -795,6 +813,7 @@ void hle_boot_init(SH4Ctx *c, const uint8_t *image, uint32_t len, const char *dc
     hle_mmio_map(0xE0000000u, 0xE3FFFFFFu, sq_rd, sq_wr); hle_set_pref_handler(sq_flush_default);
     hle_hook(0x8C0D2BA0, h_kamui_idle); hle_hook(0x8C0385D8, h_render_wait); hle_hook(0x8C0386E0, h_render_wait2);
     hle_hook(0x8C0D3AE0, h_kamui_begin); hle_hook(0x8C0E0080, h_kamui_render);
+    hle_hook(0x8C0D6C20, h_kamui_setvsync);
     hle_hook(0x8C0CD916, h_ret0);
     sh4_register_hook(0x8C0E35ECu, h_8c0e35ec);
     hle_io_init(dcdata_root);

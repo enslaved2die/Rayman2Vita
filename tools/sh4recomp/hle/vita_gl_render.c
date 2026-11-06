@@ -45,29 +45,43 @@ static inline uint32_t fp_get(void) { return (uint32_t)fegetround(); }
 static inline void fp_set(uint32_t m) { fesetround((int)m); }
 #endif
 
-/* R2_INTERNAL_SCALE (percent, build constant): render at a lower internal resolution; the display unit upscales the framebuffer to the 960x544 screen.  Only the sizes the Vita
- * display engine scales in hardware are valid: 100 (960x544), 75 (720x408), 67 (640x368), 50 (480x272).  Cuts fill-rate (translucent overdraw, fog pass) at the cost of sharpness;
- * everything below is derived from SCREEN_W / SCREEN_H.  Needs Vita measurement (perf.log "overdraw" and "swap" lines show whether the GPU is the limit). */
-#ifndef R2_INTERNAL_SCALE
-#define R2_INTERNAL_SCALE 100
-#endif
-#if R2_INTERNAL_SCALE == 100
-#define SCREEN_W 960
-#define SCREEN_H 544
-#elif R2_INTERNAL_SCALE == 75
-#define SCREEN_W 720
-#define SCREEN_H 408
-#elif R2_INTERNAL_SCALE == 67
-#define SCREEN_W 640
-#define SCREEN_H 368
-#elif R2_INTERNAL_SCALE == 50
-#define SCREEN_W 480
-#define SCREEN_H 272
-#else
-#error "R2_INTERNAL_SCALE must be 100, 75, 67 or 50"
-#endif
-#define VIEW_W (SCREEN_H * 4 / 3)       /* 4:3 pillarbox width (725 at 544) */
-#define VIEW_X ((SCREEN_W - VIEW_W) / 2)
+/* Dynamic internal resolution scaling: default 100% (960x544).
+ * Display unit upscales the framebuffer to the 960x544 screen in hardware:
+ * 100 (960x544), 75 (720x408), 67 (640x368). */
+static int s_render_scale = 100;
+static int s_screen_w = 960;
+static int s_screen_h = 544;
+static int s_view_w = 544 * 4 / 3;
+static int s_view_x = (960 - (544 * 4 / 3)) / 2;
+
+void vita_gl_set_render_scale(int scale_pct)
+{
+    int w = 960, h = 544;
+    if (scale_pct == 75) {
+        w = 720; h = 408;
+    } else if (scale_pct == 67) {
+        w = 640; h = 368;
+    } else {
+        scale_pct = 100;
+        w = 960; h = 544;
+    }
+    s_render_scale = scale_pct;
+    s_screen_w = w;
+    s_screen_h = h;
+    s_view_w = h * 4 / 3;
+    s_view_x = (w - s_view_w) / 2;
+    vglSwapResolution(s_screen_w, s_screen_h);
+}
+
+int vita_gl_get_render_scale(void)
+{
+    return s_render_scale;
+}
+
+#define SCREEN_W s_screen_w
+#define SCREEN_H s_screen_h
+#define VIEW_W s_view_w
+#define VIEW_X s_view_x
 /* 16:9: when the game runs its own 16:9 mode (hle_ta_wide_active(); forced on by default in ta_hle.c, R2_WIDE / hle_ta_wide_set() toggle) the 640x480 screen-space output is
  * horizontally squeezed by 1/k (k = 4/3) by the engine itself (wider FOV, widened culling, squeezed HUD), so the whole 640x480 vertex space is mapped onto the full
  * 960x544 viewport: x * 1.5, y * 1.1333 (pixel aspect 0.5% off square), geometry is rasterised natively, no bitmap scaling.  4:3 mode keeps the centred 725x544 pillarbox. */
@@ -1700,5 +1714,7 @@ void vita_gl_present_fb(uint32_t fb_offset) { (void)fb_offset; }
 void vita_gl_capture_scene(uint32_t off0, uint32_t off1) { (void)off0; (void)off1; }
 int vita_gl_rt_active(void) { return 0; }
 void vita_gl_texture_cache_clear(void) {}
+void vita_gl_set_render_scale(int scale_pct) { (void)scale_pct; }
+int  vita_gl_get_render_scale(void) { return 100; }
 
 #endif
