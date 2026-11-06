@@ -267,6 +267,10 @@ static int game_main(void) {
     r2p_start();
 #endif
     vita_set_clocks();
+    {   /* real-hardware cost of one clock read (what the R2_PERF probes pay): 4000 back-to-back reads, logged once */
+        uint64_t a = sceKernelGetProcessTimeWide(), sink = 0; for (int i = 0; i < 4000; i++) sink += sceKernelGetProcessTimeWide(); uint64_t b = sceKernelGetProcessTimeWide();
+        vita_log("[vita] clock read cost: %.0f ns per sceKernelGetProcessTimeWide() call (%u us for 4000 reads%s)", (double)(b - a) * 1000.0 / 4001.0, (unsigned)(b - a), sink ? "" : " ");
+    }
     { extern const char r2_variant_name[], r2_variant_flags[]; vita_log("[vita] variant: %s | %s | game cpu mask 0x%x audio cpu mask 0x%x", r2_variant_name, r2_variant_flags, (unsigned)R2_GAME_CPU, (unsigned)R2_AUDIO_CPU); }   /* Makefile.vita VARIANT: pasted logs identify themselves */
 
     /* 1. Set controller sampling mode */

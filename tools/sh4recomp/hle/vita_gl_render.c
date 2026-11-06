@@ -931,7 +931,9 @@ static void vita_gl_render_frame_impl(RenderJob *job)
                     gc_alpha_test(1);
                     gc_alpha_ref(128);
                 } else {
-                    gc_alpha_test(0);
+                    /* Discard fully transparent fragments (alpha == 0) to save blending and fillrate */
+                    gc_alpha_test(1);
+                    gc_alpha_ref(1);
                 }
             } else if (list_id == TA_L_PUNCH) {
                 gc_blend(0);
@@ -973,13 +975,12 @@ static void vita_gl_render_frame_impl(RenderJob *job)
                 gc_tex2d(0);
             }
             /* Fog (PVR2 fogs the final post-texture colour; alpha is never touched):
-             *  - untextured translucent: pre-fog the vertex colour toward FOG_COL_RAM before the blend (exact: no texture to modulate);
-             *  - additive translucent (dst factor ONE): fog fades toward black, so the colour is scaled by (1 - fog), no extra pass;
-             *  - textured translucent: colour left alone here, fogged by the post pass below (pre-fogging the vertex colour would MODULATE the texture by the fog colour). */
+             *  - translucent (additive, untextured, or textured): pre-fog the vertex colour toward FOG_COL_RAM (or scale by (1-fog) for additive)
+             *    in a single pass before the blend, avoiding an expensive second draw pass. */
             int pre_fogged = 0;
             const int tfog_on = R2_TFOG && fog_den && (list_id == TA_L_PUNCH ? st->fog_ctrl == 0 : (st->fog_ctrl == 0 || st->fog_ctrl == 3));
             const int additive = (list_id == TA_L_TRANS && st->dst_blend == 1);
-            if (list_id == TA_L_TRANS && tfog_on && (additive || !tex_id)) {
+            if (list_id == TA_L_TRANS && tfog_on) {
                 float amax = 0.0f;
                 for (uint32_t i = 0; i < batch->count; i++) {
                     uint32_t vi = batch->first + i;
@@ -1020,10 +1021,10 @@ static void vita_gl_render_frame_impl(RenderJob *job)
              * transparency (opaque ARGB1555 cutout, punch-through, smooth-alpha translucent): that pass is textured with TEXTURE_ENV_MODE=BLEND and env colour = vertex
              * colour = fog colour (rgb = fog colour for every texel, a = texel alpha * vertex alpha * fog), so it keeps the main pass's cutout/alpha shape instead of painting a
              * fog-coloured box over the transparent texels.  Untextured/additive translucent were fogged above; other translucent blend modes are not fogged [ASSUMED]. */
-            const int fog_textured = tex_id && (st->shading & 3) != 2 && (list_id == TA_L_PUNCH || list_id == TA_L_TRANS || (list_id == TA_L_OPAQUE && st->pixel_format == 0));
+            const int fog_textured = tex_id && (st->shading & 3) != 2 && (list_id == TA_L_PUNCH || (list_id == TA_L_OPAQUE && st->pixel_format == 0));
             const int fog_func_ok = (gc.depth_func == (int)GL_GREATER || gc.depth_func == (int)GL_GEQUAL || gc.depth_func == (int)GL_ALWAYS);
-            const int fog_post = fog_func_ok && fog_den && !additive &&
-                (list_id == TA_L_OPAQUE ? st->fog_ctrl == 0 : list_id == TA_L_PUNCH ? tfog_on : (tfog_on && tex_id && st->dst_blend == 5));
+            const int fog_post = fog_func_ok && fog_den &&
+                (list_id == TA_L_OPAQUE ? st->fog_ctrl == 0 : list_id == TA_L_PUNCH ? tfog_on : 0);
             if (fog_post) {
                 float amax = 0.0f;
                 const int opq = (list_id == TA_L_OPAQUE);                           /* non-opaque: a = vertex alpha * fog; opaque: a = fog */
@@ -1173,7 +1174,7 @@ static void gl_warmup(void)
         for (int m = -1; m < 3; m++) WARM_DRAW(m);
     }
     if (wu & 2) {
-    gc_alpha_test(0); gc_blend(1);                                   /* translucent: blend pairs */
+    gc_alpha_test(1); gc_alpha_ref(1); gc_blend(1);                  /* translucent: blend pairs with alpha discard */
     static const GLenum pairs[][2] = { { GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA }, { GL_ONE, GL_ONE }, { GL_SRC_ALPHA, GL_ONE }, { GL_ONE, GL_ONE_MINUS_SRC_ALPHA },
                                        { GL_ZERO, GL_SRC_COLOR }, { GL_DST_COLOR, GL_ZERO }, { GL_ZERO, GL_ONE_MINUS_SRC_ALPHA }, { GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA },
                                        { GL_DST_COLOR, GL_SRC_COLOR }, { GL_ONE, GL_ZERO } };
