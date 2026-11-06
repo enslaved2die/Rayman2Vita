@@ -5,6 +5,18 @@
 #ifndef R2_PERF_H
 #define R2_PERF_H
 #include <stdint.h>
+#ifndef R2_SQF_PROBE
+#ifdef R2_PROF
+#define R2_SQF_PROBE 1
+#else
+#define R2_SQF_PROBE 0
+#endif
+#endif
+#if defined(__vita__)
+#define R2_SQF_UNIT 1.0
+#else
+#define R2_SQF_UNIT 1000.0   /* host probe is in ns */
+#endif
 #ifndef R2_PERF
 #define R2_PERF 1
 #endif
@@ -30,6 +42,7 @@ typedef struct R2Perf {
     uint64_t t_ta_dma;       /* time inside TA DMA parses (ch2 DMA into the TA), measured exactly */
     uint64_t t_ta_sq_probe;  /* time of the probed store-queue TA writes (every 32nd) */
     uint32_t ta_sq_n, ta_sq_probes;   /* SQ writes and probed ones */
+    uint64_t t_sqf_probe; uint32_t sqf_n, sqf_probes;   /* whole sh4_pref -> sq_flush_default path (incl. the sink), 1 in 32 timed; only with R2_SQF_PROBE (profiler variant / host -DR2_SQF_PROBE) */
     uint32_t frames, over17, over34, over50; uint32_t max_period_us;
     /* GL counters (sum over reported frames) */
     uint64_t draws, fog_draws, verts, state_calls, state_skipped, batches, tex_binds, tex_uploads, tex_bytes, strips, tris;
