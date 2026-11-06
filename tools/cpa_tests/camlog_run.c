@@ -32,6 +32,17 @@ static unsigned long dumps[32]; static int ndump;
 static unsigned long skip_from, skip_to, skip_every = 40; static uint32_t skip_btn = PAD_A;
 extern FILE *hle_trace_fp; extern unsigned long hle_trace_max, hle_trace_n; extern void hle_set_trace(int);
 extern void cam_watch_arm(uint32_t a);
+extern int cam_snap_on; extern uint32_t cam_snap_a0, cam_snap_a1; extern void (*cam_snap_cb)(void *, uint32_t); extern void cam_snap_set(int on);
+static unsigned long snaps[4096]; static int nsnap; static unsigned long snap_cur; static int snap_prez;
+/* --snap r1,r2,..: for guest frame rel r capture the full guest RAM + SH4Ctx at ENTRY of the camera director f_8c0741e0 (snap_<r>_pre.bin/.regs) and at entry of the camera behaviour f_8c08e51c (snap_<r>_post.bin).
+ * Armed at the end of rel r-1, disarmed at the end of rel r. */
+static void snap_cb(void *cc, uint32_t addr) {
+    char p[640]; const char *tag = addr == cam_snap_a0 ? "pre" : "post"; FILE *d;
+    if (snap_prez && addr != cam_snap_a0) return;
+    snprintf(p, sizeof p, "%s/snap_%lu_%s.bin", outdir, snap_cur, tag); d = fopen(p, "wb"); if (d) { fwrite(sh4_ram, 1, SH4_RAM_SIZE, d); fclose(d); }
+    snprintf(p, sizeof p, "%s/snap_%lu_%s.regs", outdir, snap_cur, tag); d = fopen(p, "wb"); if (d) { fwrite(cc, 1, sizeof(SH4Ctx), d); fclose(d); }
+    if (addr != cam_snap_a0 || snap_prez) cam_snap_set(0);
+}
 static uint32_t warm_va[4]; static int nwarm, warm_done; static unsigned long warm_rel;
 static unsigned long trace_rel = ~0ul; static FILE *trace_f;
 static unsigned long lvl_seen; static int lvl_seen_ok; static FILE *clog;
@@ -90,6 +101,7 @@ static void frame_hook(unsigned long fr) {
     prev_in = (uint32_t)(an.joyx | an.joyy << 8 | m << 16);
     if (lvl_seen_ok && !warm_done && nwarm && rel >= warm_rel) { warm_done = 1; for (int i = 0; i < nwarm; i++) cam_watch_arm(warm_va[i]); fprintf(stderr, "[camlog] watch armed at rel %lu\n", rel); }
     if (!lvl_seen_ok) return;
+    if (nsnap) { cam_snap_set(0); for (int i = 0; i < nsnap; i++) if (snaps[i] == rel + 1) { snap_cur = rel + 1; cam_snap_a0 = 0x8c0741e0u; cam_snap_a1 = 0x8c08e51cu; cam_snap_cb = snap_cb; cam_snap_set(1); } }
     if (rel >= startrel) {
         uint32_t cso = rd32(CAMTAB_VA), pso = rd32(PLTAB_VA);
         uint32_t cmat = rd32(cso + 0x24), pmat = rd32(pso + 0x24), cact = rd32(cso + 4), pact = rd32(pso + 4);
@@ -118,6 +130,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--watch") && i + 2 < argc) { warm_rel = strtoul(argv[++i], 0, 10); char *q = argv[++i]; while (*q && nwarm < 4) { warm_va[nwarm++] = (uint32_t)strtoul(q, &q, 16); if (*q == ',') q++; } }
         else if (!strcmp(argv[i], "--script") && i + 1 < argc) script = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) { char *s = argv[++i]; while (*s && ndump < 32) { dumps[ndump++] = strtoul(s, &s, 10); if (*s == ',') s++; } }
+        else if (!strcmp(argv[i], "--snaprange") && i + 2 < argc) { unsigned long a = strtoul(argv[++i], 0, 10), b = strtoul(argv[++i], 0, 10); for (; a < b && nsnap < 4096; a++) snaps[nsnap++] = a; snap_prez = 1; }
+        else if (!strcmp(argv[i], "--snap") && i + 1 < argc) { char *q = argv[++i]; while (*q && nsnap < 4096) { snaps[nsnap++] = strtoul(q, &q, 10); if (*q == ',') q++; } }
         else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = atoi(argv[++i]);
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
     }

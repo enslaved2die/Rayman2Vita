@@ -65,6 +65,13 @@ int cpa_follow_rows(const float C[3], const float L[3], float rows[9]);
  * dt = 0.016 (the engine passes counter(16 ms)/1000 in fr4 to the behaviour). Returns |step|; outStep may be NULL. The speed S1 itself is NOT decoded (UNKNOWN). */
 float cpa_follow_aim_step(float L[3], const float T[3], float speed, float dt, float outStep[3]);
 
+/* Camera goal point G, default regime (VERIFIED against the oracle on 366 Learn_10 frames: median error 0, p95 0.048, max 0.34 units on V = G - C; found by running the lifted director
+ * f_8c0741e0 on RAM snapshots, see notes_camera.md section 6): G = T + dist*(cos(el)*unit_h(Cprev - T), sin(el)), dist = 8.0, el = 0.35 rad (camera keeps its bearing around T).
+ * Other regimes (dist 8..10.1, el 0.09..0.35, transitions) are the output of the angle/distance limiters f_8c09e24e/f_8c09e3a0 and are NOT ported (UNKNOWN). Returns 0, or -1 if Cprev is above T. */
+int cpa_follow_goal_default(const float T[3], const float Cprev[3], float G[3]);
+/* Speed S2 of the C controller: S2 = 1.5*S1 on 94% of frames (VERIFIED on log); otherwise S2 decays slower than 1.5*S1 (rate limited, UNKNOWN law). */
+float cpa_follow_s2_from_s1(float s1);
+
 typedef struct CpaFollowCfg {
     float targetOffsetZ;   /* 1.4   (INFERRED: T - Rayman in z when Rayman stands/runs on level ground) */
     float kTarget;         /* 0.222 (INFERRED) */

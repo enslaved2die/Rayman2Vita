@@ -48,6 +48,16 @@ float cpa_follow_aim_step(float L[3], const float T[3], float speed, float dt, f
     return m;
 }
 
+int cpa_follow_goal_default(const float T[3], const float Cp[3], float G[3]) {
+    float dx = Cp[0] - T[0], dy = Cp[1] - T[1], h = sqrtf(dx * dx + dy * dy);
+    const float el = 0.35f, dist = 8.0f;
+    if (!(h > 1e-6f)) return -1;
+    G[0] = T[0] + dist * cosf(el) * dx / h; G[1] = T[1] + dist * cosf(el) * dy / h; G[2] = T[2] + dist * sinf(el);
+    return 0;
+}
+
+float cpa_follow_s2_from_s1(float s1) { return 1.5f * s1; }
+
 void cpa_follow_cfg_default(CpaFollowCfg *c) {
     c->targetOffsetZ = 1.4f; c->kTarget = 0.222f; c->kAim = 0.17f;
     c->distMin = 7.5f; c->distMax = 9.3f; c->kDist = 0.09f; c->height = 2.8f; c->kHeight = 0.025f;

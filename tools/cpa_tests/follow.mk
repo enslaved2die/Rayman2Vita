@@ -14,8 +14,10 @@ OUT     ?= build/camlog_$(LEVEL)
 # private copy of hle/boot.c with the R2_WATCH report limit lifted and a runtime arming function (cam_watch_arm); tools/sh4recomp is NOT modified
 build/camlog_boot.c: $(SH4)/hle/boot.c
 	@mkdir -p build
-	sed -e 's/watch_reports++ < 40/watch_reports++ < 100000/' $< > $@
+	perl -0pe 's/watch_reports\+\+ < 40/watch_reports++ < 100000/; s/(void hle_trace_enter\(void \*cc, uint32_t addr\) \{\n)/int cam_snap_on; uint32_t cam_snap_a0, cam_snap_a1; void (*cam_snap_cb)(void *, uint32_t);\n$$1    if (cam_snap_on && cam_snap_cb && (cam_snap_a0 == 1 || addr == cam_snap_a0 || addr == cam_snap_a1)) cam_snap_cb(cc, addr);\n/; s/hle_trace_on = trace_wanted \|\|/hle_trace_on = cam_snap_on || trace_wanted ||/' $< > $@.tmp
+	mv $@.tmp $@
 	printf '%s\n' 'void cam_watch_arm(uint32_t a) { if (watch_n < 4) { watch_a[watch_n] = a; watch_v[watch_n] = LD32(a); watch_n++; update_trace_flag(); } }' >> $@
+	printf '%s\n' 'void cam_snap_set(int on) { cam_snap_on = on; update_trace_flag(); }' >> $@
 build/camlog_boot.o: build/camlog_boot.c
 	$(CC) -O1 -std=gnu11 -I$(SH4) -I$(SH4)/hle -I$(SH4)/gen_fix -I$(SH4)/gen_fix -w -c build/camlog_boot.c -o $@
 
@@ -40,7 +42,7 @@ follow-test: build/test_follow
 	./build/test_follow $(LOG) $(START) $(END) $(RAM) $(REL)
 
 # camprobe_*: run lifted guest camera code on RAM dumps (oracle side research tools, like vis_frustum)
-build/camprobe_%: camprobe_%.c $(SH4)/build_hle/run_game
+build/camprobe_%: camprobe_%.c $(SH4)/build_hle/run_game build/camlog_boot.o
 	@mkdir -p build
 	$(CC) -O1 -std=gnu11 -I$(SH4) -I$(SH4)/hle -I$(SH4)/gen_fix -c camprobe_$*.c -o build/camprobe_$*.o
-	$(CC) -o $@ build/camprobe_$*.o $(HLEOBJ) -lm
+	$(CC) -o $@ build/camprobe_$*.o build/camlog_boot.o $(filter-out $(SH4)/build_hle/boot.o,$(HLEOBJ)) -lm

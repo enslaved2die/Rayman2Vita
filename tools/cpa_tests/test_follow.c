@@ -85,6 +85,20 @@ int main(int argc, char **argv) {
         printf("check5 C = C_prev + u1 (u1 = oracle displacement, actor+0x60c): err mean %.2e max %.2e, %d of %d frames differ by > 1e-3 (collision pull-in, not decoded)\n", sC / nC, mC, nCbad, nC);
     }
 
+    /* 6. goal point, default regime: V_model = G(T, C_prev) - C_prev vs oracle V (actor+0x3d0) on frames where the oracle goal is at distance 8, elevation 0.35 */
+    { int nd = 0, nall = 0, n15 = 0, nm = 0; double se = 0; float me = 0;
+      for (int i = (start > 0 ? start : 1); i <= end; i++) {
+          const float *Cp = R[i - 1].Cd, *T = R[i].T; float V[3];
+          memcpy(V, buf + (size_t)i * RS + 808 + 0x3d0, 12);
+          float Gt[3] = { Cp[0] + V[0] - T[0], Cp[1] + V[1] - T[1], Cp[2] + V[2] - T[2] };
+          float d = sqrtf(Gt[0] * Gt[0] + Gt[1] * Gt[1] + Gt[2] * Gt[2]), el = atan2f(Gt[2], hypotf(Gt[0], Gt[1])); nall++;
+          if (R[i].S1 > 0.01f) { nm++; if (fabsf(R[i].S2 / R[i].S1 - 1.5f) < 1e-3f) n15++; }
+          if (fabsf(d - 8.f) > 2e-3f || fabsf(el - 0.35f) > 2e-3f) continue;
+          float G[3]; if (cpa_follow_goal_default(T, Cp, G)) continue;
+          float e = dist3(G, (float[3]){ Cp[0] + V[0], Cp[1] + V[1], Cp[2] + V[2] }); se += e; if (e > me) me = e; nd++;
+      }
+      printf("check6 goal G(T,Cprev) default regime: %d of %d frames in regime, |G-G_oracle| mean %.4f max %.4f; S2==1.5*S1 on %d of %d frames\n", nd, nall, nd ? se / nd : 0., me, n15, nm); }
+
     /* 3. model */
     if (end - start < 10) { printf("window too short (%d..%d)\n", start, end); return fails ? 1 : 0; }
     for (int mode = 0; mode < 2; mode++) {
