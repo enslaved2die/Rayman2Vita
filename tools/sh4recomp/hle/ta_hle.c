@@ -65,11 +65,6 @@ static void config_save(void);
 void r2_set_fps_limit(int fps) {
     if (fps != 30 && fps != 60) fps = 60;
     s_fps_limit = fps;
-    /* Apply vsync divider immediately to Kamui sys struct (0x8C2ECF08 + 0x7F4) */
-    uint32_t base = 0x8C2ECF08u;
-    if (hle_is_ram(base)) {
-        ST32(base + 0x7F4, (fps == 30) ? 1 : 0);
-    }
     config_save();
 }
 

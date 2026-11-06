@@ -261,8 +261,6 @@ void r2_set_fps_limit(int fps);
 int  r2_get_fps_limit(void);
 void r2_set_render_scale(int scale_pct);
 int  r2_get_render_scale(void);
-void vita_gl_set_render_scale(int scale_pct);
-int  vita_gl_get_render_scale(void);
 
 /* Suggested draw order of list types: opaque, punch-through, translucent. Returns count (3). */
 int  ta_draw_order(int out_lists[3]);
