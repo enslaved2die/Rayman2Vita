@@ -57,11 +57,25 @@ static const char *config_path = "config.ini";
 #endif
 
 static int config_loaded = 0;
+static int s_fps_limit = 60;
+static int s_render_scale = 100;
+
+int r2_get_fps_limit(void) {
+    if (!config_loaded) config_load();
+    return s_fps_limit;
+}
+
+int r2_get_render_scale(void) {
+    if (!config_loaded) config_load();
+    return s_render_scale;
+}
 
 static void config_load(void) {
     if (config_loaded) return;
     config_loaded = 1;
     wide_pref = 1;
+    s_fps_limit = 60;
+    s_render_scale = 100;
     FILE *f = fopen(config_path, "r");
     if (!f) return;
     char line[128];
@@ -69,6 +83,10 @@ static void config_load(void) {
         int v;
         if (sscanf(line, "widescreen = %d", &v) == 1 || sscanf(line, "widescreen=%d", &v) == 1) {
             wide_pref = v ? 1 : 0;
+        } else if (sscanf(line, "fps_limit = %d", &v) == 1 || sscanf(line, "fps_limit=%d", &v) == 1) {
+            if (v == 30 || v == 60) s_fps_limit = v;
+        } else if (sscanf(line, "render_scale = %d", &v) == 1 || sscanf(line, "render_scale=%d", &v) == 1) {
+            if (v == 100 || v == 75 || v == 67 || v == 50) s_render_scale = v;
         }
     }
     fclose(f);

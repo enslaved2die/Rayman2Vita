@@ -718,6 +718,15 @@ static void deliver_vblank(SH4Ctx *c) {          /* paced 60 Hz VBlank-in, as th
     if (vb_delivered < 12) hle_log("[irq] vblank #%lu flag884 %08x -> %08x (888=%08x 890=%08x 89c=%08x)", vb_delivered, f0, LD32(0x8C2ED884u), LD32(0x8C2ED888u), LD32(0x8C2ED890u), LD32(0x8C2ED89Cu));
     c->pr = pr;
 }
+static void h_kamui_setvsync(SH4Ctx *c) {
+    if (r2_get_fps_limit() == 30 && c->r[4] == 1) {
+        c->r[4] = 2; /* Force 30 FPS vsync pacing when configured */
+    }
+    uint32_t pr = c->pr;
+    hle_orig(c, 0x8C0D6C20u);
+    c->pr = pr;
+}
+
 static void h_kamui_idle(SH4Ctx *c) {            /* 0x8C0D2BA0(type): invoke Kamui callback table[type]; type 7 = idle-wait callback */
     uint32_t type = c->r[4], pr = c->pr;
     if (type == 7 && asic_flush_one()) { /* deferred event delivered instead of vblank on this idle tick */ }
@@ -794,7 +803,7 @@ void hle_boot_init(SH4Ctx *c, const uint8_t *image, uint32_t len, const char *dc
     hle_hook(0x8C0CFFE0, h_nop); hle_hook(0x8C0D1096, h_nop);
     hle_mmio_map(0xE0000000u, 0xE3FFFFFFu, sq_rd, sq_wr); hle_set_pref_handler(sq_flush_default);
     hle_hook(0x8C0D2BA0, h_kamui_idle); hle_hook(0x8C0385D8, h_render_wait); hle_hook(0x8C0386E0, h_render_wait2);
-    hle_hook(0x8C0D3AE0, h_kamui_begin); hle_hook(0x8C0E0080, h_kamui_render);
+    hle_hook(0x8C0D3AE0, h_kamui_begin); hle_hook(0x8C0E0080, h_kamui_render); hle_hook(0x8C0D6C20, h_kamui_setvsync);
     hle_hook(0x8C0CD916, h_ret0);
     sh4_register_hook(0x8C0E35ECu, h_8c0e35ec);
     hle_io_init(dcdata_root);

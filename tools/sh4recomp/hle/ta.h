@@ -255,6 +255,8 @@ uint32_t ta_hash_bytes(const void *data, uint32_t n);      /* 4-lane multiplicat
 void  hle_ta_wide_set(int on);       /* runtime preference: 1 = force the game's 16:9 mode (default), 0 = 4:3 */
 int   hle_ta_wide_pref(void);
 int   hle_ta_wide_active(void);
+int   r2_get_fps_limit(void);
+int   r2_get_render_scale(void);
 float hle_ta_wide_k(void);
 
 /* Suggested draw order of list types: opaque, punch-through, translucent. Returns count (3). */
