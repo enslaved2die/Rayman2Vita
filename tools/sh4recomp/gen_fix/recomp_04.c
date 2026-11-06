@@ -12676,16 +12676,11 @@ void f_8c02f87e(SH4Ctx *c) {
   {  return; }
 }
 void f_8c02f896(SH4Ctx *c) {
-  {uint32_t v=c->pr;R(15)-=4;ST32(R(15),v);}
-  R(15)+=0xffffffecu;
-  R(3)=R(5);
-  R(6)=R(15);
-  ST32(R(15),R(5));
-  R(2)=LD32(R(3)+4);
-  { uint32_t tg=R(2); c->pr=0x8c02f8a6u; R(6)+=0x4u; sh4_call(c,tg); }
-  R(15)+=0x14u;
-  {uint32_t v=LD32(R(15));R(15)+=4;c->pr=v;}
-  {  return; }
+  /* SCREEN CALIBRATION activation: repurposed to toggle FPS limit (60 <-> 30) */
+  int cur_fps = r2_get_fps_limit();
+  int new_fps = (cur_fps == 60) ? 30 : 60;
+  r2_set_fps_limit(new_fps);
+  return;
 }
 void f_8c02f8ae(SH4Ctx *c) {
   {uint32_t v=c->pr;R(15)-=4;ST32(R(15),v);}
@@ -14439,26 +14434,12 @@ void f_8c0305b8(SH4Ctx *c) {
   if(c->t) goto L8c03063e;
   {  goto L8c030644; }
 L8c030620:;
-  /* Toggle framerate between 60 FPS and 30 FPS */
-  {
-    int cur_fps = r2_get_fps_limit();
-    int new_fps = (cur_fps == 60) ? 30 : 60;
-    r2_set_fps_limit(new_fps);
-    if (new_fps == 60) {
-      R(4) = 60u;
-      R(2) = 0x8c010ae0u;
-      { c->pr = 0x8c03062cu; f_8c010ae0(c); }
-    } else {
-      R(4) = 50u;
-      R(2) = 0x8c010ab8u;
-      { c->pr = 0x8c030636u; f_8c010ab8(c); }
-    }
-    /* Cycle render scale on video mode change: 100% -> 75% -> 67% -> 100% */
-    int cur_scale = r2_get_render_scale();
-    int new_scale = (cur_scale == 100) ? 75 : (cur_scale == 75) ? 67 : 100;
-    r2_set_render_scale(new_scale);
-  }
-  goto L8c030636;
+  R(0)=R(4);
+  c->t=(int32_t)R(0)==60;
+  if(!c->t) goto L8c030630;
+  R(2)=0x8c010ae0u;
+  { c->pr=0x8c03062cu;  f_8c010ae0(c); }
+  {  goto L8c030636; }
 L8c030630:;
   R(2)=0x8c010ab8u;
   { c->pr=0x8c030636u;  f_8c010ab8(c); }
@@ -14467,6 +14448,12 @@ L8c030636:;
   R(3)=0x1u;
   { ST32(R(2),R(3)); goto L8c030644; }
 L8c03063e:;
+  /* Cycle render scale: 100% -> 75% -> 67% -> 100% */
+  {
+    int cur_scale = r2_get_render_scale();
+    int new_scale = (cur_scale == 100) ? 75 : (cur_scale == 75) ? 67 : 100;
+    r2_set_render_scale(new_scale);
+  }
   R(3)=0x8c04c31eu;
   { c->pr=0x8c030644u;  f_8c04c31e(c); }
 L8c030644:;

@@ -321,15 +321,20 @@ static void h_text(SH4Ctx *c) {                                       /* FUN_8c0
     }
     if (id == 369u) { *hle_ptr(HLE_VMU_EMPTYSTR) = 0; c->r[0] = HLE_VMU_EMPTYSTR; }   /* "Rayman II Web site" */
     else if (id == 389u) {
-        /* Options menu title/label for Resolution / Render Scale */
-        int scale = r2_get_render_scale();
-        snprintf((char *)hle_ptr(HLE_MENU_STR_BUF), 48, "SCALE: %d%%", scale);
+        /* Options menu: "SCALE" label */
+        snprintf((char *)hle_ptr(HLE_MENU_STR_BUF), 48, "SCALE");
         c->r[0] = HLE_MENU_STR_BUF;
     }
-    else if (id == 397u || id == 398u) {
-        /* Options menu framerate toggle (50Hz / 60Hz replacement) */
+    else if (id == 399u || id == 400u) {
+        /* Options menu: Render scale value (replaces MODE 16;9 / MODE 4;3) */
+        int scale = r2_get_render_scale();
+        snprintf((char *)hle_ptr(HLE_MENU_STR_BUF), 48, "%d%%", scale);
+        c->r[0] = HLE_MENU_STR_BUF;
+    }
+    else if (id == 393u) {
+        /* Options menu: Framerate toggle (replaces SCREEN CALIBRATION) */
         int fps = r2_get_fps_limit();
-        snprintf((char *)hle_ptr(HLE_MENU_STR_BUF), 48, "FPS: %d", fps);
+        snprintf((char *)hle_ptr(HLE_MENU_STR_BUF), 48, "/c:FPS LIMIT: %d", fps);
         c->r[0] = HLE_MENU_STR_BUF;
     }
 }
