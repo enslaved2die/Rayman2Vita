@@ -8,7 +8,7 @@ enum { GL_FALSE = 0, GL_TRUE = 1, GL_DEPTH_TEST = 0xB71, GL_BLEND = 0xBE2, GL_AL
        GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_BUFFER_BIT = 0x100, GL_STENCIL_BUFFER_BIT = 0x400,
        GL_NEVER = 0x200, GL_LESS, GL_EQUAL, GL_LEQUAL, GL_GREATER, GL_NOTEQUAL, GL_GEQUAL, GL_ALWAYS,
        GL_ZERO = 0, GL_ONE = 1, GL_SRC_COLOR = 0x300, GL_ONE_MINUS_SRC_COLOR, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_DST_ALPHA, GL_ONE_MINUS_DST_ALPHA, GL_DST_COLOR, GL_ONE_MINUS_DST_COLOR,
-       GL_PROJECTION = 0x1701, GL_MODELVIEW = 0x1700, GL_FLOAT = 0x1406, GL_UNSIGNED_BYTE = 0x1401, GL_RGBA = 0x1908, GL_RGB = 0x1907, GL_UNSIGNED_SHORT_5_6_5 = 0x8363, GL_TRIANGLES = 4,
+       GL_PROJECTION = 0x1701, GL_MODELVIEW = 0x1700, GL_FLOAT = 0x1406, GL_UNSIGNED_BYTE = 0x1401, GL_RGBA = 0x1908, GL_RGB = 0x1907, GL_UNSIGNED_SHORT_4_4_4_4 = 0x8033, GL_UNSIGNED_SHORT_5_5_5_1 = 0x8034, GL_UNSIGNED_SHORT_5_6_5 = 0x8363, GL_TRIANGLES = 4,
        GL_VERTEX_ARRAY = 0x8074, GL_COLOR_ARRAY = 0x8076, GL_TEXTURE_COORD_ARRAY = 0x8078,
        GL_TEXTURE_ENV = 0x2300, GL_TEXTURE_ENV_MODE = 0x2200, GL_REPLACE = 0x1E01, GL_MODULATE = 0x2100, GL_DECAL = 0x2101,
        GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800, GL_TEXTURE_WRAP_S = 0x2802, GL_TEXTURE_WRAP_T = 0x2803,
@@ -59,7 +59,7 @@ static inline void glTexEnvi(GLenum a, GLenum b, GLint c) { (void)a; (void)b; fg
 #define GL_TEXTURE_ENV_COLOR 0x2201
 static inline void glTexEnvfv(GLenum a, GLenum b, const GLfloat *c) { (void)a; (void)b; (void)c; fg.other++; }
 static inline void glBindTexture(GLenum t, GLuint id) { (void)t; fgr.bound = (int)(id & 0xFFFF); FGC(bind); }
-static inline void glTexImage2D(GLenum t, int l, int ifmt, int w, int h, int b, GLenum f, GLenum ty, const void *p) { (void)t; (void)l; (void)ifmt; (void)b; (void)f; (void)ty; fgr.tex[fgr.bound].pix = fgr_hash_bytes(p, (size_t)w * h * 4); fgr.tex[fgr.bound].w = w; fgr.tex[fgr.bound].h = h; fgr.tex[fgr.bound].has = 1; fg.teximage++; }
+static inline void glTexImage2D(GLenum t, int l, int ifmt, int w, int h, int b, GLenum f, GLenum ty, const void *p) { (void)t; (void)l; (void)ifmt; (void)b; (void)f; size_t bpp = (ty == GL_UNSIGNED_SHORT_5_6_5 || ty == GL_UNSIGNED_SHORT_5_5_5_1 || ty == GL_UNSIGNED_SHORT_4_4_4_4) ? 2 : 4; fgr.tex[fgr.bound].pix = fgr_hash_bytes(p, (size_t)w * h * bpp); fgr.tex[fgr.bound].w = w; fgr.tex[fgr.bound].h = h; fgr.tex[fgr.bound].has = 1; fg.teximage++; }
 static inline void glGenTextures(int n, GLuint *ids) { static GLuint next = 1; for (int i = 0; i < n; i++) { ids[i] = next++; if (next > 60000) next = 1; memset(&fgr.tex[ids[i]], 0, sizeof fgr.tex[0]); } fg.gen++; }
 static inline void glDeleteTextures(int n, const GLuint *ids) { for (int i = 0; i < n; i++) memset(&fgr.tex[ids[i] & 0xFFFF], 0, sizeof fgr.tex[0]); fg.other++; }
 static inline void glGenerateMipmap(GLenum t) { (void)t; fg.other++; }

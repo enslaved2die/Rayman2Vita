@@ -837,6 +837,100 @@ int ta_tex_decode(const uint8_t *vram, uint32_t vn, uint32_t tcw, uint32_t tsp, 
     return 0;
 }
 
+static inline uint16_t conv_px16(uint32_t p, int fmt, int force_opaque)
+{
+    if (fmt == 0) {
+        /* ARGB1555 -> GL_UNSIGNED_SHORT_5_5_5_1:
+         * PVR: A[15], R[14:10], G[9:5], B[4:0]
+         * GL5551: R[15:11], G[10:6], B[5:1], A[0] */
+        uint32_t a = (p >> 15) & 1;
+        if (force_opaque) a = 1;
+        return (uint16_t)(((p & 0x7FFFu) << 1) | a);
+    } else if (fmt == 1) {
+        /* RGB565 -> GL_UNSIGNED_SHORT_5_6_5:
+         * PVR: R[15:11], G[10:5], B[4:0]
+         * GL565: R[15:11], G[10:5], B[4:0] */
+        return (uint16_t)p;
+    } else if (fmt == 2) {
+        /* ARGB4444 -> GL_UNSIGNED_SHORT_4_4_4_4:
+         * PVR: A[15:12], R[11:8], G[7:4], B[3:0]
+         * GL4444: R[15:12], G[11:8], B[7:4], A[3:0] */
+        uint32_t a = (p >> 12) & 15;
+        if (force_opaque) a = 15;
+        return (uint16_t)(((p & 0x0FFFu) << 4) | a);
+    }
+    return 0;
+}
+
+int ta_tex_decode16(const uint8_t *vram, uint32_t vn, uint32_t tcw, uint32_t tsp, const TaTexEnv *env, int level, int force_opaque, uint16_t *out)
+{
+    (void)env;
+    int W, H; ta_tex_size(tsp, &W, &H);
+    int mip = (int)(tcw >> 31), vq = (int)((tcw >> 30) & 1), fmt = (int)((tcw >> 27) & 7), nontw = (int)((tcw >> 26) & 1);
+    if (fmt > 2) return -1;
+    uint32_t base = (tcw & 0x1FFFFFu) << 3;
+    uint32_t w = (uint32_t)W >> level, h = (uint32_t)H >> level;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    if (mip) h = w;                                   /* mip chains are square */
+    uint32_t S = (w * w - 1) / 3;                     /* texels in all smaller levels (4^k sums) */
+    if (vq) {
+        uint32_t off = 2048, bw = w > 1 ? w / 2 : 1, bh = h > 1 ? h / 2 : 1;
+        if (mip) { uint32_t o = 0; for (uint32_t s = 1; s < w; s <<= 1) o += (s == 1) ? 1 : (s / 2) * (s / 2); off += o; }
+        for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
+            uint32_t bidx = twid(x >> 1, y >> 1, bw, bh);
+            uint32_t e = rd8(vram, vn, base + off + bidx);
+            uint32_t p = rd16(vram, vn, base + e * 8 + (((x & 1) * 2 + (y & 1)) * 2));
+            out[y * w + x] = conv_px16(p, fmt, force_opaque);
+        }
+    } else {
+        uint32_t off = mip ? 2 * S + 6 : 0;
+        uint32_t stride = w;
+        if (nontw && ((tcw >> 25) & 1)) stride = (env ? (env->text_control & 31) : 0) * 32, stride = stride ? stride : w;
+        for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
+            uint32_t i = nontw ? y * stride + x : twid(x, y, w, h);
+            out[y * w + x] = conv_px16(rd16(vram, vn, base + off + i * 2), fmt, force_opaque);
+        }
+    }
+    /* Colour bleed: replicate neighbour RGB into alpha-0 texels */
+    if (fmt == 0) {
+        uint32_t n = w * h, nt = 0;
+        for (uint32_t i = 0; i < n; i++) nt += ((out[i] & 1) == 0);
+        if (nt && nt < n) {
+            for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
+                if (out[y * w + x] & 1) continue;
+                uint32_t sr = 0, sg = 0, sb = 0, c = 0;
+                for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                    int xx = (int)x + dx, yy = (int)y + dy;
+                    if ((dx | dy) == 0 || xx < 0 || yy < 0 || xx >= (int)w || yy >= (int)h) continue;
+                    uint16_t p = out[(uint32_t)yy * w + (uint32_t)xx];
+                    if (!(p & 1)) continue;
+                    sr += (p >> 11) & 31; sg += (p >> 6) & 31; sb += (p >> 1) & 31; c++;
+                }
+                if (c) out[y * w + x] = (uint16_t)(((sr / c) << 11) | ((sg / c) << 6) | ((sb / c) << 1));
+            }
+        }
+    } else if (fmt == 2) {
+        uint32_t n = w * h, nt = 0;
+        for (uint32_t i = 0; i < n; i++) nt += ((out[i] & 15) == 0);
+        if (nt && nt < n) {
+            for (uint32_t y = 0; y < h; y++) for (uint32_t x = 0; x < w; x++) {
+                if (out[y * w + x] & 15) continue;
+                uint32_t sr = 0, sg = 0, sb = 0, c = 0;
+                for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                    int xx = (int)x + dx, yy = (int)y + dy;
+                    if ((dx | dy) == 0 || xx < 0 || yy < 0 || xx >= (int)w || yy >= (int)h) continue;
+                    uint16_t p = out[(uint32_t)yy * w + (uint32_t)xx];
+                    if (!(p & 15)) continue;
+                    sr += (p >> 12) & 15; sg += (p >> 8) & 15; sb += (p >> 4) & 15; c++;
+                }
+                if (c) out[y * w + x] = (uint16_t)(((sr / c) << 12) | ((sg / c) << 8) | ((sb / c) << 4));
+            }
+        }
+    }
+    return 0;
+}
+
 void ta_gl_free(TaGl *g) { free(g->verts); free(g->batches); free(g->sidx); memset(g, 0, sizeof *g); }
 
 

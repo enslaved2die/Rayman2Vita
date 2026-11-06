@@ -99,7 +99,7 @@ typedef struct {
 static GTexEntry s_gtex[TEX_CACHE_SIZE];
 static RTexEntry s_rtex[TEX_CACHE_SIZE];
 
-typedef struct { uint16_t slot; uint8_t reset, levels; uint16_t w, h; uint32_t *pix; } TexOp;   /* pix == NULL with reset: delete the slot's GL texture */
+typedef struct { uint16_t slot; uint8_t reset, levels, fmt; uint16_t w, h; void *pix; } TexOp;   /* pix == NULL with reset: delete the slot's GL texture; fmt: 0 ARGB1555, 1 RGB565, 2 ARGB4444, other 32-bit RGBA */
 typedef struct { uint32_t tcw, tsp; int slot; } TexRef;
 typedef struct RenderJob {
     TaFrame *frame;                     /* owned by the job: freed by the render side after drawing (NULL until parsed when raw != NULL) */
@@ -189,23 +189,35 @@ static void apply_tex_params(RTexEntry *e, uint32_t tsp)
     if (e->wrap_t != wt) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt); e->wrap_t = wt; vita_gl_perf.tex_params++; pf.tex_param++; }
 }
 
-/* GUEST: decode the texture of (tcw, tsp) from VRAM into a fresh pixel buffer (the render side uploads and frees it).  Returns the buffer or NULL. */
-static uint32_t *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph)
+/* GUEST: decode the texture of (tcw, tsp) from VRAM into a fresh pixel buffer (the render side uploads and frees it).  Returns the buffer or NULL.
+ * For formats 0 (ARGB1555), 1 (RGB565), and 2 (ARGB4444), decodes directly into a 16-bit buffer. */
+static void *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph, uint8_t *pfmt)
 {
     uint8_t *vram = hle_vram_ptr();
     if (!vram) return NULL;
     int w, h;
     ta_tex_size(tsp, &w, &h);
     if (tcw >> 31) h = w;                             /* mip chains are square */
-    uint32_t *px = (uint32_t *)malloc((size_t)w * h * sizeof(uint32_t));
-    if (!px) return NULL;
     const uint32_t *pr = hle_pvr_regs();
     TaTexEnv env = { pr + 0x400, PVR_REG(0x005F8108u), PVR_REG(0x005F80E4u) };   /* palette RAM, PAL_RAM_CTRL, TEXT_CONTROL */
     int fmt = (int)((tcw >> 27) & 7);
-    if (!(fmt == 5 || fmt == 6)) env.pal = NULL;
     int force_op = (fmt == 0) ? 0 : (int)((tsp >> 19) & 1);
+    *pfmt = (uint8_t)fmt;
+    if (fmt <= 2) {
+        uint16_t *px16 = (uint16_t *)malloc((size_t)w * h * sizeof(uint16_t));
+        if (!px16) return NULL;
+        if (ta_tex_decode16(vram, 8u << 20, tcw, tsp, &env, 0, force_op, px16) == 0) {
+            *pw = w; *ph = h;
+            return px16;
+        }
+        free(px16);
+    }
+    uint32_t *px = (uint32_t *)malloc((size_t)w * h * sizeof(uint32_t));
+    if (!px) return NULL;
+    if (!(fmt == 5 || fmt == 6)) env.pal = NULL;
     ta_tex_decode(vram, 8u << 20, tcw, tsp, &env, 0, force_op, px);
     *pw = w; *ph = h;
+    *pfmt = 255; /* 32-bit RGBA */
     return px;
 }
 
@@ -246,10 +258,10 @@ static int guest_texture_slot(RenderJob *j, uint32_t tcw, uint32_t tsp_full)
             int sl = (int)(e - s_gtex);
             if (!entry_valid(e)) {
                 s_tex_redecodes++;
-                int w, hh; uint32_t *px = decode_texture(tcw, tsp, &w, &hh);
-                if (!px) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = 0; memset(e, 0, sizeof *e); return -1; }
+                int w, hh; uint8_t fmt; void *px = decode_texture(tcw, tsp, &w, &hh, &fmt);
+                if (!px) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = op->fmt = 0; memset(e, 0, sizeof *e); return -1; }
                 hle_texstamp_set(&e->stamp, tcw, tsp); e->dec_frame = (int)s_gframe_no; e->chk_frame = (int)s_gframe_no;
-                TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 0; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh; op->levels = (uint8_t)ta_tex_levels(tcw, tsp);
+                TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 0; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh; op->levels = (uint8_t)ta_tex_levels(tcw, tsp); op->fmt = fmt;
             }
             return sl;
         }
@@ -262,10 +274,10 @@ static int guest_texture_slot(RenderJob *j, uint32_t tcw, uint32_t tsp_full)
     s_tex_misses++;
     memset(slot, 0, sizeof *slot);
     slot->tcw = tcw; slot->tsp = tsp;
-    int w, hh; uint32_t *px = decode_texture(tcw, tsp, &w, &hh);
-    if (!px) { memset(slot, 0, sizeof *slot); if (reset) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = 0; } return -1; }
+    int w, hh; uint8_t fmt; void *px = decode_texture(tcw, tsp, &w, &hh, &fmt);
+    if (!px) { memset(slot, 0, sizeof *slot); if (reset) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = op->fmt = 0; } return -1; }
     hle_texstamp_set(&slot->stamp, tcw, tsp); slot->dec_frame = (int)s_gframe_no; slot->chk_frame = (int)s_gframe_no; slot->used = 1;
-    TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = (uint8_t)reset; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh; op->levels = (uint8_t)ta_tex_levels(tcw, tsp);
+    TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = (uint8_t)reset; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh; op->levels = (uint8_t)ta_tex_levels(tcw, tsp); op->fmt = fmt;
     return sl;
 }
 
@@ -282,13 +294,24 @@ static void render_exec_ops(RenderJob *j)
         if (e->tex_id == 0) glGenTextures(1, &e->tex_id);
         if (e->tex_id) {
             bind_tex(e->tex_id);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, op->w, op->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, op->pix);
-            vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += (uint32_t)op->w * op->h * 4;
+            GLenum ifmt, format, type;
+            uint32_t bpp;
+            if (op->fmt == 0) {
+                ifmt = GL_RGBA; format = GL_RGBA; type = GL_UNSIGNED_SHORT_5_5_5_1; bpp = 2;
+            } else if (op->fmt == 1) {
+                ifmt = GL_RGB; format = GL_RGB; type = GL_UNSIGNED_SHORT_5_6_5; bpp = 2;
+            } else if (op->fmt == 2) {
+                ifmt = GL_RGBA; format = GL_RGBA; type = GL_UNSIGNED_SHORT_4_4_4_4; bpp = 2;
+            } else {
+                ifmt = GL_RGBA; format = GL_RGBA; type = GL_UNSIGNED_BYTE; bpp = 4;
+            }
+            glTexImage2D(GL_TEXTURE_2D, 0, ifmt, op->w, op->h, 0, format, type, op->pix);
+            vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += (uint32_t)op->w * op->h * bpp;
             e->levels = op->levels;
             if (op->levels > 1) glGenerateMipmap(GL_TEXTURE_2D);   /* the PVR mip levels are box-filtered versions of level 0 in the source files */
             e->minf = e->magf = e->wrap_s = e->wrap_t = 0;        /* (re)apply filter / wrap for the TSP the batch draws with */
 #if R2_PERF
-            g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)op->w * op->h * 4;
+            g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)op->w * op->h * bpp;
 #endif
         }
 #if R2_PERF
@@ -910,19 +933,55 @@ static void vita_gl_render_frame_impl(RenderJob *job)
             const TaState *st = &batch->st;
             if (s_only_tcw && list_id == TA_L_TRANS && st->tcw != s_only_tcw) continue;
 
+            int hud = 0;
+            if (list_id == TA_L_TRANS) {                /* HUD-layer translucent batch (every vertex at the clamped ceiling): coplanar with the bars, so a strict depth func would reject it; draw in order */
+                hud = 1;
+                for (uint32_t i = 0; i < batch->count; i++) if (gl.verts[batch->first + i].z < hud_z * 0.999f) { hud = 0; break; }
+            }
+
+            /* Batch coalescing: look ahead in sorted draw order. Contiguous batches in vertex buffer
+             * that share the exact same render state can be drawn with a single glDrawArrays call. */
+            uint32_t coalesce_cnt = 0;
+            while (bi + 1 + coalesce_cnt < n_ord) {
+                uint32_t next_b = sorted ? s_ord[bi + 1 + coalesce_cnt] : (bi + 1 + coalesce_cnt);
+                const TaBatch *next_bt = &gl.batches[first_b + next_b];
+                if (next_bt->count == 0) { coalesce_cnt++; continue; }
+                if (s_only_tcw && list_id == TA_L_TRANS && next_bt->st.tcw != s_only_tcw) break;
+                /* Must be contiguous in vertex stream */
+                const TaBatch *prev_bt = &gl.batches[first_b + (sorted ? s_ord[bi + coalesce_cnt] : (bi + coalesce_cnt))];
+                if (next_bt->first != prev_bt->first + prev_bt->count) break;
+
+                /* State comparison */
+                const TaState *nst = &next_bt->st;
+                if (nst->tcw != st->tcw || nst->tsp != st->tsp) break;
+                if (nst->depth_mode != st->depth_mode || nst->z_write_disable != st->z_write_disable) break;
+                if (nst->src_blend != st->src_blend || nst->dst_blend != st->dst_blend || nst->use_alpha != st->use_alpha) break;
+                if (nst->shading != st->shading || nst->fog_ctrl != st->fog_ctrl) break;
+                if (nst->pixel_format != st->pixel_format || nst->textured != st->textured || nst->shadow != st->shadow) break;
+
+                if (list_id == TA_L_TRANS) {
+                    int next_hud = 1;
+                    for (uint32_t i = 0; i < next_bt->count; i++) if (gl.verts[next_bt->first + i].z < hud_z * 0.999f) { next_hud = 0; break; }
+                    if (next_hud != hud) break;
+                }
+                coalesce_cnt++;
+            }
+
+            uint32_t total_batch_count = batch->count;
+            if (coalesce_cnt > 0) {
+                const TaBatch *last_bt = &gl.batches[first_b + (sorted ? s_ord[bi + coalesce_cnt] : (bi + coalesce_cnt))];
+                total_batch_count = (last_bt->first + last_bt->count) - batch->first;
+            }
+
             gc_depth_test(1);
             /* Translucent list: the game's coplanar overlays (bump-map / detail strips over the terrain, water ripples) share the exact depth of the surface below and use depth mode GREATER (never GEQUAL
              * in any dumped frame), so they must pass on equality like on the PVR (its sorted translucent pass ties pass); strict GREATER rejected every pixel of them. */
             gc_depth_func(list_id == TA_L_TRANS && (st->depth_mode & 7) == 4 ? GL_GEQUAL : s_gl_depth_funcs[st->depth_mode & 7]);
-            if (list_id == TA_L_TRANS) {                /* HUD-layer translucent batch (every vertex at the clamped ceiling): coplanar with the bars, so a strict depth func would reject it; draw in order */
-                int hud = 1;
-                for (uint32_t i = 0; i < batch->count; i++) if (gl.verts[batch->first + i].z < hud_z * 0.999f) { hud = 0; break; }
-                if (hud) gc_depth_func(GL_ALWAYS);
-            }
+            if (hud) gc_depth_func(GL_ALWAYS);
             int is_cutout_trans = (list_id == TA_L_TRANS && st->textured && st->pixel_format == 0);
             gc_depth_mask(!st->z_write_disable && (list_id != TA_L_TRANS || is_cutout_trans));
             if (dbg && bi < 8) { const TaGlVertex *v0 = &gl.verts[batch->first]; gl_logf("[vita]     tcw=%08x tsp=%08x shade=%d tex=%d v0 col=%.2f,%.2f,%.2f,%.2f v1 col=%.2f,%.2f,%.2f,%.2f", (unsigned)st->tcw, (unsigned)st->tsp, st->shading, st->textured, v0[0].r, v0[0].g, v0[0].b, v0[0].a, v0[1].r, v0[1].g, v0[1].b, v0[1].a); }
-            if (dbg && bi < 8) gl_logf("[vita]   trans b=%u cnt=%u depth_mode=%d zwd=%d mask=%d func=%d", b, batch->count, st->depth_mode, st->z_write_disable, (st->z_write_disable || list_id == TA_L_TRANS) ? 0 : 1, (int)s_gl_depth_funcs[st->depth_mode & 7]);
+            if (dbg && bi < 8) gl_logf("[vita]   trans b=%u cnt=%u depth_mode=%d zwd=%d mask=%d func=%d", b, total_batch_count, st->depth_mode, st->z_write_disable, (st->z_write_disable || list_id == TA_L_TRANS) ? 0 : 1, (int)s_gl_depth_funcs[st->depth_mode & 7]);
 
             if (list_id == TA_L_TRANS) {
                 gc_blend(1);
@@ -982,7 +1041,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
             const int additive = (list_id == TA_L_TRANS && st->dst_blend == 1);
             if (list_id == TA_L_TRANS && tfog_on) {
                 float amax = 0.0f;
-                for (uint32_t i = 0; i < batch->count; i++) {
+                for (uint32_t i = 0; i < total_batch_count; i++) {
                     uint32_t vi = batch->first + i;
                     float a = ta_fog_alpha(gl.verts[vi].z, fog_den, fog_table);
                     s_fc[vi][3] = s_cv[vi].a;
@@ -993,7 +1052,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
                 if (amax > 1.0f / 255.0f) { gc_color_ptr(s_fc, FC_STRIDE); pre_fogged = 1; }
             }
             uint64_t td0 = r2_now_us();
-            glDrawArrays(GL_TRIANGLES, batch->first, batch->count);
+            glDrawArrays(GL_TRIANGLES, batch->first, total_batch_count);
             if (!s_ph.first_draw1) { s_ph.first_draw0 = td0; s_ph.first_draw1 = r2_now_us(); }
 #if R2_PERF
             {   /* first-use cost detector: a single draw call that takes > 5 ms is (almost certainly) vitaGL creating a shader / fragment program for a state combination it had not seen (task 3, notes_render_thread.md) */
@@ -1001,14 +1060,14 @@ static void vita_gl_render_frame_impl(RenderJob *job)
                 if (dt > 5000 && s_slow_logged < 64 && r2_perf_sink) {
                     char ln[300]; s_slow_logged++;
                     snprintf(ln, sizeof ln, "[perf] SLOW DRAW %llu us (render frame %d, guest frame %lu): list %d tex=%d shade=%d alpha_test=%d blend=%d/%d use_alpha=%d fmt=%d verts=%u",
-                             (unsigned long long)dt, s_frame_no, hle_frame_count, list_id, st->textured, st->shading, list_id == TA_L_PUNCH, st->src_blend, st->dst_blend, st->use_alpha, st->pixel_format, batch->count);
+                             (unsigned long long)dt, s_frame_no, hle_frame_count, list_id, st->textured, st->shading, list_id == TA_L_PUNCH, st->src_blend, st->dst_blend, st->use_alpha, st->pixel_format, total_batch_count);
                     r2_perf_sink(ln);
                 }
             }
 #endif
-            vita_gl_perf.draws++; vita_gl_perf.verts += batch->count; pf.draws++; pf.verts += batch->count;
+            vita_gl_perf.draws++; vita_gl_perf.verts += total_batch_count; pf.draws++; pf.verts += total_batch_count;
 #if R2_PERF || R2_PF
-            {   const float ar = perf_area(&gl.verts[batch->first], batch->count);
+            {   const float ar = perf_area(&gl.verts[batch->first], total_batch_count);
                 if (list_id == TA_L_TRANS) pf.area_trans += ar; else if (list_id == TA_L_PUNCH) pf.area_punch += ar; else pf.area_opq += ar;
 #if R2_PERF
                 g_perf.area[list_id == TA_L_TRANS ? 2 : list_id == TA_L_PUNCH ? 1 : 0] += ar;
@@ -1028,7 +1087,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
             if (fog_post) {
                 float amax = 0.0f;
                 const int opq = (list_id == TA_L_OPAQUE);                           /* non-opaque: a = vertex alpha * fog; opaque: a = fog */
-                for (uint32_t i = 0; i < batch->count; i++) {
+                for (uint32_t i = 0; i < total_batch_count; i++) {
                     uint32_t vi = batch->first + i;
                     float a = ta_fog_alpha(gl.verts[vi].z, fog_den, fog_table);
                     s_fc[vi][0] = fog_r; s_fc[vi][1] = fog_g; s_fc[vi][2] = fog_b;
@@ -1036,12 +1095,13 @@ static void vita_gl_render_frame_impl(RenderJob *job)
                     if (a > amax) amax = a;
                 }
                 if (amax > 1.0f / 255.0f) {
-                    FogJob fj = { batch->first, batch->count, tex_id, (uint8_t)fog_textured, (uint8_t)(list_id != TA_L_TRANS || st->pixel_format == 0) };
+                    FogJob fj = { batch->first, total_batch_count, tex_id, (uint8_t)fog_textured, (uint8_t)(list_id != TA_L_TRANS || st->pixel_format == 0) };
                     if (defer_fog) fq[nfq++] = fj;
                     else { fog_pass_draw(&st_cur, &fj, fog_ram, fog_r, fog_g, fog_b, gl.verts); gc_color_ptr(&s_cv[0].r, CV_STRIDE); gc_blend(0); }
                 }
             }
-            if (s_dump_pending) gl_logf("[gl]  list %d batch %u first=%u count=%u tex=%u fmt=%u/%u/%u shade=%d depth=%d zwd=%d blend=%d/%d ua=%d glerr=0x%x", list_id, b, batch->first, batch->count, tex_id, st->pixel_format, st->mip_mapped, st->vq, st->shading, st->depth_mode, st->z_write_disable, st->src_blend, st->dst_blend, st->use_alpha, (unsigned)glGetError());
+            if (s_dump_pending) gl_logf("[gl]  list %d batch %u first=%u count=%u (coal=%u) tex=%u fmt=%u/%u/%u shade=%d depth=%d zwd=%d blend=%d/%d ua=%d glerr=0x%x", list_id, b, batch->first, total_batch_count, coalesce_cnt, tex_id, st->pixel_format, st->mip_mapped, st->vq, st->shading, st->depth_mode, st->z_write_disable, st->src_blend, st->dst_blend, st->use_alpha, (unsigned)glGetError());
+            bi += coalesce_cnt;
         }
         if (nfq) {                                  /* deferred fog passes of this list, in the original order */
             for (uint32_t q = 0; q < nfq; q++) fog_pass_draw(&st_cur, &fq[q], fog_ram, fog_r, fog_g, fog_b, gl.verts);

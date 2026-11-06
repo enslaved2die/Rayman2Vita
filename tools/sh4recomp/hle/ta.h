@@ -235,6 +235,9 @@ int  ta_tex_levels(uint32_t tcw, uint32_t tsp);
 /* Decode one level into rgba (size (w>>level)*(h>>level) words). `vram` is the PVR-order texture memory (linear, byte address = tcw[20:0]*8) of
  * vram_size bytes; out-of-range reads give 0.  force_opaque sets alpha to 255 (TSP ignore-texture-alpha).  Returns 0, or -1 for unsupported (bump). */
 int  ta_tex_decode(const uint8_t *vram, uint32_t vram_size, uint32_t tcw, uint32_t tsp, const TaTexEnv *env, int level, int force_opaque, uint32_t *rgba);
+/* 16-bit decode directly to GL_UNSIGNED_SHORT_5_5_5_1 (fmt 0), GL_UNSIGNED_SHORT_5_6_5 (fmt 1), or GL_UNSIGNED_SHORT_4_4_4_4 (fmt 2).
+ * Returns 0 on success, or -1 if unsupported (non-16-bit format). */
+int  ta_tex_decode16(const uint8_t *vram, uint32_t vram_size, uint32_t tcw, uint32_t tsp, const TaTexEnv *env, int level, int force_opaque, uint16_t *out);
 
 /* ---- fog (TSP fog control 0 = table lookup) ----
  * FOG_DENSITY = mantissa[15:8]/128 * 2^(int8)[7:0]; z = clamp(invW * density, 1, 255.99); e = floor(log2 z); m = z*16/2^e - 16; idx = floor(m) + 16e (0..127);

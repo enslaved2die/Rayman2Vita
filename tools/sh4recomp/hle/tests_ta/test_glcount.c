@@ -3,6 +3,7 @@
  * hashed for texture validation.  Build it against two source trees (before / after) to compare:   see Makefile target test-glcount.
  * usage: test_glcount frame.bin vram.bin pvrregs.bin pvrfog.bin [frames=6] */
 #include "vitaGL.h"
+uint32_t r2_perf_post_dbg[4];
 #include "../vita_gl_render.c"
 #include <stdio.h>
 #include <stdlib.h>
