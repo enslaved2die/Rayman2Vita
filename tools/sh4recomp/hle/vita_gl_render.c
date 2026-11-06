@@ -1237,6 +1237,12 @@ static RenderJob *prepare_job(TaFrame *frame, TaRaw *raw, uint32_t shad)
 #else
     j->native = NULL;
 #endif
+#ifdef R2_NATIVE_GFX
+    if (j->native) {      /* pure native frame: no PVR register snapshot, no background plane, and above all no TA texture validation / decode / upload (the native texture store is the only one) */
+        j->have_bg = 0; j->wide = hle_ta_wide_active(); j->fpmode = fp_get(); j->t_prep_us = r2_now_us() - t0;
+        return j;
+    }
+#endif
     memcpy(j->regs, hle_pvr_regs(), sizeof j->regs);
     j->have_bg = hle_ta_background(j->bg, &j->bg_isp, &j->bg_tsp, &j->bg_tcw);
     j->wide = hle_ta_wide_active();
@@ -1385,9 +1391,9 @@ static void render_job_exec(RenderJob *j)
         return;
     }
 #ifdef R2_NATIVE_GFX
-    if (j->native) {      /* native renderer draws this frame instead of the TA strips; the guest texture ops still run so the TA path's texture cache stays consistent */
+    if (j->native) {      /* pure native: the native renderer draws this frame (or a clear frame); no TA texture ops, no TA strips */
         s_frame_no++; vita_gl_perf.frames++;
-        render_exec_ops(j); gc_reset();
+        gc_reset();
         native_hook_render(j->native); j->native = NULL;
         s_cur_tex = (GLuint)-1; gc_reset();
         if (fp_saved != j->fpmode) fp_set(fp_saved);
@@ -1453,6 +1459,9 @@ static void render_thread_loop(void)
         RenderJob *j = s_ring[s_ring_tail]; s_ring_tail = (s_ring_tail + 1) % (RT_JOBS + 1);
         if (!j) break;                              /* shutdown marker */
         rt_stress_delay();
+#ifdef R2_NATIVE_GFX
+        if (j->raw && j->native) { ta_raw_free(j->raw); j->raw = NULL; }    /* pure native: the captured TA packets are dropped unparsed */
+#endif
         if (j->raw) {                               /* deferred parse: raw packets -> TaFrame on this thread (parse state persists across frames in s_rctx, packets arrive in guest order) */
 #if R2_PERF
             uint64_t tp = r2_now_us();

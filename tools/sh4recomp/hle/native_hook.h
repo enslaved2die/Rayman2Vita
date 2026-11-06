@@ -6,7 +6,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-void *native_hook_frame(void);            /* guest thread; NULL = draw this frame with the recompiled TA path */
+int   native_hook_pure(void);             /* 1 when the NATIVE_GFX file exists: pure native mode (no recompiled-TA drawing, no TA texture bookkeeping at all) */
+void *native_hook_frame(void);            /* guest thread; NULL = switch off (recompiled TA path draws this frame); in pure mode never NULL: a NatJob, or a clear-frame sentinel when the native path is not ready */
 void  native_hook_render(void *job);      /* render thread, GL context current; takes ownership of job */
 void  vita_gl_set_pending_native(void *job);   /* vita_gl_render.c: the next presented job carries `job` (NULL = none) */
 #ifdef __cplusplus

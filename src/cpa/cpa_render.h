@@ -64,6 +64,8 @@ typedef struct CpaRenderStats {
     uint32_t passByFlags;                                            /* source batches whose pass/blend came from tex.flags (flag rule) instead of the drawlist's alphaClass */
     uint32_t haveVis, visSector, visNIpos;
     uint32_t hudQuads, hudTranslucent, hudAdditive, hudTexMissing;   /* HUD pass: quads, of those translucent / additive, and quads whose texture does not resolve in the store */
+    /* stage timers in microseconds (only filled when CpaRenderOpts.now_us is set): visibility + cull, static batches, actor pose, actor lighting selection, actor geometry (vertex transform + vertex colours), sprites, sort/merge/vertex stream, HUD */
+    uint32_t usVis, usStatic, usPose, usLight, usActorGeo, usSprites, usVerts, usHud;
 } CpaRenderStats;
 
 /* HUD quad as submitted to the backend's 2D pass: the cpa_hud quad plus the state the guest's 2D path gives it. Drawn AFTER all 3D passes in the 640x480 virtual ortho space
@@ -168,6 +170,7 @@ typedef struct CpaRenderOpts {
     int animMode;               /* cpa_anim mode, default CPA_ANIM_BEST */
     float spriteHalfScale;      /* default 0.5 (sizeX/sizeY taken as full sizes; UNVERIFIED) */
     CpaTexDescribeFn describe; void *describeUser;
+    uint64_t (*now_us)(void);   /* optional monotonic microsecond clock for the per-stage timers in CpaRenderStats (NULL = timers stay 0) */
 } CpaRenderOpts;
 void cpa_render_opts_default(CpaRenderOpts *o);
 

@@ -301,6 +301,9 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
     const CpaScene *S = c->scene; const CpaRenderOpts *O = &c->opts;
     memset(out, 0, sizeof *out); out->cam = in->cam; out->w = in->w; out->h = in->h; out->fit = in->fit;
     CpaRenderStats *st = &out->st;
+#define TNOW() (O->now_us ? O->now_us() : 0u)
+    uint64_t tq = TNOW();
+#define TLAP(field) do { if (O->now_us) { uint64_t tn_ = O->now_us(); st->field += (uint32_t)(tn_ - tq); tq = tn_; } } while (0)
     Build B; memset(&B, 0, sizeof B); B.flagRule = O->flagRule; B.cutoutTrans = O->cutoutAsTranslucent; B.store = c->store;
     B.lighting = O->useLighting; B.lights = in->lights; B.nLights = in->nLights > CPA_RENDER_MAXLIGHTS ? CPA_RENDER_MAXLIGHTS : in->nLights;
     cpa_light_env_default(&B.env); cpa_light_env_from_list(in->lights, B.nLights, &B.env);
@@ -321,6 +324,7 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
             if (drawnActors) { for (uint32_t i = 0; i < vis.nDrawn; i++) if (cpa_u32(&S->img, vis.drawn[i]) == CPA_SO_ACTOR) drawnActors[nDrawnActors++] = vis.drawn[i]; qsort(drawnActors, nDrawnActors, 4, cmp_u32); } }
     }
 
+    TLAP(usVis);
     /* 2. static batches + sprites from the draw list */
     CpaDrawList dl; CpaDrawListOpts dopt; cpa_drawlist_opts_default(&dopt); dopt.includeLayer2 = O->includeLayer2; dopt.includeSprites = O->includeSprites; dopt.cull = haveCull ? &cull : NULL;
     if (!cpa_drawlist_build(&dl, S, &dopt)) { cpa_vis_cull_free(&cull); cpa_vis_free(&vis); free(drawnActors); return 0; }
@@ -341,6 +345,7 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
         st->staticBatches++;
     }
     if (haveCull) st->staticTrisCulled = cull.nTriCulled;
+    TLAP(usStatic);
 
     /* 3. posed actors */
     const CpaImage *aim = in->actorImg ? in->actorImg : &S->img;
@@ -349,7 +354,9 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
         for (uint32_t a = 0; rig && a < in->nActors && !B.oom; a++) {
             const CpaRenderActor *ra = &in->actors[a]; CpaAnimActor A; st->actorsGiven++;
             if (O->actorMode == 2 && haveVis && !bsearch(&ra->soVa, drawnActors, nDrawnActors, 4, cmp_u32)) { st->actorsVisCulled++; continue; }
-            if (!cpa_anim_actor_open(&A, aim, &c->tables, ra->soVa) || !cpa_anim_rig_pose(&A, ra->anim, ra->frame, O->animMode, ra->matrix, rig)) { st->actorsFailed++; continue; }
+            TLAP(usActorGeo);
+            if (!cpa_anim_actor_open(&A, aim, &c->tables, ra->soVa) || !cpa_anim_rig_pose(&A, ra->anim, ra->frame, O->animMode, ra->matrix, rig)) { TLAP(usPose); st->actorsFailed++; continue; }
+            TLAP(usPose);
             st->actorsPosed++;
             uint32_t mark = B.n, amark = B.an; Box box; memset(&box, 0, sizeof box);
             CpaLight actL[CPA_RENDER_MAXLIGHTS], secL[CPA_RENDER_MAXLIGHTS]; const CpaLight *stack = B.lights; uint32_t nStack = B.nLights;
@@ -357,6 +364,7 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
             B.curN = cpa_light_for_actor(aim, ra->soVa, stack, nStack, actL); B.curL = actL;   /* per-actor selection of the light list (cpa_light.h) */
             cpa_light_env_default(&B.env); cpa_light_env_from_list(actL, B.curN, &B.env);
             cpa_light_actor_alpha(aim, ra->soVa, in->hasSceneAlpha ? in->sceneAlpha : 1.0f, &B.env);   /* objAlpha / draw bit 3 of f_8c05f7a0 */
+            TLAP(usLight);
             int transList = !(B.env.drawFlags & 8u) && B.env.objAlpha < 0.98f;                      /* translucent list decision, recomp_05 f_8c037xxx: bit 3 clear and objAlpha < 0.98 */
             for (unsigned ch = 0; ch < rig->pose.nCh; ch++) {
                 int obj = rig->pose.ch[ch].obj; if (obj < 0) continue;
@@ -369,6 +377,7 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
         free(rig);
     }
 
+    TLAP(usActorGeo);
     /* 4. sprites -> quads in the arena */
     for (uint32_t i = 0; i < dl.nSprites && !B.oom; i++) {
         const CpaDrawSprite *sp = &dl.sprites[i]; float q[12]; cpa_sprite_quad(&in->cam, sp, O->spriteHalfScale, q);
@@ -385,6 +394,7 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
         store_wrap(c->store, r->texVa, &r->wrapU, &r->wrapV);
     }
     cpa_drawlist_free(&dl); cpa_vis_cull_free(&cull); cpa_vis_free(&vis); free(drawnActors);
+    TLAP(usSprites);
     if (B.oom) { free(B.b); free(B.apos); free(B.auv); free(B.acol); return 0; }
     st->srcBatches = B.n;
     if (O->cutoutAsTranslucent) for (uint32_t i = 0; i < B.n; i++) { RB *r = &B.b[i]; if (r->pass == CPA_PASS_CUTOUT) { r->pass = CPA_PASS_TRANSLUCENT; r->blend = CPA_BLEND_ALPHA; r->alphaTest = 0; r->cullBack = 0; } }
@@ -443,6 +453,7 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
             free(t); }
     }
     st->passByFlags = B.nByFlags;
+    TLAP(usVerts);
     if (in->hud && in->hud->n) {   /* 2D pass: pass/blend/wrap per quad (cpa_hud.h rules) */
         out->hud = (CpaRenderHud *)calloc(in->hud->n, sizeof *out->hud);
         if (out->hud) for (uint32_t i = 0; i < in->hud->n; i++) {
@@ -455,6 +466,7 @@ int cpa_render_build_frame(CpaRenderCtx *c, CpaRenderFrame *out, const CpaFrameI
             st->hudQuads++; st->hudTranslucent += tr; st->hudAdditive += ad;
         }
     }
+    TLAP(usHud);
     free(idx); free(B.b); free(B.apos); free(B.auv); free(B.acol);
     return 1;
 }
