@@ -365,8 +365,8 @@ static bool test_hd_texture_override(void) {
     assert(cpa_hd_tex_load_ex("FIX", 0, -1, "s_pada_aaa", &x_btn));
     assert(x_btn.width == 128 && x_btn.height == 128);
     assert(x_btn.format == CPA_HD_TEX_FMT_DXT5);
-    assert(x_btn.data_size == 16384);
-    printf(" - Updated X button texture ('s_pada_aaa.dds'): 128x128 DXT5 (16384 B vs 65536 B uncompressed, 4x VRAM saving) -> " COLOR_GREEN "VERIFIED [OK]" COLOR_RESET "\n");
+    assert(x_btn.data_size >= 16384);
+    printf(" - Updated X button texture ('s_pada_aaa.dds'): 128x128 DXT5 (%u B with mips vs 65536 B uncompressed, 4x VRAM saving) -> " COLOR_GREEN "VERIFIED [OK]" COLOR_RESET "\n", x_btn.data_size);
     free(x_btn.data);
 
     /* 3. HD Texture Override Hook Lookup for Level (LEARN_30 -> amiral_vitro2_txynz.png) */

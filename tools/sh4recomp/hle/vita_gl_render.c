@@ -20,6 +20,7 @@
 #if defined(__vita__) || defined(CPA_PLATFORM_VITA)
 
 #include <vitaGL.h>
+#include <psp2/gxm.h>
 #include <ctype.h>
 #include <psp2/kernel/clib.h>
 #include "hle.h"
@@ -186,13 +187,27 @@ static void apply_tex_params(RTexEntry *e, uint32_t tsp)
 {
     int filt = (int)((tsp >> 13) & 3);                /* 0 point, 1 bilinear, 2/3 trilinear */
     GLint magf = filt ? GL_LINEAR : GL_NEAREST, minf;
-    if (e->levels > 1) minf = filt == 0 ? GL_NEAREST_MIPMAP_NEAREST : filt == 1 ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR;
+    /* In VitaGL, GL_LINEAR_MIPMAP_NEAREST and GL_NEAREST_MIPMAP_NEAREST disable hardware mip filtering (SCE_GXM_TEXTURE_MIP_FILTER_DISABLED).
+     * To enable hardware mipmap filtering on Vita GXM, GL_*_MIPMAP_LINEAR must be used. */
+    if (e->levels > 1) minf = filt == 0 ? GL_NEAREST_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_LINEAR;
     else minf = magf;
     int clamp_v = (int)((tsp >> 15) & 1), clamp_u = (int)((tsp >> 16) & 1), flip_v = (int)((tsp >> 17) & 1), flip_u = (int)((tsp >> 18) & 1);
     GLint ws = clamp_u ? GL_CLAMP_TO_EDGE : flip_u ? GL_MIRRORED_REPEAT : GL_REPEAT, wt = clamp_v ? GL_CLAMP_TO_EDGE : flip_v ? GL_MIRRORED_REPEAT : GL_REPEAT;
     if (e->minf == minf && e->magf == magf && e->wrap_s == ws && e->wrap_t == wt) return;
     bind_tex(e->tex_id);
-    if (e->minf != minf) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minf); e->minf = minf; vita_gl_perf.tex_params++; pf.tex_param++; }
+    if (e->minf != minf) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minf);
+        e->minf = minf;
+        vita_gl_perf.tex_params++;
+        pf.tex_param++;
+        if (e->levels > 1) {
+            SceGxmTexture *gxm_tex = vglGetGxmTexture(GL_TEXTURE_2D);
+            if (gxm_tex) {
+                sceGxmTextureSetMipFilter(gxm_tex, SCE_GXM_TEXTURE_MIP_FILTER_ENABLED);
+                sceGxmTextureSetMipmapCount(gxm_tex, e->levels);
+            }
+        }
+    }
     if (e->magf != magf) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magf); e->magf = magf; vita_gl_perf.tex_params++; pf.tex_param++; }
     if (e->wrap_s != ws) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ws); e->wrap_s = ws; vita_gl_perf.tex_params++; pf.tex_param++; }
     if (e->wrap_t != wt) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt); e->wrap_t = wt; vita_gl_perf.tex_params++; pf.tex_param++; }
@@ -216,20 +231,22 @@ static void *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph, uint8_
             level_buf[i] = (char)toupper((unsigned char)c);
         }
     }
-    const char *bank = (t && t->struct_va && cpa_hd_tex_is_fix_va(t->struct_va)) ? "FIX" : (level_buf[0] ? level_buf : cpa_hd_tex_get_level());
-    CpaHdTexture hd_tex;
-    if (cpa_hd_tex_load_ex(bank, t ? t->struct_va : 0, -1, NULL, &hd_tex)) {
-        *pw = (int)hd_tex.width;
-        *ph = (int)hd_tex.height;
-        if (plevels) *plevels = hd_tex.mip_count;
-        if (hd_tex.format == CPA_HD_TEX_FMT_DXT1) {
-            *pfmt = 254; /* Hardware UBC1 / DXT1 */
-        } else if (hd_tex.format == CPA_HD_TEX_FMT_DXT5) {
-            *pfmt = 253; /* Hardware UBC3 / DXT5 */
-        } else {
-            *pfmt = 255; /* 32-bit RGBA */
+    if (cpa_hd_tex_is_enabled()) {
+        const char *bank = (t && t->struct_va && cpa_hd_tex_is_fix_va(t->struct_va)) ? "FIX" : (level_buf[0] ? level_buf : cpa_hd_tex_get_level());
+        CpaHdTexture hd_tex;
+        if (cpa_hd_tex_load_ex(bank, t ? t->struct_va : 0, -1, NULL, &hd_tex)) {
+            *pw = (int)hd_tex.width;
+            *ph = (int)hd_tex.height;
+            if (plevels) *plevels = hd_tex.mip_count;
+            if (hd_tex.format == CPA_HD_TEX_FMT_DXT1) {
+                *pfmt = 254; /* Hardware UBC1 / DXT1 */
+            } else if (hd_tex.format == CPA_HD_TEX_FMT_DXT5) {
+                *pfmt = 253; /* Hardware UBC3 / DXT5 */
+            } else {
+                *pfmt = 255; /* 32-bit RGBA */
+            }
+            return hd_tex.data;
         }
-        return hd_tex.data;
     }
 
     uint8_t *vram = hle_vram_ptr();
@@ -301,7 +318,7 @@ static int guest_texture_slot(RenderJob *j, uint32_t tcw, uint32_t tsp_full)
                 if (!px) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = op->fmt = 0; memset(e, 0, sizeof *e); return -1; }
                 hle_texstamp_set(&e->stamp, tcw, tsp); e->dec_frame = (int)s_gframe_no; e->chk_frame = (int)s_gframe_no;
                 TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 0; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh;
-                op->levels = (hd_levels > 1) ? hd_levels : ((fmt == 253 || fmt == 254) ? 1 : (uint8_t)ta_tex_levels(tcw, tsp));
+                op->levels = (hd_levels > 1) ? hd_levels : (uint8_t)ta_tex_levels(tcw, tsp);
                 op->fmt = fmt;
             }
             return sl;
@@ -319,7 +336,7 @@ static int guest_texture_slot(RenderJob *j, uint32_t tcw, uint32_t tsp_full)
     if (!px) { memset(slot, 0, sizeof *slot); if (reset) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = op->fmt = 0; } return -1; }
     hle_texstamp_set(&slot->stamp, tcw, tsp); slot->dec_frame = (int)s_gframe_no; slot->chk_frame = (int)s_gframe_no; slot->used = 1;
     TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = (uint8_t)reset; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh;
-    op->levels = (hd_levels > 1) ? hd_levels : ((fmt == 253 || fmt == 254) ? 1 : (uint8_t)ta_tex_levels(tcw, tsp));
+    op->levels = (hd_levels > 1) ? hd_levels : (uint8_t)ta_tex_levels(tcw, tsp);
     op->fmt = fmt;
     return sl;
 }
@@ -339,60 +356,78 @@ static void render_exec_ops(RenderJob *j)
             bind_tex(e->tex_id);
             if (op->fmt == 253) {
                 /* Hardware-compressed DXT5 (UBC3) */
-                if (op->levels <= 1) {
-                    GLsizei dxt_sz = ((op->w + 3) / 4) * ((op->h + 3) / 4) * 16;
-                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, op->w, op->h, 0, dxt_sz, op->pix);
-                    vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += dxt_sz;
-                    e->levels = 1;
-#if R2_PERF
-                    g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)dxt_sz;
-#endif
-                } else {
-                    const uint8_t *ptr = (const uint8_t *)op->pix;
-                    uint32_t total_sz = 0;
-                    for (uint8_t lvl = 0; lvl < op->levels; lvl++) {
-                        GLsizei cur_w = (op->w >> lvl) > 0 ? (op->w >> lvl) : 1;
-                        GLsizei cur_h = (op->h >> lvl) > 0 ? (op->h >> lvl) : 1;
-                        GLsizei lvl_sz = ((cur_w + 3) / 4) * ((cur_h + 3) / 4) * 16;
+                GLsizei block_bytes = 16;
+                const uint8_t *ptr = (const uint8_t *)op->pix;
+                uint32_t total_sz = 0;
+                uint8_t upload_levels = 0;
+                for (uint8_t lvl = 0; lvl < op->levels; lvl++) {
+                    GLsizei cur_w = (op->w >> lvl) > 0 ? (op->w >> lvl) : 1;
+                    GLsizei cur_h = (op->h >> lvl) > 0 ? (op->h >> lvl) : 1;
+                    GLsizei lvl_sz = ((cur_w + 3) / 4) * ((cur_h + 3) / 4) * block_bytes;
+                    /* VitaGL hardware swizzler requires width >= 4 && height >= 4 to avoid 0-dimension DMA transfers */
+                    if (cur_w >= 4 && cur_h >= 4) {
                         glCompressedTexImage2D(GL_TEXTURE_2D, lvl, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, cur_w, cur_h, 0, lvl_sz, ptr);
-                        ptr += lvl_sz;
-                        total_sz += (uint32_t)lvl_sz;
+                        upload_levels = lvl + 1;
                     }
-                    vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += total_sz;
-                    e->levels = op->levels;
-#if R2_PERF
-                    g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)total_sz;
-#endif
+                    ptr += lvl_sz;
+                    total_sz += (uint32_t)lvl_sz;
                 }
+                if (upload_levels == 0) {
+                    GLsizei lvl_sz = ((op->w + 3) / 4) * ((op->h + 3) / 4) * block_bytes;
+                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, op->w, op->h, 0, lvl_sz, op->pix);
+                    upload_levels = 1;
+                    total_sz = (uint32_t)lvl_sz;
+                }
+                vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += total_sz;
+                e->levels = upload_levels;
+#if R2_PERF
+                g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)total_sz;
+#endif
                 e->minf = e->magf = e->wrap_s = e->wrap_t = 0;
+                if (e->levels > 1) {
+                    SceGxmTexture *gxm_tex = vglGetGxmTexture(GL_TEXTURE_2D);
+                    if (gxm_tex) {
+                        sceGxmTextureSetMipFilter(gxm_tex, SCE_GXM_TEXTURE_MIP_FILTER_ENABLED);
+                        sceGxmTextureSetMipmapCount(gxm_tex, e->levels);
+                    }
+                }
             } else if (op->fmt == 254) {
                 /* Hardware-compressed DXT1 (UBC1) */
-                if (op->levels <= 1) {
-                    GLsizei dxt_sz = ((op->w + 3) / 4) * ((op->h + 3) / 4) * 8;
-                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, op->w, op->h, 0, dxt_sz, op->pix);
-                    vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += dxt_sz;
-                    e->levels = 1;
-#if R2_PERF
-                    g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)dxt_sz;
-#endif
-                } else {
-                    const uint8_t *ptr = (const uint8_t *)op->pix;
-                    uint32_t total_sz = 0;
-                    for (uint8_t lvl = 0; lvl < op->levels; lvl++) {
-                        GLsizei cur_w = (op->w >> lvl) > 0 ? (op->w >> lvl) : 1;
-                        GLsizei cur_h = (op->h >> lvl) > 0 ? (op->h >> lvl) : 1;
-                        GLsizei lvl_sz = ((cur_w + 3) / 4) * ((cur_h + 3) / 4) * 8;
+                GLsizei block_bytes = 8;
+                const uint8_t *ptr = (const uint8_t *)op->pix;
+                uint32_t total_sz = 0;
+                uint8_t upload_levels = 0;
+                for (uint8_t lvl = 0; lvl < op->levels; lvl++) {
+                    GLsizei cur_w = (op->w >> lvl) > 0 ? (op->w >> lvl) : 1;
+                    GLsizei cur_h = (op->h >> lvl) > 0 ? (op->h >> lvl) : 1;
+                    GLsizei lvl_sz = ((cur_w + 3) / 4) * ((cur_h + 3) / 4) * block_bytes;
+                    /* VitaGL hardware swizzler requires width >= 4 && height >= 4 to avoid 0-dimension DMA transfers */
+                    if (cur_w >= 4 && cur_h >= 4) {
                         glCompressedTexImage2D(GL_TEXTURE_2D, lvl, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, cur_w, cur_h, 0, lvl_sz, ptr);
-                        ptr += lvl_sz;
-                        total_sz += (uint32_t)lvl_sz;
+                        upload_levels = lvl + 1;
                     }
-                    vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += total_sz;
-                    e->levels = op->levels;
-#if R2_PERF
-                    g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)total_sz;
-#endif
+                    ptr += lvl_sz;
+                    total_sz += (uint32_t)lvl_sz;
                 }
+                if (upload_levels == 0) {
+                    GLsizei lvl_sz = ((op->w + 3) / 4) * ((op->h + 3) / 4) * block_bytes;
+                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, op->w, op->h, 0, lvl_sz, op->pix);
+                    upload_levels = 1;
+                    total_sz = (uint32_t)lvl_sz;
+                }
+                vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += total_sz;
+                e->levels = upload_levels;
+#if R2_PERF
+                g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)total_sz;
+#endif
                 e->minf = e->magf = e->wrap_s = e->wrap_t = 0;
+                if (e->levels > 1) {
+                    SceGxmTexture *gxm_tex = vglGetGxmTexture(GL_TEXTURE_2D);
+                    if (gxm_tex) {
+                        sceGxmTextureSetMipFilter(gxm_tex, SCE_GXM_TEXTURE_MIP_FILTER_ENABLED);
+                        sceGxmTextureSetMipmapCount(gxm_tex, e->levels);
+                    }
+                }
             } else {
                 GLenum ifmt, format, type;
                 uint32_t bpp;
@@ -408,7 +443,14 @@ static void render_exec_ops(RenderJob *j)
                 glTexImage2D(GL_TEXTURE_2D, 0, ifmt, op->w, op->h, 0, format, type, op->pix);
                 vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += (uint32_t)op->w * op->h * bpp;
                 e->levels = op->levels;
-                if (op->levels > 1) glGenerateMipmap(GL_TEXTURE_2D);   /* the PVR mip levels are box-filtered versions of level 0 in the source files */
+                if (op->levels > 1) {
+                    glGenerateMipmap(GL_TEXTURE_2D);   /* the PVR mip levels are box-filtered versions of level 0 in the source files */
+                    SceGxmTexture *gxm_tex = vglGetGxmTexture(GL_TEXTURE_2D);
+                    if (gxm_tex) {
+                        sceGxmTextureSetMipFilter(gxm_tex, SCE_GXM_TEXTURE_MIP_FILTER_ENABLED);
+                        sceGxmTextureSetMipmapCount(gxm_tex, e->levels);
+                    }
+                }
                 e->minf = e->magf = e->wrap_s = e->wrap_t = 0;        /* (re)apply filter / wrap for the TSP the batch draws with */
 #if R2_PERF
                 g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)op->w * op->h * bpp;

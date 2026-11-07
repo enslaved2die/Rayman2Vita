@@ -120,16 +120,18 @@ const uint32_t *cpa_texstore_pixels(CpaTexStore *s, uint32_t va) {
     if (!e || e->state < 0) return NULL;
     if (e->state == 0) {
         /* Check HD texture override hook on disk before PVR decode */
-        const char *bank = e->isFix ? "FIX" : (s->levelName[0] ? s->levelName : cpa_hd_tex_get_level());
-        uint32_t hd_w = 0, hd_h = 0;
-        uint32_t *hd_px = cpa_hd_tex_load(bank, e->va, (int)e->chunk, NULL, &hd_w, &hd_h);
-        if (hd_px) {
-            e->w = (uint16_t)hd_w;
-            e->h = (uint16_t)hd_h;
-            e->rgba = hd_px;
-            e->state = 1;
-            s->nDecoded++;
-            return e->rgba;
+        if (cpa_hd_tex_is_enabled()) {
+            const char *bank = e->isFix ? "FIX" : (s->levelName[0] ? s->levelName : cpa_hd_tex_get_level());
+            uint32_t hd_w = 0, hd_h = 0;
+            uint32_t *hd_px = cpa_hd_tex_load(bank, e->va, (int)e->chunk, NULL, &hd_w, &hd_h);
+            if (hd_px) {
+                e->w = (uint16_t)hd_w;
+                e->h = (uint16_t)hd_h;
+                e->rgba = hd_px;
+                e->state = 1;
+                s->nDecoded++;
+                return e->rgba;
+            }
         }
 
         size_t npx = (size_t)e->w * e->h; e->state = -1;

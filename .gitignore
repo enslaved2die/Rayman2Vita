@@ -40,3 +40,5 @@ extracted_audio
 *.log
 *.psp2dmp
 tools/sh4recomp/Save/
+vita_textures_compact
+Save

@@ -630,7 +630,7 @@ typedef struct {
 static HdBankInfo s_banks[MAX_HD_BANKS];
 static uint32_t s_num_banks = 0;
 static char s_current_level[32] = "LEARN_10";
-static bool s_enabled = true;
+static bool s_enabled = false;
 static bool s_initialized = false;
 
 #define MAX_SEARCH_ROOTS 16
@@ -649,6 +649,9 @@ static void add_search_root_internal(const char *root) {
 
 void cpa_hd_tex_add_search_root(const char *root) {
     add_search_root_internal(root);
+    if (s_num_search_roots > 0) {
+        s_enabled = true;
+    }
 }
 
 void cpa_hd_tex_set_level(const char *level_name) {
@@ -666,6 +669,7 @@ void cpa_hd_tex_enable(bool enable) {
 }
 
 bool cpa_hd_tex_is_enabled(void) {
+    if (!s_initialized) cpa_hd_tex_init();
     return s_enabled;
 }
 
@@ -691,6 +695,15 @@ void cpa_hd_tex_init(void) {
     add_search_root_internal("../../upscaled_textures");
     add_search_root_internal("../../textures");
 #endif
+
+    if (s_num_search_roots == 0) {
+        s_enabled = false;
+        OS_LOG("[cpa_hd_tex] No HD textures folder found. HD texture overrides disabled (0 I/O overhead).\n");
+    } else {
+        s_enabled = true;
+        OS_LOG("[cpa_hd_tex] HD textures enabled (%u root%s, primary: %s)\n",
+               s_num_search_roots, s_num_search_roots > 1 ? "s" : "", s_search_roots[0]);
+    }
 }
 
 static HdBankInfo *get_or_create_bank(const char *bank) {
@@ -808,6 +821,10 @@ static int parse_bank_log(HdBankInfo *b, const char *log_path) {
 
 static void ensure_bank_loaded(HdBankInfo *b) {
     if (b->loaded) return;
+    if (!cpa_hd_tex_is_enabled() || s_num_search_roots == 0) {
+        b->loaded = true;
+        return;
+    }
 
     /* Build candidate log paths for this bank */
     bool is_fix = (strcasecmp(b->bank, "FIX") == 0);
@@ -900,7 +917,7 @@ static void ensure_bank_loaded(HdBankInfo *b) {
 }
 
 bool cpa_hd_tex_is_fix_va(uint32_t struct_va) {
-    if (!struct_va) return false;
+    if (!struct_va || !cpa_hd_tex_is_enabled()) return false;
     if (cpa_hd_manifest_is_fix_va(struct_va)) return true;
     HdBankInfo *fix = get_or_create_bank("FIX");
     ensure_bank_loaded(fix);
@@ -946,7 +963,7 @@ bool cpa_hd_tex_load_ex(const char *bank, uint32_t struct_va, int chunk_idx,
                         const char *hint_name, CpaHdTexture *out_tex) {
     if (!out_tex) return false;
     memset(out_tex, 0, sizeof(*out_tex));
-    if (!s_enabled) return false;
+    if (!cpa_hd_tex_is_enabled() || s_num_search_roots == 0) return false;
 
     if (struct_va == 0 && chunk_idx < 0 && (!hint_name || !hint_name[0])) {
         return false;
