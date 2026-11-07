@@ -520,6 +520,7 @@ extern uint32_t (*sh4_io_read_hook)(uint32_t, int); extern void (*sh4_io_write_h
 __attribute__((weak)) void hle_io_init(const char *root) { (void)root; hle_log("[boot] hle/io.c not linked: file IO hooks absent"); }
 __attribute__((weak)) void hle_vmu_init(void) { hle_log("[boot] hle/vmu.c not linked: no virtual VMU (the game shows its 'insert VMS' prompt)"); }
 __attribute__((weak)) void hle_ta_init(void) { hle_log("[boot] hle/ta.c not linked: TA/SQ parser absent"); }
+__attribute__((weak)) void hle_camera_init(void) { }
 
 /* ---------------------------------------------------------------- BIOS pseudo entry points */
 static void bios_sysinfo(SH4Ctx *c) {
@@ -863,6 +864,7 @@ void hle_boot_init(SH4Ctx *c, const uint8_t *image, uint32_t len, const char *dc
     { extern void hle_pad_init(void); hle_pad_init(); }
     hle_vmu_init();                      /* after pad: pad_set_vmu() + BUP hooks (hle/vmu.c) */
     hle_ta_init();
+    hle_camera_init();
     { extern void hle_dbg_init(void); hle_dbg_init(); }
 }
 

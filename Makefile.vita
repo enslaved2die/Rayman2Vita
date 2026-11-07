@@ -179,6 +179,7 @@ RECOMP_OBJS     := $(patsubst $(HGEN)/recomp_%.c,$(BUILD_DIR)/recomp_%.o,$(RECOM
 
 # HLE & Runtime Sources
 HLE_SRCS        := $(HLE_DIR)/boot.c \
+                   $(HLE_DIR)/camera.c \
                    $(HLE_DIR)/dbg.c \
                    $(HLE_DIR)/io.c \
                    $(HLE_DIR)/mathhooks.c \

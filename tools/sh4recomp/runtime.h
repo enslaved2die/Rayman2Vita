@@ -82,7 +82,21 @@ SH4_INLINE void ST32(uint32_t a, uint32_t v) { if (SH4_LIKELY(SH4_FASTQ(a))) mem
 typedef struct { uint32_t addr; sh4_fn fn; } Sh4FuncEnt;
 extern const Sh4FuncEnt sh4_functab[];      /* generated, sorted by addr */
 extern const uint32_t   sh4_functab_n;
-void sh4_call(SH4Ctx *c, uint32_t addr);                /* indirect call / tail-dispatch by guest address */
+#define SH4_CALL_CACHE_SIZE 2048
+#define SH4_CALL_CACHE_MASK (SH4_CALL_CACHE_SIZE - 1)
+typedef struct Sh4CallEntry { uint32_t addr; sh4_fn fn; } Sh4CallEntry;
+extern Sh4CallEntry sh4_call_cache[SH4_CALL_CACHE_SIZE];
+void sh4_call_slow(SH4Ctx *c, uint32_t addr);
+
+SH4_INLINE void sh4_call(SH4Ctx *c, uint32_t addr) {
+    if (SH4_UNLIKELY((addr >> 29) == 5)) addr &= ~0x20000000u;
+    uint32_t slot = ((addr >> 2) ^ (addr >> 7)) & SH4_CALL_CACHE_MASK;
+    if (SH4_LIKELY(sh4_call_cache[slot].addr == addr)) {
+        sh4_call_cache[slot].fn(c);
+        return;
+    }
+    sh4_call_slow(c, addr);
+}
 void sh4_register_hook(uint32_t addr, sh4_fn fn);       /* override or provide a function (BIOS/syscall imports) */
 void sh4_bad_jump(SH4Ctx *c, uint32_t pc, uint32_t target);  /* unresolved indirect jump target */
 void sh4_undef(SH4Ctx *c, uint32_t pc, uint32_t op);    /* undecoded opcode reached */

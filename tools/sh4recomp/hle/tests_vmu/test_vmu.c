@@ -17,7 +17,8 @@ int hle_verbose = 0; unsigned long hle_frame_count;
 void hle_log(const char *f, ...) { if (getenv("TEST_VMU_VERBOSE")) { va_list ap; va_start(ap, f); vfprintf(stderr, f, ap); fputc('\n', stderr); va_end(ap); } }
 uint64_t hle_time_us(void) { return 0; }
 void hle_orig(SH4Ctx *c, uint32_t a) { (void)c; (void)a; }
-void sh4_call(SH4Ctx *c, uint32_t a) { (void)c; (void)a; }
+Sh4CallEntry sh4_call_cache[SH4_CALL_CACHE_SIZE];
+void sh4_call_slow(SH4Ctx *c, uint32_t a) { (void)c; (void)a; }
 static int vmu_flag; void pad_set_vmu(int p) { vmu_flag = p; }
 #define MAXH 32
 static struct { uint32_t a; hle_fn f; } hooks[MAXH]; static int nh;
