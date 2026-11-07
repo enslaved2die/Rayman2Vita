@@ -95,6 +95,7 @@ static NatLevel *level_load(const char *up) {
     snprintf(p, sizeof p, "%s/%s/%s.TEX", root, up, up);
     if (cpa_read_file(p, &L->tex, &L->texN)) {
         cpa_texstore_load(&L->store, &L->sc, L->tex, L->texN, s_fix, s_fixN, s_fxt, s_fxtN); L->haveStore = 1;
+        cpa_texstore_set_level_name(&L->store, up);
         nlog("[native] texstore %s: level bank %u (%s), FIX bank %u (%s)", up, L->store.nLevel, L->store.levelOk ? "ok" : "FAILED", L->store.nFix, L->store.fixOk ? "ok" : "FAILED");
     } else nlog("[native] %s.TEX missing: untextured", up);
     uint64_t t2 = r2_now_us();

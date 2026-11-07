@@ -4,10 +4,13 @@
  */
 
 #include "gli_pvr.h"
+#include "cpa_hd_tex.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+
+const void* GLI_VITA_pResolveVA(const void *ptr) { return ptr; }
 
 #define COLOR_RESET  "\033[0m"
 #define COLOR_GREEN  "\033[32m"
@@ -325,6 +328,97 @@ static bool test_cnt_archives(void) {
     return true;
 }
 
+/* ============================================================================
+ * Test 5: HD Texture Override Hook (upscaled_textures/ & Fallback)
+ * ============================================================================ */
+static bool test_hd_texture_override(void) {
+    printf(COLOR_BOLD "=== Test 5: HD Texture Override Hook & Portable PNG Decoder ===" COLOR_RESET "\n");
+
+    /* 1. Direct PNG Loading Verification */
+    uint32_t w_png = 0, h_png = 0;
+    uint32_t *rgba_png = cpa_png_load_file("upscaled_textures/FIX/ago_eclab2_aaa.png", &w_png, &h_png);
+    assert(rgba_png != NULL);
+    assert(w_png == 64 && h_png == 64);
+    printf(" - Direct PNG decode ('upscaled_textures/FIX/ago_eclab2_aaa.png'): %ux%u -> " COLOR_GREEN "DECODED [OK]" COLOR_RESET "\n", w_png, h_png);
+
+    /* 2. HD Texture Override Hook Lookup for FIX by struct VA (0x8cdd6d98 -> ago_eclab2_aaa) */
+    CpaHdTexture hd_direct;
+    assert(cpa_hd_tex_load_ex("FIX", 0x8cdd6d98, 0, NULL, &hd_direct));
+    assert(hd_direct.width == 64 && hd_direct.height == 64);
+    assert(hd_direct.format == CPA_HD_TEX_FMT_DXT5 || hd_direct.format == CPA_HD_TEX_FMT_DXT1);
+    printf(" - Direct hardware-compressed DDS load (0x8cdd6d98 in FIX): %ux%u format=%s (%u B) -> " COLOR_GREEN "LOADED [OK]" COLOR_RESET "\n",
+           hd_direct.width, hd_direct.height,
+           (hd_direct.format == CPA_HD_TEX_FMT_DXT5) ? "DXT5" : "DXT1", hd_direct.data_size);
+    free(hd_direct.data);
+
+    /* 2b. Transparent RGBA decompression via cpa_hd_tex_load wrapper */
+    uint32_t w_hd = 0, h_hd = 0;
+    uint32_t *rgba_hd = cpa_hd_tex_load("FIX", 0x8cdd6d98, 0, NULL, &w_hd, &h_hd);
+    assert(rgba_hd != NULL);
+    assert(w_hd == 64 && h_hd == 64);
+    printf(" - Transparent on-the-fly DXT decode: (%ux%u) -> " COLOR_GREEN "DECODED [OK]" COLOR_RESET "\n", w_hd, h_hd);
+    free(rgba_png);
+    free(rgba_hd);
+
+    /* 2c. Verification of User's Updated X Button Texture (s_pada_aaa.dds) */
+    CpaHdTexture x_btn;
+    assert(cpa_hd_tex_load_ex("FIX", 0, -1, "s_pada_aaa", &x_btn));
+    assert(x_btn.width == 128 && x_btn.height == 128);
+    assert(x_btn.format == CPA_HD_TEX_FMT_DXT5);
+    assert(x_btn.data_size == 16384);
+    printf(" - Updated X button texture ('s_pada_aaa.dds'): 128x128 DXT5 (16384 B vs 65536 B uncompressed, 4x VRAM saving) -> " COLOR_GREEN "VERIFIED [OK]" COLOR_RESET "\n");
+    free(x_btn.data);
+
+    /* 3. HD Texture Override Hook Lookup for Level (LEARN_30 -> amiral_vitro2_txynz.png) */
+    cpa_hd_tex_set_level("LEARN_30");
+    uint32_t w_l30 = 0, h_l30 = 0;
+    uint32_t *rgba_l30 = cpa_hd_tex_load("LEARN_30", 0, -1, "amiral_vitro2_txynz", &w_l30, &h_l30);
+    assert(rgba_l30 != NULL);
+    assert(w_l30 == 256 && h_l30 == 256);
+    printf(" - HD override query for Level bank (LEARN_30/amiral_vitro2_txynz): %ux%u -> " COLOR_GREEN "OVERRIDDEN [OK]" COLOR_RESET "\n", w_l30, h_l30);
+    free(rgba_l30);
+
+    /* 4. Graceful Fallback Verification for unreplaced texture */
+    uint32_t w_none = 0, h_none = 0;
+    uint32_t *rgba_none = cpa_hd_tex_load("FIX", 0x12345678, 999, "nonexistent_texture", &w_none, &h_none);
+    assert(rgba_none == NULL);
+    printf(" - Negative query returns NULL (graceful fallback triggered) -> " COLOR_GREEN "FALLBACK [OK]" COLOR_RESET "\n");
+
+    /* Verify that original PVR chunk decodes normally on fallback */
+    size_t sz_fix = 0;
+    uint8_t *fix_tex = load_file("assets/dc/DCDATA/FIX.TEX", &sz_fix);
+    assert(fix_tex != NULL);
+    PVR_TextureBank bank;
+    assert(PVR_fn_bLoadTexBank(fix_tex, sz_fix, &bank));
+    uint32_t pvr_w = 0, pvr_h = 0;
+    uint32_t *pvr_rgba = NULL;
+    /* Chunk 0 is the original 32x32 ago_eclab2_aaa */
+    assert(PVR_fn_pDecodeTexture(bank.ppTextureBuffers[0], bank.pTextureSizes[0], &pvr_w, &pvr_h, &pvr_rgba));
+    assert(pvr_w == 32 && pvr_h == 32);
+    printf(" - Original PVR decode on fallback: %ux%u -> " COLOR_GREEN "VERIFIED [OK]" COLOR_RESET " (original 32x32 vs upscaled 64x64)\n", pvr_w, pvr_h);
+    PVR_fn_vFreeTexture(pvr_rgba);
+    PVR_fn_vFreeTexBank(&bank);
+    free(fix_tex);
+
+    /* 5. Fast Raw Accelerator (.bin) Format Verification */
+    uint32_t test_w = 4, test_h = 4;
+    uint32_t test_pixels[16];
+    for (int i = 0; i < 16; i++) test_pixels[i] = 0xFF000000u | (uint32_t)i;
+    const char *tmp_bin = "/tmp/r2_test_accel.bin";
+    assert(cpa_hd_tex_save_raw(tmp_bin, test_w, test_h, test_pixels));
+    uint32_t load_w = 0, load_h = 0;
+    uint32_t *reloaded = cpa_hd_tex_load_raw_file(tmp_bin, &load_w, &load_h);
+    assert(reloaded != NULL);
+    assert(load_w == 4 && load_h == 4);
+    assert(memcmp(test_pixels, reloaded, sizeof(test_pixels)) == 0);
+    free(reloaded);
+    remove(tmp_bin);
+    printf(" - Raw binary accelerator roundtrip (.bin / R2TX): 4x4 RGBA -> " COLOR_GREEN "VERIFIED [OK]" COLOR_RESET "\n");
+
+    printf(" - HD texture override hook & fallback suite: " COLOR_GREEN "PASS [OK]" COLOR_RESET "\n");
+    return true;
+}
+
 int main(int argc, char **argv) {
     printf(COLOR_BOLD "======================================================================" COLOR_RESET "\n");
     printf(COLOR_BOLD "  Rayman 2 Dreamcast Texture Container & Decoder Host Verification     " COLOR_RESET "\n");
@@ -337,9 +431,11 @@ int main(int argc, char **argv) {
     bool t3 = test_fix_tex_bank();
     printf("\n");
     bool t4 = test_cnt_archives();
+    printf("\n");
+    bool t5 = test_hd_texture_override();
 
     printf("\n" COLOR_BOLD "======================================================================" COLOR_RESET "\n");
-    if (t1 && t2 && t3 && t4) {
+    if (t1 && t2 && t3 && t4 && t5) {
         printf(COLOR_GREEN COLOR_BOLD "  ALL DREAMCAST PVR & CONTAINER TESTS PASSED CLEANLY! [100%% OK]" COLOR_RESET "\n");
         printf(COLOR_BOLD "======================================================================" COLOR_RESET "\n");
         return 0;

@@ -16,9 +16,16 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#if defined(CPA_PLATFORM_VITA) || defined(__vita__)
 #include <vitaGL.h>
 #include <psp2/gxm.h>
 #include <psp2/display.h>
+#else
+#ifndef GLUINT_DEFINED
+typedef unsigned int GLuint;
+#define GLUINT_DEFINED
+#endif
+#endif
 
 #include "vita_shim/os_vita.h"
 #include "vita_shim/cpa_mth.h"

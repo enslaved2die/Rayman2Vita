@@ -25,6 +25,11 @@ tools/sh4recomp/tests/fp_dump
 tools/sh4recomp/libr2recomp.a
 tools/sh4recomp/runtime.o
 extracted_audio/
+extracted_textures/
+upscaled_textures/
+vita_textures/
+tools/dump_dc_textures
+tools/realesrgan-ncnn-vulkan/
 
 # build outputs / local symlinks
 build_vita_*/

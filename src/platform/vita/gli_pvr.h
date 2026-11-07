@@ -15,7 +15,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#if defined(CPA_PLATFORM_VITA) || defined(__vita__)
+#if defined(__APPLE__)
+#include <OpenGL/gl.h>
+#elif defined(CPA_PLATFORM_VITA) || defined(__vita__) || defined(CPA_PLATFORM_HOST)
 #include <vitaGL.h>
 #else
 #ifndef GLUINT_DEFINED

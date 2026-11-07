@@ -10,6 +10,8 @@ typedef struct HleTex {
     uint32_t src;         /* kmLoadTexture source data pointer (guest) */
     uint32_t m32, m64, nbytes;  /* host debug: bytes of the source payload found linearly (m32) / via 64-bit-area interleave (m64) after kmLoadTexture */
     uint32_t gen;               /* bumped on every create/load of this surface (texture cache invalidation) */
+    uint32_t struct_va;         /* guest texture structure VA if known */
+    uint32_t gbix;              /* GBIX global texture index if known */
     uint8_t loaded;       /* kmLoadTexture seen for this surface */
 } HleTex;
 void hle_texmap_init(void);

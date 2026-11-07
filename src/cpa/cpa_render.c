@@ -1,5 +1,7 @@
 /* cpa_render: see cpa_render.h for the pipeline and evidence tags. */
 #include "cpa_render.h"
+#include "cpa_hd_tex.h"
+#include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -102,6 +104,13 @@ static uint32_t *bump_build(int mip) {
     free(blk); return out;
 }
 
+void cpa_texstore_set_level_name(CpaTexStore *s, const char *name) {
+    if (s && name) {
+        snprintf(s->levelName, sizeof(s->levelName), "%s", name);
+        cpa_hd_tex_set_level(name);
+    }
+}
+
 const uint32_t *cpa_texstore_pixels(CpaTexStore *s, uint32_t va) {
     if (va == CPA_TEXVA_BUMP_MIP || va == CPA_TEXVA_BUMP) {
         int k = va == CPA_TEXVA_BUMP_MIP ? 0 : 1; if (!s->bumpRgba[k]) s->bumpRgba[k] = bump_build(k == 0);
@@ -110,6 +119,19 @@ const uint32_t *cpa_texstore_pixels(CpaTexStore *s, uint32_t va) {
     CpaTexEntry *e = (CpaTexEntry *)cpa_texstore_find(s, va);
     if (!e || e->state < 0) return NULL;
     if (e->state == 0) {
+        /* Check HD texture override hook on disk before PVR decode */
+        const char *bank = e->isFix ? "FIX" : (s->levelName[0] ? s->levelName : cpa_hd_tex_get_level());
+        uint32_t hd_w = 0, hd_h = 0;
+        uint32_t *hd_px = cpa_hd_tex_load(bank, e->va, (int)e->chunk, NULL, &hd_w, &hd_h);
+        if (hd_px) {
+            e->w = (uint16_t)hd_w;
+            e->h = (uint16_t)hd_h;
+            e->rgba = hd_px;
+            e->state = 1;
+            s->nDecoded++;
+            return e->rgba;
+        }
+
         size_t npx = (size_t)e->w * e->h; e->state = -1;
         if (!npx || npx > (size_t)1024 * 1024) { s->nDecodeFail++; return NULL; }
         uint32_t *p = (uint32_t *)malloc(npx * 4);

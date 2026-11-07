@@ -22,7 +22,7 @@
 #define OS_Vita_LogPrintf printf
 #define OS_Vita_LogWarn   printf
 #define OS_Vita_LogError  printf
-static void *CPA_LoadFile(const char *path, size_t *out_sz) {
+void *CPA_LoadFile(const char *path, size_t *out_sz) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);

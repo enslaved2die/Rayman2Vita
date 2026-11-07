@@ -143,7 +143,10 @@ typedef struct CpaTexStore {
     CpaTexEntry *e; uint32_t n;                 /* sorted by va */
     uint32_t nLevel, nFix; int levelOk, fixOk;
     uint32_t *bumpRgba[2]; uint32_t nDecoded, nDecodeFail;
+    char levelName[32];
 } CpaTexStore;
+/* Set level name for HD texture override matching */
+void cpa_texstore_set_level_name(CpaTexStore *s, const char *name);
 /* Loads both banks. sc (may be NULL) gets cpa_scene_apply_tex with the post-load flags of BOTH banks, so pass classification uses the values the running game has (the DAT image holds
  * pre-load values). Any of lvlTex / fixDat / fixTex may be NULL (that bank is then empty). Returns 1 iff the level bank matched the DAT table and every chunk of both banks parsed. */
 int  cpa_texstore_load(CpaTexStore *s, CpaScene *sc, const uint8_t *lvlTex, size_t lvlTexN, const uint8_t *fixDat, size_t fixDatN, const uint8_t *fixTex, size_t fixTexN);

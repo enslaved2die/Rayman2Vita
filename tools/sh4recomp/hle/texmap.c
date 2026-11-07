@@ -36,11 +36,20 @@ static void h_create(SH4Ctx *c) {
 }
 static void h_load(SH4Ctx *c) {
     uint32_t gd = c->r[4], src = c->r[5], pr = c->pr;
+    uint32_t struct_va = c->r[13];
     hle_orig(c, 0x8C0D6AC0); c->pr = pr;
     n_load++;
     uint32_t vaddr = LD32(gd + 0x1C);
     if (hle_verbose >= 2) hle_log("[tex] load desc=%08x src=%08x vram=%08x type=%08x fmt=%08x rv=%u pr=%08x", gd, src, vaddr, LD32(gd), LD32(gd + 24), R(0), pr);
     HleTex *t = slot_for(vaddr, gd); snap(t, gd); t->src = src; t->loaded = 1; t->gen++; s_gen_total++;
+    t->struct_va = struct_va;
+    if (src >= 0x8C000000u && src + 16 < 0x8D000000u) {
+        if (src >= 0x8C000020u && LD32(src - 0x20) == 0x58494247u) {
+            t->gbix = LD32(src - 0x20 + 8);
+        } else if (LD32(src) == 0x58494247u) {
+            t->gbix = LD32(src + 8);
+        }
+    }
 #if !defined(__vita__)
     /* Ground truth for the VRAM address model: after the game's own loader ran, is the source payload found linearly at the 32-bit-area
      * offset (m32) or at the 64-bit-area-interleaved location of the same address (m64)?  (count of equal bytes over the surface size) */

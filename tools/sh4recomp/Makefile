@@ -28,7 +28,7 @@ HLE_EXCLUDE_SND := $(if $(filter 1,$(USE_CLEANROOM_AUDIO)),hle/snd.c,hle/snd_cle
 HLE_SRC := $(if $(HLE_MODS),$(addprefix hle/,$(addsuffix .c,$(HLE_MODS))),$(filter-out hle/vita_main.c hle/vita_gl_render.c $(HLE_EXCLUDE_SND),$(wildcard hle/*.c)))   # make hle HLE_MODS="boot run_game io" to pick modules
 HLE_OBJ := $(patsubst hle/%.c,$(HLEDIR)/%.o,$(HLE_SRC))
 HLE_GEN := $(patsubst $(HGEN)/recomp_%.c,$(HLEDIR)/recomp_%.o,$(wildcard $(HGEN)/recomp_[0-9]*.c))
-HLE_CFLAGS := -I$(HGEN) $(CFLAGS) -g -Ihle
+HLE_CFLAGS := -I$(HGEN) $(CFLAGS) -g -Ihle -I../../src/cpa
 $(HLEDIR)/recomp_%.o: $(HGEN)/recomp_%.c runtime.h $(HGEN)/recomp_decls.h hle/enter.h $(HLEDIR)/rename.sed
 	sed -E -f $(HLEDIR)/rename.sed $< | $(CC) $(HLE_CFLAGS) -include hle/enter.h -x c - -c -o $@
 $(HLEDIR)/recomp_functab.o: $(HGEN)/recomp_functab.c runtime.h $(HGEN)/recomp_decls.h

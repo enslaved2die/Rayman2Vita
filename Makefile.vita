@@ -201,7 +201,7 @@ COMMON_OBJS     := $(BUILD_DIR)/recomp_functab.o \
                    $(BUILD_DIR)/runtime.o \
                    $(BUILD_DIR)/hook_stubs.o
 
-COMMON_OBJS     += $(BUILD_DIR)/variant.o
+COMMON_OBJS     += $(BUILD_DIR)/variant.o $(BUILD_DIR)/cpa_hd_tex.o $(BUILD_DIR)/cpa_hd_manifest.o
 ALL_OBJS        := $(RECOMP_OBJS) $(COMMON_OBJS) $(HLE_OBJS) $(EXTRA_OBJS)
 
 ELF             := $(BUILD_DIR)/$(TARGET).elf
@@ -240,6 +240,10 @@ $(BUILD_DIR)/variant.c: FORCE | $(BUILD_DIR)
 	@printf 'const char r2_variant_name[] = "%s";\nconst char r2_variant_flags[] = "%s";\n' '$(call VAR_ESC,$(VARIANT))' '$(call VAR_ESC,$(VARIANT_FLAGS))' > $@.new; \
 	  if cmp -s $@.new $@; then rm -f $@.new; else mv $@.new $@; fi
 $(BUILD_DIR)/variant.o: $(BUILD_DIR)/variant.c
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/cpa_hd_tex.o: $(CPA_DIR)/cpa_hd_tex.c $(wildcard $(CPA_DIR)/*.h) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/cpa_hd_manifest.o: $(CPA_DIR)/cpa_hd_manifest.c $(wildcard $(CPA_DIR)/*.h) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(HOT_ORDER): $(HOT_LIST) $(HLE_DIR)/hotorder.py | $(BUILD_DIR)
 	$(CC) -x c /dev/null -Wl,--verbose -nostartfiles -nostdlib -o /dev/null 2>/dev/null | sed -n '/^======/,/^======/p' | sed '1d;$$d' | python3 $(HLE_DIR)/hotorder.py $(HOT_LIST) > $@

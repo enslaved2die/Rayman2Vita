@@ -1,0 +1,7 @@
+# Forwarding Makefile so make -f Makefile.vita works when invoked from tools/sh4recomp/
+.PHONY: all
+all:
+	$(MAKE) -C ../.. -f Makefile.vita $(MAKECMDGOALS)
+
+%:
+	$(MAKE) -C ../.. -f Makefile.vita $(MAKECMDGOALS)

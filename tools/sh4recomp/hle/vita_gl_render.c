@@ -20,11 +20,13 @@
 #if defined(__vita__) || defined(CPA_PLATFORM_VITA)
 
 #include <vitaGL.h>
+#include <ctype.h>
 #include <psp2/kernel/clib.h>
 #include "hle.h"
 #include "ta.h"
 #include "texmap.h"
 #include "perf.h"
+#include "cpa_hd_tex.h"
 #ifdef R2_NATIVE_GFX
 #include "native_hook.h"
 #endif
@@ -198,8 +200,38 @@ static void apply_tex_params(RTexEntry *e, uint32_t tsp)
 
 /* GUEST: decode the texture of (tcw, tsp) from VRAM into a fresh pixel buffer (the render side uploads and frees it).  Returns the buffer or NULL.
  * For format 1 (RGB565), decodes directly into a 16-bit buffer. Alpha formats (0: ARGB1555, 2: ARGB4444) decode to 32-bit RGBA for maximum quality and VitaGL compatibility. */
-static void *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph, uint8_t *pfmt)
+static void *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph, uint8_t *pfmt, uint8_t *plevels)
 {
+    if (plevels) *plevels = 0;
+    /* Check HD replacement hook first */
+    uint32_t vram_addr = (tcw & 0x1FFFFFu) << 3;
+    const HleTex *t = hle_texmap_find(vram_addr);
+    char level_buf[32] = {0};
+    const uint8_t *ram = hle_ptr(0x8C000000u);
+    if (ram) {
+        for (int i = 0; i < 30; i++) {
+            char c = (char)ram[0x123B09u + i];
+            if (c == '$' || c == 0) break;
+            if (!(isalnum((unsigned char)c) || c == '_')) { level_buf[0] = 0; break; }
+            level_buf[i] = (char)toupper((unsigned char)c);
+        }
+    }
+    const char *bank = (t && t->struct_va && cpa_hd_tex_is_fix_va(t->struct_va)) ? "FIX" : (level_buf[0] ? level_buf : cpa_hd_tex_get_level());
+    CpaHdTexture hd_tex;
+    if (cpa_hd_tex_load_ex(bank, t ? t->struct_va : 0, -1, NULL, &hd_tex)) {
+        *pw = (int)hd_tex.width;
+        *ph = (int)hd_tex.height;
+        if (plevels) *plevels = hd_tex.mip_count;
+        if (hd_tex.format == CPA_HD_TEX_FMT_DXT1) {
+            *pfmt = 254; /* Hardware UBC1 / DXT1 */
+        } else if (hd_tex.format == CPA_HD_TEX_FMT_DXT5) {
+            *pfmt = 253; /* Hardware UBC3 / DXT5 */
+        } else {
+            *pfmt = 255; /* 32-bit RGBA */
+        }
+        return hd_tex.data;
+    }
+
     uint8_t *vram = hle_vram_ptr();
     if (!vram) return NULL;
     int w, h;
@@ -265,10 +297,12 @@ static int guest_texture_slot(RenderJob *j, uint32_t tcw, uint32_t tsp_full)
             int sl = (int)(e - s_gtex);
             if (!entry_valid(e)) {
                 s_tex_redecodes++;
-                int w, hh; uint8_t fmt; void *px = decode_texture(tcw, tsp, &w, &hh, &fmt);
+                int w, hh; uint8_t fmt, hd_levels = 0; void *px = decode_texture(tcw, tsp, &w, &hh, &fmt, &hd_levels);
                 if (!px) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = op->fmt = 0; memset(e, 0, sizeof *e); return -1; }
                 hle_texstamp_set(&e->stamp, tcw, tsp); e->dec_frame = (int)s_gframe_no; e->chk_frame = (int)s_gframe_no;
-                TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 0; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh; op->levels = (uint8_t)ta_tex_levels(tcw, tsp); op->fmt = fmt;
+                TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 0; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh;
+                op->levels = (hd_levels > 1) ? hd_levels : ((fmt == 253 || fmt == 254) ? 1 : (uint8_t)ta_tex_levels(tcw, tsp));
+                op->fmt = fmt;
             }
             return sl;
         }
@@ -281,10 +315,12 @@ static int guest_texture_slot(RenderJob *j, uint32_t tcw, uint32_t tsp_full)
     s_tex_misses++;
     memset(slot, 0, sizeof *slot);
     slot->tcw = tcw; slot->tsp = tsp;
-    int w, hh; uint8_t fmt; void *px = decode_texture(tcw, tsp, &w, &hh, &fmt);
+    int w, hh; uint8_t fmt, hd_levels = 0; void *px = decode_texture(tcw, tsp, &w, &hh, &fmt, &hd_levels);
     if (!px) { memset(slot, 0, sizeof *slot); if (reset) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = op->fmt = 0; } return -1; }
     hle_texstamp_set(&slot->stamp, tcw, tsp); slot->dec_frame = (int)s_gframe_no; slot->chk_frame = (int)s_gframe_no; slot->used = 1;
-    TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = (uint8_t)reset; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh; op->levels = (uint8_t)ta_tex_levels(tcw, tsp); op->fmt = fmt;
+    TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = (uint8_t)reset; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh;
+    op->levels = (hd_levels > 1) ? hd_levels : ((fmt == 253 || fmt == 254) ? 1 : (uint8_t)ta_tex_levels(tcw, tsp));
+    op->fmt = fmt;
     return sl;
 }
 
@@ -301,25 +337,83 @@ static void render_exec_ops(RenderJob *j)
         if (e->tex_id == 0) glGenTextures(1, &e->tex_id);
         if (e->tex_id) {
             bind_tex(e->tex_id);
-            GLenum ifmt, format, type;
-            uint32_t bpp;
-            if (op->fmt == 0) {
-                ifmt = GL_RGBA; format = GL_RGBA; type = GL_UNSIGNED_SHORT_5_5_5_1; bpp = 2;
-            } else if (op->fmt == 1) {
-                ifmt = GL_RGB; format = GL_RGB; type = GL_UNSIGNED_SHORT_5_6_5; bpp = 2;
-            } else if (op->fmt == 2) {
-                ifmt = GL_RGBA; format = GL_RGBA; type = GL_UNSIGNED_SHORT_4_4_4_4; bpp = 2;
-            } else {
-                ifmt = GL_RGBA; format = GL_RGBA; type = GL_UNSIGNED_BYTE; bpp = 4;
-            }
-            glTexImage2D(GL_TEXTURE_2D, 0, ifmt, op->w, op->h, 0, format, type, op->pix);
-            vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += (uint32_t)op->w * op->h * bpp;
-            e->levels = op->levels;
-            if (op->levels > 1) glGenerateMipmap(GL_TEXTURE_2D);   /* the PVR mip levels are box-filtered versions of level 0 in the source files */
-            e->minf = e->magf = e->wrap_s = e->wrap_t = 0;        /* (re)apply filter / wrap for the TSP the batch draws with */
+            if (op->fmt == 253) {
+                /* Hardware-compressed DXT5 (UBC3) */
+                if (op->levels <= 1) {
+                    GLsizei dxt_sz = ((op->w + 3) / 4) * ((op->h + 3) / 4) * 16;
+                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, op->w, op->h, 0, dxt_sz, op->pix);
+                    vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += dxt_sz;
+                    e->levels = 1;
 #if R2_PERF
-            g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)op->w * op->h * bpp;
+                    g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)dxt_sz;
 #endif
+                } else {
+                    const uint8_t *ptr = (const uint8_t *)op->pix;
+                    uint32_t total_sz = 0;
+                    for (uint8_t lvl = 0; lvl < op->levels; lvl++) {
+                        GLsizei cur_w = (op->w >> lvl) > 0 ? (op->w >> lvl) : 1;
+                        GLsizei cur_h = (op->h >> lvl) > 0 ? (op->h >> lvl) : 1;
+                        GLsizei lvl_sz = ((cur_w + 3) / 4) * ((cur_h + 3) / 4) * 16;
+                        glCompressedTexImage2D(GL_TEXTURE_2D, lvl, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, cur_w, cur_h, 0, lvl_sz, ptr);
+                        ptr += lvl_sz;
+                        total_sz += (uint32_t)lvl_sz;
+                    }
+                    vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += total_sz;
+                    e->levels = op->levels;
+#if R2_PERF
+                    g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)total_sz;
+#endif
+                }
+                e->minf = e->magf = e->wrap_s = e->wrap_t = 0;
+            } else if (op->fmt == 254) {
+                /* Hardware-compressed DXT1 (UBC1) */
+                if (op->levels <= 1) {
+                    GLsizei dxt_sz = ((op->w + 3) / 4) * ((op->h + 3) / 4) * 8;
+                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, op->w, op->h, 0, dxt_sz, op->pix);
+                    vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += dxt_sz;
+                    e->levels = 1;
+#if R2_PERF
+                    g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)dxt_sz;
+#endif
+                } else {
+                    const uint8_t *ptr = (const uint8_t *)op->pix;
+                    uint32_t total_sz = 0;
+                    for (uint8_t lvl = 0; lvl < op->levels; lvl++) {
+                        GLsizei cur_w = (op->w >> lvl) > 0 ? (op->w >> lvl) : 1;
+                        GLsizei cur_h = (op->h >> lvl) > 0 ? (op->h >> lvl) : 1;
+                        GLsizei lvl_sz = ((cur_w + 3) / 4) * ((cur_h + 3) / 4) * 8;
+                        glCompressedTexImage2D(GL_TEXTURE_2D, lvl, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, cur_w, cur_h, 0, lvl_sz, ptr);
+                        ptr += lvl_sz;
+                        total_sz += (uint32_t)lvl_sz;
+                    }
+                    vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += total_sz;
+                    e->levels = op->levels;
+#if R2_PERF
+                    g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)total_sz;
+#endif
+                }
+                e->minf = e->magf = e->wrap_s = e->wrap_t = 0;
+            } else {
+                GLenum ifmt, format, type;
+                uint32_t bpp;
+                if (op->fmt == 0) {
+                    ifmt = GL_RGBA; format = GL_RGBA; type = GL_UNSIGNED_SHORT_5_5_5_1; bpp = 2;
+                } else if (op->fmt == 1) {
+                    ifmt = GL_RGB; format = GL_RGB; type = GL_UNSIGNED_SHORT_5_6_5; bpp = 2;
+                } else if (op->fmt == 2) {
+                    ifmt = GL_RGBA; format = GL_RGBA; type = GL_UNSIGNED_SHORT_4_4_4_4; bpp = 2;
+                } else {
+                    ifmt = GL_RGBA; format = GL_RGBA; type = GL_UNSIGNED_BYTE; bpp = 4;
+                }
+                glTexImage2D(GL_TEXTURE_2D, 0, ifmt, op->w, op->h, 0, format, type, op->pix);
+                vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += (uint32_t)op->w * op->h * bpp;
+                e->levels = op->levels;
+                if (op->levels > 1) glGenerateMipmap(GL_TEXTURE_2D);   /* the PVR mip levels are box-filtered versions of level 0 in the source files */
+                e->minf = e->magf = e->wrap_s = e->wrap_t = 0;        /* (re)apply filter / wrap for the TSP the batch draws with */
+#if R2_PERF
+                g_perf.tex_uploads++; g_perf.tex_bytes += (uint64_t)op->w * op->h * bpp;
+#endif
+            }
         }
 #if R2_PERF
         g_perf.t_texdec += r2_now_us() - t0;

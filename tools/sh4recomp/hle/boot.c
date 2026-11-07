@@ -6,6 +6,7 @@
 #include "swflag.h"
 #include "r2prof.h"
 #include "ta.h"
+#include "camera.h"
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -528,7 +529,6 @@ extern uint32_t (*sh4_io_read_hook)(uint32_t, int); extern void (*sh4_io_write_h
 __attribute__((weak)) void hle_io_init(const char *root) { (void)root; hle_log("[boot] hle/io.c not linked: file IO hooks absent"); }
 __attribute__((weak)) void hle_vmu_init(void) { hle_log("[boot] hle/vmu.c not linked: no virtual VMU (the game shows its 'insert VMS' prompt)"); }
 __attribute__((weak)) void hle_ta_init(void) { hle_log("[boot] hle/ta.c not linked: TA/SQ parser absent"); }
-__attribute__((weak)) void hle_camera_init(void) { }
 
 /* ---------------------------------------------------------------- BIOS pseudo entry points */
 static void bios_sysinfo(SH4Ctx *c) {

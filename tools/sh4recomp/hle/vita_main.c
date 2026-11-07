@@ -328,8 +328,12 @@ static int game_main(void) {
     }
     { extern const char r2_variant_name[], r2_variant_flags[]; vita_log("[vita] variant: %s | %s | game cpu mask 0x%x audio cpu mask 0x%x", r2_variant_name, r2_variant_flags, (unsigned)R2_GAME_CPU, (unsigned)R2_AUDIO_CPU); }   /* Makefile.vita VARIANT: pasted logs identify themselves */
 
-    /* 1. Set controller sampling mode */
-    sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
+    /* 1. Set controller sampling mode (with Vita3K fallback to standard analog mode) */
+    int ctrl_rc = sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
+    if (ctrl_rc < 0) {
+        ctrl_rc = sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
+    }
+    vita_log("[vita] sceCtrlSetSamplingMode -> %d", ctrl_rc);
 
     /* 2. Initialize vitaGL hardware rendering context */
     vita_gl_render_init();

@@ -61,7 +61,9 @@ SOURCES         := $(SRC_DIR)/main.c \
                    $(SRC_DIR)/platform/vita/ino_vita.c \
                    $(SRC_DIR)/platform/vita/r2_ai_tables.c \
                    $(SRC_DIR)/platform/vita/snd_vita.c \
-                   $(SRC_DIR)/platform/vita/save_vita.c
+                   $(SRC_DIR)/platform/vita/save_vita.c \
+                   $(SRC_DIR)/cpa/cpa_hd_tex.c \
+                   $(SRC_DIR)/cpa/cpa_hd_manifest.c
 
 OBJECTS         := $(BUILD_DIR)/main.o \
                    $(BUILD_DIR)/cpa_engine.o \
@@ -73,7 +75,9 @@ OBJECTS         := $(BUILD_DIR)/main.o \
                    $(BUILD_DIR)/ino_vita.o \
                    $(BUILD_DIR)/r2_ai_tables.o \
                    $(BUILD_DIR)/snd_vita.o \
-                   $(BUILD_DIR)/save_vita.o
+                   $(BUILD_DIR)/save_vita.o \
+                   $(BUILD_DIR)/cpa_hd_tex.o \
+                   $(BUILD_DIR)/cpa_hd_manifest.o
 
 ELF             := $(BUILD_DIR)/$(TARGET).elf
 VELF            := $(BUILD_DIR)/$(TARGET).velf
@@ -136,6 +140,12 @@ $(BUILD_DIR)/snd_vita.o: $(SRC_DIR)/platform/vita/snd_vita.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/save_vita.o: $(SRC_DIR)/platform/vita/save_vita.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cpa_hd_tex.o: $(SRC_DIR)/cpa/cpa_hd_tex.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cpa_hd_manifest.o: $(SRC_DIR)/cpa/cpa_hd_manifest.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(ELF): $(OBJECTS)
