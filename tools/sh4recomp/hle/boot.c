@@ -631,6 +631,53 @@ static void h_memset(SH4Ctx *c) {
     if (n) memset(hle_ptr(d), (int)(c->r[5] & 0xFF), n);
     c->r[7] = n; c->r[3] = 0; c->t = 1; c->r[0] = d;           /* final scratch state of the original byte loop */
 }
+static void h_udiv32(SH4Ctx *c) {
+    uint32_t d = c->r[0];
+    if (__builtin_expect(!d, 0)) {
+        c->t = 1;
+        ST32(0x8C129AE4u, 0x44Eu);
+        c->r[1] = 0x44Eu;
+        c->r[0] = 0;
+        return;
+    }
+    uint32_t q = c->r[1] / d;
+    c->r[0] = q;
+    c->r[1] = q;
+    c->t = 0;
+    c->m = 0;
+    c->q = 0;
+}
+static void h_umod32(SH4Ctx *c) {
+    uint32_t d = c->r[0];
+    if (__builtin_expect(!d, 0)) {
+        c->t = 1;
+        ST32(0x8C129AE4u, 0x44Eu);
+        c->r[1] = 0x8C129AE4u;
+        c->r[0] = 0;
+        return;
+    }
+    c->r[0] = c->r[1] % d;
+    c->t = 1;
+    c->m = 0;
+    c->q = 0;
+}
+static void h_sdiv32(SH4Ctx *c) {
+    int32_t d = (int32_t)c->r[0];
+    if (__builtin_expect(!d, 0)) {
+        c->t = 1;
+        ST32(0x8C129AE4u, 0x44Eu);
+        c->r[1] = 0x8C129AE4u;
+        c->r[0] = 0;
+        return;
+    }
+    int32_t n = (int32_t)c->r[1];
+    int32_t q = (__builtin_expect(n == (int32_t)0x80000000 && d == -1, 0)) ? (int32_t)0x80000000 : (n / d);
+    c->r[0] = (uint32_t)q;
+    c->r[1] = (uint32_t)q;
+    c->t = 0;
+    c->m = 0;
+    c->q = 0;
+}
 static void h_nop(SH4Ctx *c) { R(0) = 0; }
 /* gdFs/GD-ROM driver bring-up (0x8C0CF158 gdFsInit, 0x8C0CD916 init-wait server). Replaced: the real driver state machine needs a faithful
  * GD-ROM BIOS (cmd 0x18/0x28/0x11 TOC/session reads); game file access is redirected at the FileMng/gdFs entry points by hle/io.c instead. */
@@ -785,6 +832,11 @@ void hle_boot_init(SH4Ctx *c, const uint8_t *image, uint32_t len, const char *dc
 #ifndef R2_NO_MEMSET_HOOK
     hle_hook(0x8C0686B8, h_memset);
 #endif
+#endif
+#ifndef R2_NO_DIV_HOOKS
+    hle_hook(0x8C0679F4, h_udiv32);
+    hle_hook(0x8C09C280, h_umod32);
+    hle_hook(0x8C067940, h_sdiv32);
 #endif
     { extern void hle_mathhooks_init(void); extern int hle_io_fdcache_enabled(void);
       int nomath = hle_switch("NO_MATH_HOOKS");

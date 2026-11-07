@@ -5,6 +5,21 @@
 uint8_t sh4_ram[SH4_RAM_SIZE];
 unsigned long sh4_stat_unmapped;
 unsigned long sh4_stat_io_rd, sh4_stat_io_wr;      /* slow-path loads / stores that are not store-queue accesses (perf.c prints them per frame) */
+
+uint32_t g_fsca_table[65536][2];
+static int g_fsca_inited = 0;
+
+void sh4_fsca_init(void) {
+    if (g_fsca_inited) return;
+    g_fsca_inited = 1;
+    const double step = 6.283185307179586476925286766559 / 65536.0;
+    for (uint32_t i = 0; i < 65536; i++) {
+        double ang = (double)i * step;
+        g_fsca_table[i][0] = f2u((float)sin(ang));
+        g_fsca_table[i][1] = f2u((float)cos(ang));
+    }
+}
+__attribute__((constructor)) static void fsca_ctor(void) { sh4_fsca_init(); }
 __attribute__((weak)) void vita_gl_present_fb(uint32_t fb_offset) { (void)fb_offset; }
 __attribute__((weak)) void vita_gl_capture_scene(uint32_t off0, uint32_t off1) { (void)off0; (void)off1; }
 static void default_fault(const char *what, uint32_t a, uint32_t b) {
@@ -126,6 +141,7 @@ void sh4_load_image(const uint8_t *data, uint32_t len, uint32_t base) {
     memcpy(&sh4_ram[base & 0xFFFFFFu], data, len);
 }
 void sh4_ctx_reset(SH4Ctx *c) {
+    sh4_fsca_init();
     memset(c, 0, sizeof *c);
     c->sr_other = 0x40000000u;          /* MD=1 */
     c->r[15] = 0x8CFFFF00u;

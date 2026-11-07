@@ -9,6 +9,9 @@
 #if !defined(__vita__)
 #include <fenv.h>
 #endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 
 /* SH4_INLINE: on the Vita build every helper below must be inlined into the (huge) lifted functions: GCC refuses at -O2/-O3 for plain `static inline`
  * and emitted ~82k outlined calls. Host builds keep plain `static inline` (identical behaviour either way). */
@@ -89,6 +92,8 @@ extern void (*sh4_fault_handler)(const char *what, uint32_t a, uint32_t b);
 
 void sh4_load_image(const uint8_t *data, uint32_t len, uint32_t guest_base);
 void sh4_ctx_reset(SH4Ctx *c);
+void sh4_fsca_init(void);
+extern uint32_t g_fsca_table[65536][2];
 
 /* ---- SR / FPSCR ---- */
 SH4_INLINE uint32_t sh4_getsr(SH4Ctx *c) { return c->sr_other | c->t | (c->s << 1) | (c->q << 8) | (c->m << 9); }
@@ -262,7 +267,22 @@ SH4_INLINE void fp_ftrc(SH4Ctx *c, int n) {
 }
 SH4_INLINE void fp_cnvsd(SH4Ctx *c, int n) { fp_setd(c, n, (double)u2f(c->fpul)); }
 SH4_INLINE void fp_cnvds(SH4Ctx *c, int n) { c->fpul = f2u((float)fp_getd(c, n)); }
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(R2_FORCE_SCALAR_FP)
+SH4_INLINE void fp_fsrra(SH4Ctx *c, int n) {
+    float x = fin(c, c->fr[n]);
+    if (SH4_UNLIKELY(x <= 0.0f || !isfinite(x))) {
+        c->fr[n] = fout(c, 1.0f / sqrtf(x));
+    } else {
+        float32x2_t vx = vdup_n_f32(x);
+        float32x2_t y = vrsqrte_f32(vx);
+        y = vmul_f32(y, vrsqrts_f32(vmul_f32(vx, y), y));
+        y = vmul_f32(y, vrsqrts_f32(vmul_f32(vx, y), y));
+        c->fr[n] = fout(c, vget_lane_f32(y, 0));
+    }
+}
+#else
 SH4_INLINE void fp_fsrra(SH4Ctx *c, int n) { c->fr[n] = fout(c, 1.0f / sqrtf(fin(c, c->fr[n]))); }
+#endif
 /* fipr/ftrv: accumulation order chosen to match qemu's helper (tested bit-exact vs qemu-system-sh4 in tests/optest.py);
  * real SH7750 hardware computes these with a non-IEEE fused datapath, so last-ulp differences vs silicon are possible. */
 #ifdef SH4_FASTFP
@@ -285,6 +305,34 @@ SH4_INLINE float fp_dot4(SH4Ctx *c, const float *a, const float *b) {
     return (float)s;
 #endif
 }
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(R2_FORCE_SCALAR_FP)
+SH4_INLINE void fp_fipr(SH4Ctx *c, int vn, int vm) {  /* FVn . FVm -> FR[n+3] */
+    float32x4_t a = vld1q_f32((const float *)&c->fr[vn * 4]);
+    float32x4_t b = vld1q_f32((const float *)&c->fr[vm * 4]);
+    float32x4_t p = vmulq_f32(a, b);
+    float32x2_t s2 = vpadd_f32(vget_low_f32(p), vget_high_f32(p));
+    float32x2_t s1 = vpadd_f32(s2, s2);
+    c->fr[vn * 4 + 3] = fout(c, vget_lane_f32(s1, 0));
+}
+SH4_INLINE void fp_ftrv(SH4Ctx *c, int vn) {
+    int a = vn * 4;
+    float32x4_t v = vld1q_f32((const float *)&c->fr[a]);
+    float32x4_t c0 = vld1q_f32((const float *)&c->xf[0]);
+    float32x4_t c1 = vld1q_f32((const float *)&c->xf[4]);
+    float32x4_t c2 = vld1q_f32((const float *)&c->xf[8]);
+    float32x4_t c3 = vld1q_f32((const float *)&c->xf[12]);
+
+    float32x2_t v_lo = vget_low_f32(v);
+    float32x2_t v_hi = vget_high_f32(v);
+
+    float32x4_t o = vmulq_lane_f32(c0, v_lo, 0);
+    o = vmlaq_lane_f32(o, c1, v_lo, 1);
+    o = vmlaq_lane_f32(o, c2, v_hi, 0);
+    o = vmlaq_lane_f32(o, c3, v_hi, 1);
+
+    vst1q_f32((float *)&c->fr[a], o);
+}
+#else
 SH4_INLINE void fp_fipr(SH4Ctx *c, int vn, int vm) {  /* FVn . FVm -> FR[n+3] */
     float a[4], b[4];
     for (int i = 0; i < 4; i++) { a[i] = fin(c, c->fr[vn * 4 + i]); b[i] = fin(c, c->fr[vm * 4 + i]); }
@@ -299,8 +347,10 @@ SH4_INLINE void fp_ftrv(SH4Ctx *c, int vn) {
     }
     for (int i = 0; i < 4; i++) c->fr[a + i] = fout(c, o[i]);
 }
+#endif
 SH4_INLINE void fp_fsca(SH4Ctx *c, int dn) {
-    double ang = (double)(c->fpul & 0xFFFFu) * (6.283185307179586476925286766559 / 65536.0);
-    c->fr[dn] = f2u((float)sin(ang)); c->fr[dn + 1] = f2u((float)cos(ang));
+    uint32_t idx = c->fpul & 0xFFFFu;
+    c->fr[dn] = g_fsca_table[idx][0];
+    c->fr[dn + 1] = g_fsca_table[idx][1];
 }
 #endif

@@ -30,6 +30,58 @@
 #include <psp2/audioout.h>
 #include <psp2/io/fcntl.h>
 
+#ifdef R2_USE_VITADEBUGGER
+#include <psp2/sysmodule.h>
+#include <psp2/net/net.h>
+#include <psp2/net/netctl.h>
+#include "uvdb.h"
+
+static void vita_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static int s_debugger_active = 0;
+static void vita_debugger_init(void) {
+    if (!hle_switch("DEBUGGER")) return;
+    vita_log("[vita] VitaDebugger: DEBUGGER switch detected, initializing network and uvdb...");
+    int rc = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
+    if (rc < 0) {
+        vita_log("[vita] VitaDebugger: sceSysmoduleLoadModule failed: 0x%08x", rc);
+        return;
+    }
+    static char net_mem[1024 * 1024] __attribute__((aligned(256)));
+    SceNetInitParam net_param = {
+        .memory = net_mem,
+        .size = sizeof(net_mem),
+        .flags = 0
+    };
+    rc = sceNetInit(&net_param);
+    if (rc < 0) {
+        vita_log("[vita] VitaDebugger: sceNetInit failed: 0x%08x", rc);
+        return;
+    }
+    rc = sceNetCtlInit();
+    if (rc < 0) {
+        vita_log("[vita] VitaDebugger: sceNetCtlInit failed: 0x%08x", rc);
+        return;
+    }
+    const struct uvdb_config dbg_cfg = {
+        .port = 1234,
+        .max_packet_buffer = 256 * 1024,
+    };
+    uvdb_configure(&dbg_cfg);
+    uvdb_register_thread("rayman2_game");
+    rc = uvdb_start_server();
+    if (rc < 0) {
+        vita_log("[vita] VitaDebugger: uvdb_start_server failed: %d", rc);
+        return;
+    }
+    s_debugger_active = 1;
+    vita_log("[vita] VitaDebugger: server listening on port 1234");
+    if (hle_switch("DEBUGGER_BREAK")) {
+        vita_log("[vita] VitaDebugger: DEBUGGER_BREAK switch detected, entering breakpoint...");
+        uvdb_enter();
+    }
+}
+#endif
+
 /* Memory budget (retail Vita user space is ~256 MB for a plain app): static BSS is ~26 MB (sh4_ram 16 + vram 8 + waveram 2) on top of the
  * 9.6 MB image, vitaGL takes its own memblocks (8 MB legacy pool + 16 MB RAM threshold + textures in CDRAM). The newlib heap only holds the
  * 0.9 MB boot image, the 4 MB texture decode buffer, TA frame vertex arrays and the io index (a few hundred KB): 96 MB is ample and measured
@@ -263,6 +315,9 @@ static int game_main(void) {
     hle_verbose = R2_VITA_VERBOSE;
     r2_perf_sink = perf_sink;
     vita_log_start_async();
+#ifdef R2_USE_VITADEBUGGER
+    vita_debugger_init();
+#endif
 #ifdef R2_PROF
     r2p_start();
 #endif
@@ -365,6 +420,9 @@ static int audio_thread(SceSize args, void *argp) {
     int buf_idx = 0;
     unsigned long blocks = 0; int peak = 0, gpeak = 0; uint32_t aud_win_max = 0;
     uint64_t last = sceKernelGetProcessTimeWide();
+#ifdef R2_USE_VITADEBUGGER
+    if (s_debugger_active) uvdb_register_thread("rayman2_audio");
+#endif
     vita_log_aud("[vita] audio thread running (port %d)", port);
     for (;;) {
         int16_t *cur_buf = buf[buf_idx];
@@ -399,6 +457,9 @@ static int game_thread(SceSize args, void *argp) {
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
+#ifdef R2_USE_VITADEBUGGER
+    uvdb_register_thread("main");
+#endif
 #ifdef R2_NO_GAME_THREAD   /* diagnostic: run on the main thread */
     return game_thread(0, NULL);
 #endif

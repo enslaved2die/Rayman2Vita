@@ -533,6 +533,42 @@ static void hle_stream_feed(SH4Ctx *c) {
     hle_orig(c, 0x8C062F60);
 }
 
+/* Resolves stream sample rate from Dreamcast AICA pitch register at STREAM_CTX_ADDR + 0x20
+ * (written by f_8c0630a0 and f_8c0982f2 from the WAV format chunk), with sound_def fallback. */
+static uint32_t hle_stream_resolve_sample_rate(void) {
+    uint16_t pitch_reg = (uint16_t)(LD32(STREAM_CTX_ADDR + 0x20) & 0xFFFF);
+    switch (pitch_reg) {
+        case 0x0000: return 44100;
+        case 0x7800: return 22050;
+        case 0x7000: return 11025;
+        case 0x79cd: return 32000;
+        case 0x785a: return 24000;
+        case 0x72db: return 18900;
+        case 0x71cd: return 16000;
+        default: {
+            int oct = (int)((pitch_reg >> 11) & 0x0F);
+            if (oct > 7) oct -= 16;
+            uint32_t fns = pitch_reg & 0x3FF;
+            float freq = 44100.0f * (1.0f + (float)fns / 1024.0f) * powf(2.0f, (float)oct);
+            uint32_t calc_rate = (uint32_t)roundf(freq);
+            if (calc_rate >= 8000 && calc_rate <= 48000) {
+                return calc_rate;
+            }
+            break;
+        }
+    }
+
+    uint32_t sound_def = LD32(STREAM_CTX_ADDR + 0x24);
+    if (sound_def && hle_is_ram(sound_def)) {
+        uint32_t srate = LD32(sound_def + 0x4C);
+        if (srate >= 8000 && srate <= 48000) {
+            return srate;
+        }
+    }
+
+    return 22050;
+}
+
 /* sdStreamTransferChunk (0x8C0E3404): transfers a stream chunk to channel buffer */
 static void hle_sdStreamTransferChunk(SH4Ctx *c) {
     uint32_t handle   = c->r[4];
@@ -543,24 +579,18 @@ static void hle_sdStreamTransferChunk(SH4Ctx *c) {
     uint32_t byte_len = desc_ptr ? LD32(desc_ptr + 12) : 0;
 
     uint32_t fmt = LD32(STREAM_CTX_ADDR + 0x1C);
+    uint32_t sample_rate = hle_stream_resolve_sample_rate();
+
     s_dbg_chunk++; s_dbg_last_len = byte_len; s_dbg_last_src = src_addr; s_dbg_last_fmt = fmt;
     s_dbg_stream_chunk_idx++;
     s_dbg_stream_bytes += byte_len;
     if (s_dbg_stream_chunk_idx <= 16 || (s_dbg_stream_chunk_idx % 32) == 0) {
-        LOG_INFO("stream_chunk id=%u n=%u fmt=%u ch=%u bytes=%u total=%u src=%08x state=%u remaining=%u eof=%u",
+        LOG_INFO("stream_chunk id=%u n=%u fmt=%u ch=%u bytes=%u total=%u src=%08x state=%u remaining=%u eof=%u rate=%u",
                  s_dbg_stream_id, s_dbg_stream_chunk_idx, fmt, ch, byte_len,
                  s_dbg_stream_bytes, src_addr, LD32(STREAM_CTX_ADDR),
-                 LD32(STREAM_CTX_ADDR + 0x0C), LD32(STREAM_CTX_ADDR + 0x14));
+                 LD32(STREAM_CTX_ADDR + 0x0C), LD32(STREAM_CTX_ADDR + 0x14),
+                 sample_rate);
     }
-    uint32_t sample_rate = 22050;
-    uint32_t sound_def = LD32(STREAM_CTX_ADDR + 0x24);
-    if (sound_def) {
-        uint32_t srate = LD32(sound_def + 0x4C);
-        if (srate >= 8000 && srate <= 48000) {
-            sample_rate = srate;
-        }
-    }
-
     if (src_addr && byte_len > 0 && byte_len <= 8192) {
         s_dbg_chunk_fed++;
         SND_Vita_FeedStreamChunk((int)ch, (const uint8_t *)hle_ptr(src_addr), byte_len, (int)fmt, sample_rate);
@@ -674,13 +704,13 @@ static void hle_stream_tick(SH4Ctx *c) {
     uint32_t pr = c->pr;
     uint32_t saved_fade = 0;
 
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 2; i++) {
         uint32_t st = LD32(STREAM_CTX_ADDR);
         if (st == 0 && i > 0) {
             break;   /* idle: run the game's own tick once (it drives state 0 -> open), but never catch up */
         }
         uint32_t prev_q = SND_Vita_GetStreamQueuedFrames();
-        if (st == 3 && prev_q >= 8192) {
+        if (st == 3 && prev_q >= 4096) {
             break;
         }
         uint64_t prev_feeds = s_stat_stream_feeds;

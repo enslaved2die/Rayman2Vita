@@ -91,6 +91,8 @@ tests.append(("fmov.d SZ=1 swaps pair via fschg", [0xF3FD, 0xF0FC & 0xF0FF | 0x0
 tests[-1] = ("float/ftrc roundtrip", [0x4A5A + 0x0, 0xF12D, 0xF13D, 0x0000], {}, 0, 0, {}, None, 0, 0)
 tests.pop()
 tests.append(("float FPUL=-7 then ftrc", [0xF02D, 0xF13D + 0x0 - 0x100 + 0x100 if False else 0xF03D], {}, 0, 0, {"fr0": one(-7.0)}, {"fr": [0] * 16, "xf": [0] * 16, "fpscr": 0x40000, "fpul": U(-7)}, 0, 0))
+tests.append(("fsca angle 0", [0xF2FD], {}, 0, 0, {"fr2": one(0.0), "fr3": one(1.0)}, {"fr": [0] * 16, "xf": [0] * 16, "fpscr": 0, "fpul": 0}, 0, 0))
+tests.append(("fsrra 4.0", [0xF57D], {}, 0, 0, {"fr5": one(0.5)}, {"fr": [one(4.0) if i == 5 else 0 for i in range(16)], "xf": [0] * 16, "fpscr": 0}, 0, 0))
 
 def run():
     fails = 0
@@ -109,7 +111,7 @@ def run():
         got = {"T": b["sr"] & 1, "mach": b["mach"], "macl": b["macl"]}
         for i in range(16): got["r%d" % i] = b["r"][i]; got["fr%d" % i] = b["fr"][i]
         bad = [(k, hex(v), hex(got[k])) for k, v in expect.items() if v is not None and got[k] != v]
-        q = T.run_qemu(blob, entries, 1, scr)
+        q = T.run_qemu(blob, entries, 1, scr) if not os.environ.get("NO_QEMU") else None
         qs = ""
         if q:
             qb = T.unpack_block(q[0][:T.BLK]); qg = {"T": qb["sr"] & 1, "mach": qb["mach"], "macl": qb["macl"]}

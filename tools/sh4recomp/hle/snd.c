@@ -1155,7 +1155,7 @@ void snd_set_master_volume(float v) { g_master = v; }
 static inline float cubic(const float *h, float t) {           /* Catmull-Rom between h[1] and h[2] */
     return h[1] + 0.5f * t * (h[2] - h[0] + t * (2.0f * h[0] - 5.0f * h[1] + 4.0f * h[2] - h[3] + t * (3.0f * (h[1] - h[2]) + h[3] - h[0])));
 }
-#define MIX_CHUNK 256                                           /* AICA samples generated per lock hold (~5.8 ms) */
+#define MIX_CHUNK 64                                            /* AICA samples generated per lock hold (~1.45 ms) */
 static uint64_t mix_now_us(void) {
 #if defined(__vita__)
     return sceKernelGetProcessTimeWide();

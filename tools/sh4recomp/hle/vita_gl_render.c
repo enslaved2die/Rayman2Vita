@@ -28,6 +28,9 @@
 #ifdef R2_NATIVE_GFX
 #include "native_hook.h"
 #endif
+#ifdef R2_USE_VITADEBUGGER
+#include "uvdb.h"
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -1563,7 +1566,14 @@ static void render_thread_loop(void)
     }
 }
 #if defined(__vita__)
-static int render_thread_entry(SceSize args, void *argp) { (void)args; (void)argp; render_thread_loop(); return 0; }
+static int render_thread_entry(SceSize args, void *argp) {
+    (void)args; (void)argp;
+#ifdef R2_USE_VITADEBUGGER
+    uvdb_register_thread("rayman2_render");
+#endif
+    render_thread_loop();
+    return 0;
+}
 #else
 static void *render_thread_entry(void *arg) { (void)arg; render_thread_loop(); return NULL; }
 #endif

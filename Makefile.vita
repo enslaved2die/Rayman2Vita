@@ -38,9 +38,10 @@ VARIANT         ?= v0_base
 V_OPT_HOT       :=
 V_OPT_COLD      :=
 V_DEFS          :=
-V_ORDER         :=
+V_ORDER         ?= 1
 OS_COLD         := __attribute__((cold,optimize("Os")))
 ifeq ($(VARIANT),v0_base)
+V_DEFS          := -DR2_FASTCHK_SUB
 else ifeq ($(VARIANT),v1_noaudio)
 V_DEFS          := -DR2_AUDIO_MODE=1
 else ifeq ($(VARIANT),v1b_armonly)
@@ -140,6 +141,13 @@ LIBS            := -lvitaGL \
                    -lmathneon \
                    -lstdc++ \
                    -lm
+
+# VitaDebugger support (make DEBUGGER=1)
+DEBUGGER        ?= 1
+ifeq ($(DEBUGGER),1)
+CFLAGS          += -DR2_USE_VITADEBUGGER
+LIBS            += -luvdb -lkubridge_stub -lSceNet_stub -lSceNetPs_stub -lSceNetCtl_stub -lSceKernelModulemgr_stub -pthread
+endif
 
 # Audio module: cleanroom audio engine (0 = fallback to AICA emulator snd.c, 1 = cleanroom audio)
 USE_CLEANROOM_AUDIO ?= 0

@@ -215,6 +215,25 @@ static int32_t              s_stream_step[2]      = {127, 127};
 static int32_t              s_stream_last_l       = 0;
 static int32_t              s_stream_last_r       = 0;
 
+/* Streaming Chunk FIFO Queue (Offloaded from game thread) */
+#define SND_CHUNK_QUEUE_SIZE        32
+#define SND_CHUNK_MAX_BYTES         8192
+
+typedef struct SndChunkEntry {
+    int         channel;
+    int         fmt;
+    uint32_t    bytes;
+    uint32_t    num_samples;
+    uint32_t    sample_rate;
+    uint8_t     data[SND_CHUNK_MAX_BYTES];
+} SndChunkEntry;
+
+static SndChunkEntry        g_chunk_queue[SND_CHUNK_QUEUE_SIZE];
+static uint32_t             g_chunk_q_head = 0;
+static uint32_t             g_chunk_q_tail = 0;
+static uint32_t             g_chunk_q_count = 0;
+static uint32_t             g_chunk_q_pending_samples[2] = {0, 0};
+
 /* ----------------------------------------------------------------------------
  * 4. Synchronization Primitives
  * ---------------------------------------------------------------------------- */
@@ -501,15 +520,13 @@ static int SND_ParseOSBData(const uint8_t *data, size_t size, SND_Vita_Bank *pBa
 
         /* Base sample rate calculation from Yamaha AICA OCT / FNS registers */
         uint32_t srate = 22050;
-        if (pitch_reg != 0) {
-            int oct = (int)((pitch_reg >> 11) & 0x0F);
-            if (oct > 7) oct -= 16;
-            uint32_t fns = pitch_reg & 0x3FF;
-            float freq = 44100.0f * (1.0f + (float)fns / 1024.0f) * powf(2.0f, (float)oct);
-            uint32_t calc_rate = (uint32_t)roundf(freq);
-            if (calc_rate >= 4000 && calc_rate <= 96000) {
-                srate = calc_rate;
-            }
+        int oct = (int)((pitch_reg >> 11) & 0x0F);
+        if (oct > 7) oct -= 16;
+        uint32_t fns = pitch_reg & 0x3FF;
+        float freq = 44100.0f * (1.0f + (float)fns / 1024.0f) * powf(2.0f, (float)oct);
+        uint32_t calc_rate = (uint32_t)roundf(freq);
+        if (calc_rate >= 4000 && calc_rate <= 96000) {
+            srate = calc_rate;
         }
 
         /* Allocate 16-bit PCM buffer and decode sample immediately for instant playback */
@@ -1057,76 +1074,49 @@ int SND_Vita_GetBGMStatus(void) {
 void SND_Vita_FeedStreamChunk(int ch, const uint8_t *data, uint32_t bytes, int fmt, uint32_t sample_rate) {
     if (!data || bytes == 0) return;
     int channel = (ch == 1) ? 1 : 0;
+    if (bytes > SND_CHUNK_MAX_BYTES) {
+        bytes = SND_CHUNK_MAX_BYTES;
+    }
 
+    uint32_t num_samples = 0;
     if (fmt == 1) {
-        /* Format 1: 16-bit signed PCM */
-        uint32_t num_samples = bytes / sizeof(int16_t);
-        const int16_t *pcm = (const int16_t *)data;
-        SND_Vita_Lock();
+        num_samples = bytes / sizeof(int16_t);
+    } else {
+        /* Format 2 / 0: Yamaha AICA ADPCM (4-bit nibbles, 2 samples per byte) */
+        num_samples = bytes * 2;
+    }
+
+    SND_Vita_Lock();
+    if (g_chunk_q_count < SND_CHUNK_QUEUE_SIZE) {
+        SndChunkEntry *entry = &g_chunk_queue[g_chunk_q_tail];
+        entry->channel = channel;
+        entry->fmt = fmt;
+        entry->bytes = bytes;
+        entry->num_samples = num_samples;
+        entry->sample_rate = sample_rate;
+        memcpy(entry->data, data, bytes);
+
+        g_chunk_q_tail = (g_chunk_q_tail + 1) % SND_CHUNK_QUEUE_SIZE;
+        g_chunk_q_count++;
+        g_chunk_q_pending_samples[channel] += num_samples;
         if (sample_rate > 0) {
             g_stream_sample_rate = sample_rate;
         }
-        uint32_t wp = g_stream_write_pos[channel];
-        for (uint32_t i = 0; i < num_samples; i++) {
-            uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
-            g_stream_ring[idx * 2 + channel] = pcm[i];
-        }
-        g_stream_write_pos[channel] = wp + num_samples;
-        SND_Vita_Unlock();
-    } else if (fmt == 2 || fmt == 0) {
-        /* Format 2 / 0: Yamaha AICA ADPCM — decode outside lock to avoid stalling real-time mixer */
-        uint32_t total_samples = bytes * 2;
-        int32_t pred = s_stream_pred[channel];
-        int32_t step = s_stream_step[channel];
-        if (step < 127) step = 127;
-
-        int16_t decoded[4096];
-        uint32_t offset = 0;
-        while (offset < total_samples) {
-            uint32_t chunk = total_samples - offset;
-            if (chunk > 4096) chunk = 4096;
-
-            for (uint32_t i = 0; i < chunk; i++) {
-                uint32_t sample_idx = offset + i;
-                uint8_t byte = data[sample_idx >> 1];
-                uint8_t nib = (sample_idx & 1) ? (byte >> 4) : (byte & 0x0F);
-
-                pred += (yam_diff[nib] * step) / 8;
-                if (pred > 32767) pred = 32767;
-                else if (pred < -32768) pred = -32768;
-
-                decoded[i] = (int16_t)pred;
-
-                int32_t st = (step * yam_scale[nib & 7]) >> 8;
-                step = (st < 127) ? 127 : ((st > 24576) ? 24576 : st);
-            }
-
-            SND_Vita_Lock();
-            if (sample_rate > 0) {
-                g_stream_sample_rate = sample_rate;
-            }
-            uint32_t wp = g_stream_write_pos[channel];
-            for (uint32_t i = 0; i < chunk; i++) {
-                uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
-                g_stream_ring[idx * 2 + channel] = decoded[i];
-            }
-            g_stream_write_pos[channel] = wp + chunk;
-            s_stream_pred[channel] = pred;
-            s_stream_step[channel] = step;
-            SND_Vita_Unlock();
-
-            offset += chunk;
-        }
+    } else {
+        OS_Vita_LogWarn("[SND] FeedStreamChunk: FIFO queue overflow (dropped chunk)");
     }
+    SND_Vita_Unlock();
 }
 
 uint32_t SND_Vita_GetStreamQueuedFrames(void) {
     SND_Vita_Lock();
     uint32_t write_head = (g_stream_write_pos[0] < g_stream_write_pos[1]) ? g_stream_write_pos[0] : g_stream_write_pos[1];
+    uint32_t pending_queue_samples = (g_chunk_q_pending_samples[0] < g_chunk_q_pending_samples[1]) ? g_chunk_q_pending_samples[0] : g_chunk_q_pending_samples[1];
     uint32_t queued = 0;
     if (write_head > g_stream_read_pos) {
         queued = write_head - g_stream_read_pos;
     }
+    queued += pending_queue_samples;
     SND_Vita_Unlock();
     return queued;
 }
@@ -1145,6 +1135,11 @@ uint32_t SND_Vita_GetStreamConsumedFrames(void) {
 
 void SND_Vita_ClearStream(void) {
     SND_Vita_Lock();
+    g_chunk_q_head = 0;
+    g_chunk_q_tail = 0;
+    g_chunk_q_count = 0;
+    g_chunk_q_pending_samples[0] = 0;
+    g_chunk_q_pending_samples[1] = 0;
     g_stream_write_pos[0] = 0;
     g_stream_write_pos[1] = 0;
     g_stream_read_pos = 0;
@@ -1472,6 +1467,60 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
 #endif
 
     SND_Vita_Lock();
+
+    /* 0. Drain queued streaming chunks (offloaded from game thread) */
+    while (g_chunk_q_count > 0) {
+        SndChunkEntry *entry = &g_chunk_queue[g_chunk_q_head];
+        int channel = entry->channel;
+        if (entry->sample_rate > 0) {
+            g_stream_sample_rate = entry->sample_rate;
+        }
+
+        if (entry->fmt == 1) {
+            /* Format 1: 16-bit signed PCM */
+            const int16_t *pcm = (const int16_t *)entry->data;
+            uint32_t wp = g_stream_write_pos[channel];
+            for (uint32_t i = 0; i < entry->num_samples; i++) {
+                uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
+                g_stream_ring[idx * 2 + channel] = pcm[i];
+            }
+            g_stream_write_pos[channel] = wp + entry->num_samples;
+        } else {
+            /* Format 2 / 0: Yamaha AICA ADPCM */
+            int32_t pred = s_stream_pred[channel];
+            int32_t step = s_stream_step[channel];
+            if (step < 127) step = 127;
+
+            uint32_t wp = g_stream_write_pos[channel];
+            for (uint32_t i = 0; i < entry->num_samples; i++) {
+                uint8_t byte = entry->data[i >> 1];
+                uint8_t nib = (i & 1) ? (byte >> 4) : (byte & 0x0F);
+
+                pred += (yam_diff[nib] * step) / 8;
+                if (pred > 32767) pred = 32767;
+                else if (pred < -32768) pred = -32768;
+
+                uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
+                g_stream_ring[idx * 2 + channel] = (int16_t)pred;
+
+                int32_t st = (step * yam_scale[nib & 7]) >> 8;
+                step = (st < 127) ? 127 : ((st > 24576) ? 24576 : st);
+            }
+
+            g_stream_write_pos[channel] = wp + entry->num_samples;
+            s_stream_pred[channel] = pred;
+            s_stream_step[channel] = step;
+        }
+
+        if (g_chunk_q_pending_samples[channel] >= entry->num_samples) {
+            g_chunk_q_pending_samples[channel] -= entry->num_samples;
+        } else {
+            g_chunk_q_pending_samples[channel] = 0;
+        }
+
+        g_chunk_q_head = (g_chunk_q_head + 1) % SND_CHUNK_QUEUE_SIZE;
+        g_chunk_q_count--;
+    }
 
     float master_vol = g_fMasterVolume;
 
@@ -1857,6 +1906,11 @@ int SND_Vita_InitEx(int spawn_thread) {
     memset(&g_fix_bank, 0, sizeof(g_fix_bank));
     memset(&g_level_bank, 0, sizeof(g_level_bank));
     memset(g_stream_ring, 0, sizeof(g_stream_ring));
+    g_chunk_q_head = 0;
+    g_chunk_q_tail = 0;
+    g_chunk_q_count = 0;
+    g_chunk_q_pending_samples[0] = 0;
+    g_chunk_q_pending_samples[1] = 0;
     g_stream_write_pos[0] = g_stream_write_pos[1] = 0;
     g_stream_read_pos = g_stream_read_frac = 0;
     s_stream_pred[0] = s_stream_pred[1] = 0;

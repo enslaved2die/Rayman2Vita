@@ -352,10 +352,29 @@ static bool test_streaming_bgm_lifecycle(void) {
     for (int i = 0; i < 2048; i++) stream_energy += abs(stream_test_buf[i]);
     assert(stream_energy > 0);
     assert(SND_Vita_GetStreamQueuedFrames() < 1024 + 4096);
+    uint32_t consumed_22k = SND_Vita_GetStreamConsumedFrames();
+    assert(consumed_22k >= 468 && consumed_22k <= 472);
 
     SND_Vita_ClearStream();
     assert(SND_Vita_GetStreamQueuedFrames() == 0);
-    printf(" - Stream Ring Buffer (Feed, ADPCM, Mix & Reset): PASS [OK]\n");
+
+    /* 8. 44.1 kHz Stream Chunk Feeding & Full-Speed Consumption Verification */
+    SND_Vita_FeedStreamChunk(0, (const uint8_t *)dummy_pcm, sizeof(dummy_pcm), 1, 44100);
+    SND_Vita_FeedStreamChunk(1, (const uint8_t *)dummy_pcm, sizeof(dummy_pcm), 1, 44100);
+    SND_Vita_FeedStreamChunk(0, dummy_adpcm, sizeof(dummy_adpcm), 2, 44100);
+    SND_Vita_FeedStreamChunk(1, dummy_adpcm, sizeof(dummy_adpcm), 2, 44100);
+    assert(SND_Vita_GetStreamQueuedFrames() == 1024 + 4096);
+
+    /* Mix 1024 frames at 48000 Hz: at 44.1 kHz, ~940 stream frames must be consumed */
+    SND_Vita_MixStereoBuffer(stream_test_buf, 1024);
+    uint32_t consumed_44k = SND_Vita_GetStreamConsumedFrames();
+    printf(" - Stream Sample Rates: 22.05 kHz consumed %u frames, 44.1 kHz consumed %u frames (expected ~940)\n",
+           consumed_22k, consumed_44k);
+    assert(consumed_44k >= 938 && consumed_44k <= 942);
+
+    SND_Vita_ClearStream();
+    assert(SND_Vita_GetStreamQueuedFrames() == 0);
+    printf(" - Stream Ring Buffer (Feed, ADPCM, 44.1 kHz vs 22.05 kHz Rate Matching): PASS [OK]\n");
 
     printf(COLOR_GREEN "Streaming BGM lifecycle: PASS [OK]" COLOR_RESET "\n\n");
     return true;
