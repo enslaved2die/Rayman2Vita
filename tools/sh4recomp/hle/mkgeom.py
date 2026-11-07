@@ -54,7 +54,7 @@ static void GEOM_STAT_ENTER(int i, SH4Ctx *c) { static int init; if (!init) { in
 
 /* 32-bit guest store: SQ window straight into the SQ buffer (== runtime.c sh4_io_write for 0xE0..), everything else as ST32 */
 static inline void STQ(uint32_t a, uint32_t v) {
-    if (SH4_LIKELY((a & 0xFC000000u) == 0xE0000000u)) memcpy(sh4_sq_buf + (a & 0x3F), &v, 4);
+    if (SH4_LIKELY((a & 0xFC000000u) == 0xE0000000u)) *(uint32_t *)(void *)(sh4_sq_buf + (a & 0x3F)) = v;
     else ST32(a, v);
 }
 

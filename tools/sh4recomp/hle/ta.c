@@ -3,6 +3,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(R2_FORCE_SCALAR_FP)
+#include <arm_neon.h>
+#endif
+
+#ifndef SH4_LIKELY
+#define SH4_LIKELY(x)   __builtin_expect(!!(x), 1)
+#endif
+#ifndef SH4_UNLIKELY
+#define SH4_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#endif
 
 static float f32(uint32_t w) { float f; memcpy(&f, &w, 4); return f; }
 /* byte/255.f for all 256 byte values, computed with the very same division (a divide is ~15-30 cycles on the Cortex-A9's non-pipelined VFP divider; packed colours need 4-8 per vertex) */
@@ -354,13 +364,26 @@ int ta_cap_write32(TaCap *c, const void *p)
     TaRaw *r = c->cur;
     if (__builtin_expect(r->nbytes + 32 > r->cap, 0)) { uint32_t nc = r->cap ? r->cap * 2 : 65536; r->data = (uint8_t *)realloc(r->data, nc); r->cap = nc; }
     uint32_t *w = (uint32_t *)(void *)(r->data + r->nbytes);       /* 32-byte steps from a malloc'ed base: aligned */
-    memcpy(w, p, 32); r->nbytes += 32; r->chunks++;
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(R2_FORCE_SCALAR_FP)
+    uint8x16_t v0 = vld1q_u8((const uint8_t *)p);
+    uint8x16_t v1 = vld1q_u8((const uint8_t *)p + 16);
+    vst1q_u8((uint8_t *)w, v0);
+    vst1q_u8((uint8_t *)w + 16, v1);
+#else
+    memcpy(w, p, 32);
+#endif
+    r->nbytes += 32; r->chunks++;
     uint32_t w0 = w[0];
-    if (c->pend) { c->pend = 0; return cap_param(c, c->pend_w0 >> 29, c->pend_w0, c->pend_w2, c->pend_w3); }
+    if (SH4_UNLIKELY(c->pend)) { c->pend = 0; return cap_param(c, c->pend_w0 >> 29, c->pend_w0, c->pend_w2, c->pend_w3); }
     unsigned para = w0 >> 29;
+    if (SH4_LIKELY(para == TA_P_VERTEX)) {
+        if (SH4_UNLIKELY(c->vch == 2)) {
+            c->pend = 1; c->pend_w0 = w0; c->pend_w2 = w[2]; c->pend_w3 = w[3];
+        }
+        return 0;
+    }
     int need = 1;
     if (para == TA_P_POLYHDR) need = ta_header_chunks(w0);
-    else if (para == TA_P_VERTEX) need = c->vch;
     if (need == 2) { c->pend = 1; c->pend_w0 = w0; c->pend_w2 = w[2]; c->pend_w3 = w[3]; return 0; }
     return cap_param(c, para, w0, w[2], w[3]);
 }

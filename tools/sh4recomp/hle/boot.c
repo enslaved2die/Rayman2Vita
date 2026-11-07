@@ -227,7 +227,6 @@ void hle_mmio_watch(uint32_t lo, uint32_t hi, hle_mmio_wr cb) { maps[nmaps++] = 
 static hle_pref_fn pref_fn;
 void hle_set_pref_handler(hle_pref_fn fn) { pref_fn = fn; }
 hle_pref_fn hle_get_pref_handler(void) { return pref_fn; }
-void sh4_pref(SH4Ctx *c, uint32_t addr) { if (pref_fn) pref_fn(c, addr); }
 static void (*cb_begin)(SH4Ctx *), (*cb_end)(SH4Ctx *);
 static void (*cb_vblank)(SH4Ctx *);
 void hle_set_frame_callbacks(void (*b)(SH4Ctx *), void (*e)(SH4Ctx *)) { cb_begin = b; cb_end = e; }
@@ -425,12 +424,14 @@ static void sq_flush_body(SH4Ctx *c, uint32_t addr) {          /* `pref @Rn` wit
     (void)c;
     if (addr < 0xE0000000u || addr > 0xE3FFFFFFu) return;          /* pref to a normal address = cache prefetch: no side effect (was corrupting RAM with SQ contents) */
     int q = (addr >> 5) & 1;
-    uint32_t qacr = hle_reg_get(q ? 0xFF00003Cu : 0xFF000038u);
+    uint32_t qacr = qacr_v[q];
     uint32_t phys = (((qacr >> 2) & 7u) << 26) | (addr & 0x03FFFFE0u);
     const uint8_t *d = sq_buf + q * 32;
+    if (SH4_LIKELY(phys >= 0x10000000u && phys < 0x10800000u)) {
+        if (sq_sink) { sq_sink(phys, d); sq_other_n++; return; }
+        ta_fallback_scan(d, 32); sq_other_n++; return;
+    }
     if (phys >= 0x0C000000u && phys < 0x0D000000u) { memcpy(&sh4_ram[phys & 0xFFFFFF], d, 32); sq_ram_n++; return; }   /* SQ -> system RAM */
-    if (sq_sink) { sq_sink(phys, d); sq_other_n++; return; }
-    if (phys >= 0x10000000u && phys < 0x10800000u) { ta_fallback_scan(d, 32); sq_other_n++; return; }
     if (phys >= 0x04000000u && phys < 0x08000000u) { vram_area_n[(phys >> 24) & 3]++; memcpy(&vram[phys & 0x7FFFFF], d, 32); vram_stamp(phys & 0x7FFFFF, 32); sq_other_n++; return; }        /* SQ -> VRAM */
     hle_unhandled("sq-flush", phys, 32, 0);
 }
@@ -447,6 +448,13 @@ static void sq_flush_default(SH4Ctx *c, uint32_t addr) {      /* measurement bui
 #else
 #define sq_flush_default sq_flush_body
 #endif
+void sh4_pref(SH4Ctx *c, uint32_t addr) {
+    if (SH4_LIKELY(pref_fn == sq_flush_default)) {
+        sq_flush_default(c, addr);
+        return;
+    }
+    if (pref_fn) pref_fn(c, addr);
+}
 static uint32_t sq_rd(uint32_t a, int size) { uint32_t v = 0; memcpy(&v, sq_buf + (a & 0x3F), size); return v; }
 static void sq_wr(uint32_t a, int size, uint32_t v) { memcpy(sq_buf + (a & 0x3F), &v, size); }
 
