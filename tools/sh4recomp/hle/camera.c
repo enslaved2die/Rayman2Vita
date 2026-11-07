@@ -4,6 +4,7 @@
  */
 #include "camera.h"
 #include "pad.h"
+#include "swflag.h"
 #include <math.h>
 #include <string.h>
 #include <strings.h>
@@ -303,5 +304,6 @@ void hle_cam_follow_step(SH4Ctx *c) {
 }
 
 void hle_camera_init(void) {
+    if (!hle_switch("ENABLE_360_CAM")) return; // Disabled by default
     hle_hook(0x8C08CD74, hle_cam_follow_step);
 }
