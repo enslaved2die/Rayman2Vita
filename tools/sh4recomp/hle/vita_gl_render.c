@@ -139,7 +139,7 @@ typedef struct RenderJob {
     int is_fb; uint32_t fb_off;         /* direct frame-buffer presentation job (swirl / loading vignet) */
     void *native;                       /* R2_NATIVE_GFX: NatJob built by native_hook_frame (NULL = draw the TA frame as usual) */
     int is_cap;                         /* scene-capture job: read the presented (front) buffer back into s_scene565 (base image of the swirl transition) */
-    uint32_t regs[2048];                /* PVR register file 0x5F8000..0x5F9FFF at STARTRENDER (palette RAM at word 0x400, fog table at 0x80 ...) */
+    uint32_t regs[256];                 /* PVR register file 0x5F8000..0x5F83FC at STARTRENDER (control regs + fog table at 0x80..0xFF; palette RAM is decoded on guest thread) */
     float bg[3][4]; uint32_t bg_isp, bg_tsp, bg_tcw; int have_bg;   /* ISP_BACKGND plane (lives in VRAM) */
     int wide;                           /* hle_ta_wide_active() */
     uint32_t fpmode;                    /* FP rounding / flush-to-zero mode of the guest thread at STARTRENDER (the SH-4 code runs with FPSCR.RM=1 = round-to-zero in the hardware FPSCR; the old inline renderer inherited it, the render thread must run the same arithmetic) */

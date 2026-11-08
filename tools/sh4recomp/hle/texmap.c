@@ -11,14 +11,35 @@
 #include <stdlib.h>
 
 #define MAXTEX 4096
+#define TEX_HT_SIZE 8192
+#define TEX_HT_MASK (TEX_HT_SIZE - 1)
 static HleTex tex[MAXTEX]; static unsigned ntex;
+static uint16_t tex_ht[TEX_HT_SIZE]; /* index + 1 into tex[], 0 = empty */
 static unsigned s_gen_total;
 static unsigned long n_create, n_load, n_create_fail;
 
+static inline uint32_t vram_hash(uint32_t v) {
+    uint32_t h = (v >> 3) * 0x9E3779B9u;
+    return (h ^ (h >> 16)) & TEX_HT_MASK;
+}
+
 static HleTex *slot_for(uint32_t vram, uint32_t gd) {
-    for (unsigned i = 0; i < ntex; i++) if (tex[i].vram == vram) return &tex[i];
-    if (ntex >= MAXTEX) return &tex[MAXTEX - 1];
-    memset(&tex[ntex], 0, sizeof tex[0]); tex[ntex].vram = vram; tex[ntex].guest_desc = gd; return &tex[ntex++];
+    uint32_t h = vram_hash(vram);
+    for (uint32_t k = 0; k < TEX_HT_SIZE; k++) {
+        uint32_t slot = (h + k) & TEX_HT_MASK;
+        uint16_t idx1 = tex_ht[slot];
+        if (!idx1) {
+            if (ntex >= MAXTEX) return &tex[MAXTEX - 1];
+            unsigned idx = ntex++;
+            memset(&tex[idx], 0, sizeof tex[0]);
+            tex[idx].vram = vram;
+            tex[idx].guest_desc = gd;
+            tex_ht[slot] = (uint16_t)(idx + 1);
+            return &tex[idx];
+        }
+        if (tex[idx1 - 1].vram == vram) return &tex[idx1 - 1];
+    }
+    return &tex[MAXTEX - 1];
 }
 static void snap(HleTex *t, uint32_t gd) { for (int i = 0; i < 8; i++) t->desc[i] = LD32(gd + 4 * i); t->guest_desc = gd; }
 
@@ -99,8 +120,16 @@ int hle_ta_background(float col[3][4], uint32_t *isp, uint32_t *tsp, uint32_t *t
     return any;
 }
 unsigned hle_texmap_epoch(void) { return s_gen_total; }
-unsigned hle_texmap_gen(uint32_t v) { for (unsigned i = 0; i < ntex; i++) if (tex[i].vram == v) return tex[i].gen; return 0; }
-const HleTex *hle_texmap_find(uint32_t v) { for (unsigned i = 0; i < ntex; i++) if (tex[i].vram == v) return &tex[i]; return 0; }
+const HleTex *hle_texmap_find(uint32_t v) {
+    uint32_t h = vram_hash(v);
+    for (uint32_t k = 0; k < TEX_HT_SIZE; k++) {
+        uint16_t idx1 = tex_ht[(h + k) & TEX_HT_MASK];
+        if (!idx1) return 0;
+        if (tex[idx1 - 1].vram == v) return &tex[idx1 - 1];
+    }
+    return 0;
+}
+unsigned hle_texmap_gen(uint32_t v) { const HleTex *t = hle_texmap_find(v); return t ? t->gen : 0; }
 unsigned hle_texmap_count(void) { return ntex; }
 const HleTex *hle_texmap_at(unsigned i) { return i < ntex ? &tex[i] : 0; }
 void hle_texmap_dump(FILE *o) {
