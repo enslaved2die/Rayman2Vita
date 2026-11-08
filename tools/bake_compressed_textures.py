@@ -30,9 +30,9 @@ def ensure_binary():
             "clang", "-O3", "-Wall", "-Wextra",
             "-I" + os.path.join(REPO_ROOT, "include"),
             "-I" + os.path.join(REPO_ROOT, "src", "cpa"),
+            # The baker is self-contained (it has its own PNG loader and DXT encoder).
+            # Linking cpa_hd_tex.c as well duplicates cpa_png_load_* and fails.
             C_TOOL_SRC,
-            os.path.join(REPO_ROOT, "src", "cpa", "cpa_hd_tex.c"),
-            os.path.join(REPO_ROOT, "src", "cpa", "cpa_hd_manifest.c"),
             "-lpthread", "-o", C_TOOL_BIN
         ]
         res = subprocess.run(cmd)

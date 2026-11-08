@@ -43,3 +43,23 @@ tools/sh4recomp/Save/
 vita_textures_compact
 Save
 vita_button_prompts
+
+# Copyrighted game data (Ubisoft) - never commit; supply your own copy
+Rayman 2 16x9 Widescreen Fix/
+re_analysis/dc/decompiled.c
+
+# Compiled host test binaries (rebuild from source)
+tools/sh4recomp/hle/tests_ta/bench_ta
+tools/sh4recomp/hle/tests_ta/bench_ta_vmath
+tools/sh4recomp/hle/tests_ta/test_glcount
+tools/sh4recomp/hle/tests_ta/test_ta_real
+tools/sh4recomp/hle/tests_ta/test_stamp
+tools/sh4recomp/tests_snd/replay_new
+tools/sh4recomp/tests_snd/replay_ref
+tools/sh4recomp/tests_snd/snd_test
+
+# OS / editor noise
+.claude/settings.local.json
+
+# Emulator screenshots of the original game (copyrighted)
+re_analysis/flycast_ref/*.png
