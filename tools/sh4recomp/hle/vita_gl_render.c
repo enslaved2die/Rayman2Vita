@@ -28,6 +28,8 @@
 #include "texmap.h"
 #include "perf.h"
 #include "cpa_hd_tex.h"
+#include "cpa_hd_manifest.h"
+#include "cpa_hd_stage.h"
 #ifdef R2_NATIVE_GFX
 #include "native_hook.h"
 #endif
@@ -122,11 +124,15 @@ typedef struct {
     int chk_frame;                      /* guest frame number of the last successful validity check (once per frame) */
     uint8_t used;
     int dec_frame;
+    uint8_t hd_pending;                 /* drawn with the original (PVR) texture while its HD override stages; re-checked each frame */
+    uint32_t hd_va;
+    char hd_bank[32];
 } GTexEntry;
 typedef struct {
     GLuint tex_id;
     uint8_t levels;                     /* mip levels of the uploaded texture */
     GLint minf, magf, wrap_s, wrap_t;   /* parameters currently set on the GL texture object (0 = unknown) */
+    void *gpu_mem;                      /* DXT chain copy in GPU-mapped memory; vitaGL may reference it after glCompressedTexImage2D (freed with the texture) */
 } RTexEntry;
 static GTexEntry s_gtex[TEX_CACHE_SIZE];
 static RTexEntry s_rtex[TEX_CACHE_SIZE];
@@ -237,9 +243,30 @@ static void apply_tex_params(RTexEntry *e, uint32_t tsp)
 
 /* GUEST: decode the texture of (tcw, tsp) from VRAM into a fresh pixel buffer (the render side uploads and frees it).  Returns the buffer or NULL.
  * For format 1 (RGB565), decodes directly into a 16-bit buffer. Alpha formats (0: ARGB1555, 2: ARGB4444) decode to 32-bit RGBA for maximum quality and VitaGL compatibility. */
+/* Mip levels of a full chain for an image of this size (down to 1x1). */
+static uint8_t hd_full_levels(uint32_t w, uint32_t h)
+{
+    uint32_t m = w > h ? w : h;
+    uint8_t n = 1;
+    while (m > 1) { m >>= 1; n++; }
+    return n;
+}
+
+static int s_hd_pending;                /* set by decode_texture when the HD override is still being staged */
+static uint32_t s_hd_pending_va;
+static char s_hd_pending_bank[32];
+/* records on a cache entry that it was decoded from the original texture while its override stages */
+static void mark_hd_pending(GTexEntry *e)
+{
+    e->hd_pending = (uint8_t)(s_hd_pending ? 1 : 0);
+    if (s_hd_pending) { e->hd_va = s_hd_pending_va; snprintf(e->hd_bank, sizeof e->hd_bank, "%s", s_hd_pending_bank); }
+}
+#define TEX_PENDING_ID 0xFFFFFFFFu       /* render_texture: texture not staged yet; the batch is skipped this frame */
+
 static void *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph, uint8_t *pfmt, uint8_t *plevels)
 {
     if (plevels) *plevels = 0;
+    s_hd_pending = 0;
     /* Check HD replacement hook first */
     uint32_t vram_addr = (tcw & 0x1FFFFFu) << 3;
     const HleTex *t = hle_texmap_find(vram_addr);
@@ -254,25 +281,56 @@ static void *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph, uint8_
         }
     }
     if (cpa_hd_tex_is_enabled()) {
-        const char *bank = (t && t->struct_va && cpa_hd_tex_is_fix_va(t->struct_va)) ? "FIX" : (level_buf[0] ? level_buf : cpa_hd_tex_get_level());
-        bool is_fix = (strcmp(bank, "FIX") == 0);
-        if (is_fix) {
-            uint32_t hd_w = 0, hd_h = 0;
-            uint32_t *rgba = cpa_hd_tex_load(bank, t ? t->struct_va : 0, -1, NULL, &hd_w, &hd_h);
-            if (rgba) {
-                *pw = (int)hd_w;
-                *ph = (int)hd_h;
-                if (plevels) *plevels = 8;
-                *pfmt = 255; /* RGBA8888 with hardware glGenerateMipmap for smooth anti-aliased fonts */
-                return rgba;
-            }
+        /* HD overrides are staged by a worker thread (cpa_hd_stage.h): no file is read or decoded on this thread. */
+        cpa_hd_stage_init();
+        static bool s_fix_prefetched;
+        static char s_prefetched_level[32];
+        if (!s_fix_prefetched) { cpa_hd_stage_prefetch_bank("FIX"); s_fix_prefetched = true; }
+        /* Level-load prefetch (HD_Texture_Plan.md, Phase 4): the first decode under a new level name queues that bank. */
+        if (level_buf[0] && strcmp(s_prefetched_level, level_buf) != 0) {
+            snprintf(s_prefetched_level, sizeof(s_prefetched_level), "%s", level_buf);
+            cpa_hd_stage_prefetch_bank(level_buf);
         }
+
+        const char *bank = (t && t->struct_va && cpa_hd_manifest_is_fix_va(t->struct_va)) ? "FIX" : (level_buf[0] ? level_buf : cpa_hd_tex_get_level());
+        bool is_fix = (strcmp(bank, "FIX") == 0);
         CpaHdTexture hd_tex;
-        if (cpa_hd_tex_load_ex(bank, t ? t->struct_va : 0, -1, NULL, &hd_tex)) {
+        CpaHdStageState st = cpa_hd_stage_request(bank, t ? t->struct_va : 0, -1, &hd_tex);
+        if (st == CPA_HD_STAGE_PENDING) {   /* the original texture is drawn meanwhile; the entry is re-checked each frame until the override is ready */
+            s_hd_pending = 1; s_hd_pending_va = t ? t->struct_va : 0; snprintf(s_hd_pending_bank, sizeof s_hd_pending_bank, "%s", bank);
+        }
+   /* not staged yet: the batch is skipped and the texture is asked again next frame; PVR is not used (it would stay cached and the override would never show) */
+        if (st == CPA_HD_STAGE_READY) {
+#ifdef CPA_HD_FORCE_RGBA
+            /* test build: expand DXT to RGBA here, like FIX, so no compressed upload happens */
+            if (hd_tex.format != CPA_HD_TEX_FMT_RGBA8888) {
+                size_t npx = (size_t)hd_tex.width * hd_tex.height;
+                uint32_t *px = (uint32_t *)malloc(npx * 4);
+                if (px && cpa_dxt_decompress(hd_tex.data, hd_tex.width, hd_tex.height, hd_tex.format, px) == 0) {
+                    free(hd_tex.data);
+                    hd_tex.data = px;
+                    hd_tex.format = CPA_HD_TEX_FMT_RGBA8888;
+                    hd_tex.data_size = (uint32_t)(npx * 4);
+                    hd_tex.mip_count = 1;
+                    is_fix = true; /* full GL mip chain, as FIX gets */
+                } else {
+                    free(px);
+                    free(hd_tex.data);
+                    return NULL;
+                }
+            }
+#endif
             *pw = (int)hd_tex.width;
             *ph = (int)hd_tex.height;
-            if (plevels) *plevels = hd_tex.mip_count;
-            *pfmt = (hd_tex.format == CPA_HD_TEX_FMT_DXT1) ? 254 : (hd_tex.format == CPA_HD_TEX_FMT_DXT5) ? 253 : 255;
+            if (hd_tex.format == CPA_HD_TEX_FMT_RGBA8888) {
+                /* RGBA8888 (FIX always; PNG/raw overrides): FIX gets a GL mip chain for smooth anti-aliased fonts */
+                if (plevels) *plevels = (tcw >> 31) ? hd_full_levels(hd_tex.width, hd_tex.height) : 1;   /* the override is 2x the original: its own chain, not the PVR's */
+                *pfmt = 255;
+            } else {
+                /* DXT1 / DXT5 with the baked mip chain, uploaded compressed */
+                if (plevels) *plevels = hd_tex.mip_count;
+                *pfmt = (hd_tex.format == CPA_HD_TEX_FMT_DXT1) ? 254 : 253;
+            }
             return hd_tex.data;
         }
     }
@@ -318,6 +376,9 @@ static inline uint32_t tex_hash(uint32_t tcw, uint32_t tsp)
 static int entry_valid(GTexEntry *e)
 {
     if (R2_TEX_AGE && (int)s_gframe_no - e->dec_frame > R2_TEX_AGE) return 0;   /* DEBUG experiment */
+    if (e->hd_pending) {   /* original texture on screen: the override takes over once it is ready (a cheap check, no decode) */
+        if (cpa_hd_stage_poll(e->hd_bank, e->hd_va, -1) != CPA_HD_STAGE_PENDING) return 0;
+    }
     if (e->chk_frame == (int)s_gframe_no) return 1;
     if (!hle_texstamp_valid(&e->stamp, e->tcw, e->tsp)) return 0;
     e->chk_frame = (int)s_gframe_no;
@@ -343,8 +404,8 @@ static int guest_texture_slot(RenderJob *j, uint32_t tcw, uint32_t tsp_full)
             if (!entry_valid(e)) {
                 s_tex_redecodes++;
                 int w, hh; uint8_t fmt, hd_levels = 0; void *px = decode_texture(tcw, tsp, &w, &hh, &fmt, &hd_levels);
-                if (!px) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = op->fmt = 0; memset(e, 0, sizeof *e); return -1; }
-                hle_texstamp_set(&e->stamp, tcw, tsp); e->dec_frame = (int)s_gframe_no; e->chk_frame = (int)s_gframe_no;
+                if (!px) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = op->fmt = 0; memset(e, 0, sizeof *e); return s_hd_pending ? -2 : -1; }
+                hle_texstamp_set(&e->stamp, tcw, tsp); mark_hd_pending(e); e->dec_frame = (int)s_gframe_no; e->chk_frame = (int)s_gframe_no;
                 TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 0; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh;
                 op->levels = (hd_levels > 1) ? hd_levels : (uint8_t)ta_tex_levels(tcw, tsp);
                 op->fmt = fmt;
@@ -361,12 +422,31 @@ static int guest_texture_slot(RenderJob *j, uint32_t tcw, uint32_t tsp_full)
     memset(slot, 0, sizeof *slot);
     slot->tcw = tcw; slot->tsp = tsp;
     int w, hh; uint8_t fmt, hd_levels = 0; void *px = decode_texture(tcw, tsp, &w, &hh, &fmt, &hd_levels);
-    if (!px) { memset(slot, 0, sizeof *slot); if (reset) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = op->fmt = 0; } return -1; }
-    hle_texstamp_set(&slot->stamp, tcw, tsp); slot->dec_frame = (int)s_gframe_no; slot->chk_frame = (int)s_gframe_no; slot->used = 1;
+    if (!px) { memset(slot, 0, sizeof *slot); if (reset) { TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = 1; op->pix = NULL; op->w = op->h = op->levels = op->fmt = 0; } return s_hd_pending ? -2 : -1; }
+    hle_texstamp_set(&slot->stamp, tcw, tsp); mark_hd_pending(slot); slot->dec_frame = (int)s_gframe_no; slot->chk_frame = (int)s_gframe_no; slot->used = 1;
     TexOp *op = job_op(j); op->slot = (uint16_t)sl; op->reset = (uint8_t)reset; op->pix = px; op->w = (uint16_t)w; op->h = (uint16_t)hh;
     op->levels = (hd_levels > 1) ? hd_levels : (uint8_t)ta_tex_levels(tcw, tsp);
     op->fmt = fmt;
     return sl;
+}
+
+/* Frees a copied DXT chain. R2_HD_GPU_MEM_NOFREE (test build) keeps it alive to isolate the free. */
+#ifdef R2_HD_GPU_MEM_NOFREE
+#define HD_GPU_FREE(p) ((void)(p))
+#else
+#define HD_GPU_FREE(p) vgl_free(p)
+#endif
+
+/* Bytes of a block-compressed mip chain of `levels` levels, as the DXT upload branches walk it. */
+static size_t dxt_chain_bytes(uint32_t w, uint32_t h, int levels, uint32_t block)
+{
+    size_t total = 0;
+    for (int lvl = 0; lvl < levels; lvl++) {
+        uint32_t cw = (w >> lvl) > 0 ? (w >> lvl) : 1;
+        uint32_t ch = (h >> lvl) > 0 ? (h >> lvl) : 1;
+        total += (size_t)((cw + 3) / 4) * ((ch + 3) / 4) * block;
+    }
+    return total;
 }
 
 /* RENDER: execute the texture ops of a job (GL object create / delete / upload) */
@@ -374,7 +454,7 @@ static void render_exec_ops(RenderJob *j)
 {
     for (uint32_t i = 0; i < j->nops; i++) {
         TexOp *op = &j->ops[i]; RTexEntry *e = &s_rtex[op->slot];
-        if (op->reset && e->tex_id) { glDeleteTextures(1, &e->tex_id); s_cur_tex = (GLuint)-1; memset(e, 0, sizeof *e); }
+        if (op->reset && e->tex_id) { glDeleteTextures(1, &e->tex_id); s_cur_tex = (GLuint)-1; if (e->gpu_mem) HD_GPU_FREE(e->gpu_mem); memset(e, 0, sizeof *e); }
         if (!op->pix) continue;
 #if R2_PERF
         uint64_t t0 = r2_now_us();
@@ -385,7 +465,14 @@ static void render_exec_ops(RenderJob *j)
             if (op->fmt == 253) {
                 /* Hardware-compressed DXT5 (UBC3) - multi-level upload with safe vgl_realloc */
                 GLsizei block_bytes = 16;
-                const uint8_t *ptr = (const uint8_t *)op->pix;
+                /* copy the chain into GPU-mapped memory the entry keeps; the payload itself is freed below */
+                size_t chain_sz = dxt_chain_bytes(op->w, op->h, op->levels, 16);
+                uint8_t *gm = (uint8_t *)gpu_alloc_mapped_aligned_for_gpu(64, (uint32_t)chain_sz);
+                if (gm) memcpy(gm, op->pix, chain_sz);
+                const uint8_t *base = gm ? gm : (const uint8_t *)op->pix;
+                void *old_gm = e->gpu_mem;
+                if (gm) e->gpu_mem = gm;
+                const uint8_t *ptr = base;
                 uint32_t total_sz = 0;
                 uint8_t upload_levels = 0;
                 for (uint8_t lvl = 0; lvl < op->levels; lvl++) {
@@ -401,10 +488,11 @@ static void render_exec_ops(RenderJob *j)
                 }
                 if (upload_levels == 0) {
                     GLsizei lvl_sz = ((op->w + 3) / 4) * ((op->h + 3) / 4) * block_bytes;
-                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, op->w, op->h, 0, lvl_sz, op->pix);
+                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, op->w, op->h, 0, lvl_sz, base);
                     upload_levels = 1;
                     total_sz = (uint32_t)lvl_sz;
                 }
+                if (old_gm) HD_GPU_FREE(old_gm);   /* the previous chain is no longer referenced by this texture */
                 vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += total_sz;
                 e->levels = upload_levels;
 #if R2_PERF
@@ -421,7 +509,14 @@ static void render_exec_ops(RenderJob *j)
             } else if (op->fmt == 254) {
                 /* Hardware-compressed DXT1 (UBC1) - multi-level upload with safe vgl_realloc */
                 GLsizei block_bytes = 8;
-                const uint8_t *ptr = (const uint8_t *)op->pix;
+                /* copy the chain into GPU-mapped memory the entry keeps; the payload itself is freed below */
+                size_t chain_sz = dxt_chain_bytes(op->w, op->h, op->levels, 8);
+                uint8_t *gm = (uint8_t *)gpu_alloc_mapped_aligned_for_gpu(64, (uint32_t)chain_sz);
+                if (gm) memcpy(gm, op->pix, chain_sz);
+                const uint8_t *base = gm ? gm : (const uint8_t *)op->pix;
+                void *old_gm = e->gpu_mem;
+                if (gm) e->gpu_mem = gm;
+                const uint8_t *ptr = base;
                 uint32_t total_sz = 0;
                 uint8_t upload_levels = 0;
                 for (uint8_t lvl = 0; lvl < op->levels; lvl++) {
@@ -437,10 +532,11 @@ static void render_exec_ops(RenderJob *j)
                 }
                 if (upload_levels == 0) {
                     GLsizei lvl_sz = ((op->w + 3) / 4) * ((op->h + 3) / 4) * block_bytes;
-                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, op->w, op->h, 0, lvl_sz, op->pix);
+                    glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, op->w, op->h, 0, lvl_sz, base);
                     upload_levels = 1;
                     total_sz = (uint32_t)lvl_sz;
                 }
+                if (old_gm) HD_GPU_FREE(old_gm);   /* the previous chain is no longer referenced by this texture */
                 vita_gl_perf.tex_uploads++; pf.tex_up++; pf.tex_bytes += total_sz;
                 e->levels = upload_levels;
 #if R2_PERF
@@ -500,6 +596,7 @@ static GLuint render_texture(const RenderJob *j, const uint16_t *tab, uint32_t t
         if (!v) return 0;
         const TexRef *r = &j->refs[v - 1];
         if (r->tcw == tcw && r->tsp == tsp) {
+            if (r->slot == -2) return TEX_PENDING_ID;   /* override still staging: draw nothing for this batch */
             if (r->slot < 0) return 0;
             RTexEntry *e = &s_rtex[r->slot];
             if (!e->tex_id) return 0;
@@ -514,6 +611,7 @@ void vita_gl_texture_cache_clear(void)
 {
     for (uint32_t i = 0; i < TEX_CACHE_SIZE; i++) {
         if (s_rtex[i].tex_id) glDeleteTextures(1, &s_rtex[i].tex_id);
+        if (s_rtex[i].gpu_mem) HD_GPU_FREE(s_rtex[i].gpu_mem);
         memset(&s_rtex[i], 0, sizeof s_rtex[i]); memset(&s_gtex[i], 0, sizeof s_gtex[i]);
     }
     s_cur_tex = (GLuint)-1;
@@ -1198,6 +1296,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
 
             GLuint tex_id = 0;
             if (st->textured) tex_id = render_texture(job, ref_tab, st->tcw, st->tsp);
+            if (tex_id == TEX_PENDING_ID) continue;
             if (tex_id) {
                 gc_tex2d(1);
                 bind_tex(tex_id);

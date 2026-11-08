@@ -100,6 +100,21 @@ RENDER_THREAD   ?= 1
 ifeq ($(RENDER_THREAD),0)
 V_DEFS          += -DR2_RENDER_THREAD=0
 endif
+# HD texture staging test switch: HD_STAGE_SYNC=1 disables the stager worker thread (loads run on the game thread)
+HD_STAGE_SYNC   ?= 0
+ifeq ($(HD_STAGE_SYNC),1)
+V_DEFS          += -DCPA_HD_STAGE_SYNC
+endif
+# HD texture test switch: HD_GPU_NOFREE=1 keeps the copied DXT chains alive (never freed)
+HD_GPU_NOFREE   ?= 0
+ifeq ($(HD_GPU_NOFREE),1)
+V_DEFS          += -DR2_HD_GPU_MEM_NOFREE
+endif
+# HD texture test switch: HD_FORCE_RGBA=1 expands DXT overrides to RGBA before upload (no compressed uploads)
+HD_FORCE_RGBA   ?= 0
+ifeq ($(HD_FORCE_RGBA),1)
+V_DEFS          += -DCPA_HD_FORCE_RGBA
+endif
 
 CFLAGS          := $(OPT) -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
                    -fno-strict-aliasing -ffunction-sections -fdata-sections \
@@ -201,7 +216,7 @@ COMMON_OBJS     := $(BUILD_DIR)/recomp_functab.o \
                    $(BUILD_DIR)/runtime.o \
                    $(BUILD_DIR)/hook_stubs.o
 
-COMMON_OBJS     += $(BUILD_DIR)/variant.o $(BUILD_DIR)/cpa_hd_tex.o $(BUILD_DIR)/cpa_hd_manifest.o
+COMMON_OBJS     += $(BUILD_DIR)/variant.o $(BUILD_DIR)/cpa_hd_tex.o $(BUILD_DIR)/cpa_hd_manifest.o $(BUILD_DIR)/cpa_hd_pak.o $(BUILD_DIR)/cpa_hd_stage.o
 ALL_OBJS        := $(RECOMP_OBJS) $(COMMON_OBJS) $(HLE_OBJS) $(EXTRA_OBJS)
 
 ELF             := $(BUILD_DIR)/$(TARGET).elf
@@ -244,6 +259,10 @@ $(BUILD_DIR)/variant.o: $(BUILD_DIR)/variant.c
 $(BUILD_DIR)/cpa_hd_tex.o: $(CPA_DIR)/cpa_hd_tex.c $(wildcard $(CPA_DIR)/*.h) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(BUILD_DIR)/cpa_hd_manifest.o: $(CPA_DIR)/cpa_hd_manifest.c $(wildcard $(CPA_DIR)/*.h) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/cpa_hd_pak.o: $(CPA_DIR)/cpa_hd_pak.c $(wildcard $(CPA_DIR)/*.h) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/cpa_hd_stage.o: $(CPA_DIR)/cpa_hd_stage.c $(wildcard $(CPA_DIR)/*.h) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(HOT_ORDER): $(HOT_LIST) $(HLE_DIR)/hotorder.py | $(BUILD_DIR)
 	$(CC) -x c /dev/null -Wl,--verbose -nostartfiles -nostdlib -o /dev/null 2>/dev/null | sed -n '/^======/,/^======/p' | sed '1d;$$d' | python3 $(HLE_DIR)/hotorder.py $(HOT_LIST) > $@

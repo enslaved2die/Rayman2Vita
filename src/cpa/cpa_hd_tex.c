@@ -7,6 +7,7 @@
 
 #include "cpa_hd_tex.h"
 #include "cpa_hd_manifest.h"
+#include "cpa_hd_pak.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -514,6 +515,70 @@ int cpa_dxt_decompress(const void *dxt_data, uint32_t w, uint32_t h, CpaHdTexFor
     return 0;
 }
 
+/* Reads a little-endian u32 at p (the target is little-endian; see the R2TX/DDS magics). */
+static uint32_t le32_at(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+bool cpa_dds_load_mem(const uint8_t *buf, size_t sz, CpaHdTexture *out_tex) {
+    if (!buf || !out_tex || sz <= 128) return false;
+    if (le32_at(buf) != CPA_HD_TEX_MAGIC_DDS) return false;
+
+    uint32_t height = le32_at(buf + 12);
+    uint32_t width = le32_at(buf + 16);
+    uint32_t mips = le32_at(buf + 28);
+    uint32_t fourcc = le32_at(buf + 84);
+
+    CpaHdTexFormat fmt;
+    size_t block_bytes;
+    if (fourcc == 0x31545844u /* "DXT1" */) {
+        fmt = CPA_HD_TEX_FMT_DXT1;
+        block_bytes = 8;
+    } else if (fourcc == 0x35545844u /* "DXT5" */) {
+        fmt = CPA_HD_TEX_FMT_DXT5;
+        block_bytes = 16;
+    } else {
+        return false;
+    }
+    if (!width || !height || width > 4096 || height > 4096) return false;
+
+    size_t l0_size = (size_t)((width + 3) / 4) * ((height + 3) / 4) * block_bytes;
+    size_t payload_sz = sz - 128;
+    if (payload_sz < l0_size) return false;
+
+    uint8_t *data = (uint8_t *)malloc(payload_sz);
+    if (!data) return false;
+    memcpy(data, buf + 128, payload_sz);
+
+    out_tex->data = data;
+    out_tex->width = width;
+    out_tex->height = height;
+    out_tex->data_size = (uint32_t)payload_sz;
+    out_tex->format = fmt;
+    out_tex->mip_count = (uint8_t)(mips ? mips : 1);
+    return true;
+}
+
+uint32_t *cpa_hd_tex_load_raw_mem(const uint8_t *buf, size_t sz, uint32_t *out_w, uint32_t *out_h) {
+    if (!buf || sz < 16) return NULL;
+    if (le32_at(buf) != CPA_HD_TEX_MAGIC_RAW) return NULL;
+    uint32_t w = le32_at(buf + 4);
+    uint32_t h = le32_at(buf + 8);
+    if (!w || !h || w > 4096 || h > 4096) return NULL;
+
+    size_t px_bytes = (size_t)w * h * 4;
+    if (sz - 16 < px_bytes) return NULL;
+    uint32_t *rgba = (uint32_t *)malloc(px_bytes);
+    if (!rgba) return NULL;
+    memcpy(rgba, buf + 16, px_bytes);
+
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return rgba;
+}
+
 bool cpa_dds_load_file(const char *path, CpaHdTexture *out_tex) {
     if (!path || !out_tex) return false;
     FILE *f = fopen(path, "rb");
@@ -610,12 +675,27 @@ uint32_t *cpa_hd_tex_load_raw_file(const char *path, uint32_t *out_w, uint32_t *
  * 3. Bank Mapping & Texture Replacement Lookup
  * ============================================================================ */
 
+/* Probing fallback: 1 keeps the filesystem probing of the pre-Phase-1 loader for banks that
+ * have no precomputed <BANK>.hdtab (HD_Texture_Plan.md, Phase 1). Host builds default to 1;
+ * Vita builds default to 0 so the game thread never probes. Override with -DCPA_HD_TEX_PROBE_FALLBACK=0|1. */
+#ifndef CPA_HD_TEX_PROBE_FALLBACK
+#if defined(CPA_PLATFORM_VITA) || defined(__vita__)
+#define CPA_HD_TEX_PROBE_FALLBACK 0
+#else
+#define CPA_HD_TEX_PROBE_FALLBACK 1
+#endif
+#endif
+
 typedef struct {
     uint32_t va;
     uint32_t chunk_idx;
     char name[128];
     int8_t has_override; /* 0 unchecked, 1 found, -1 not found */
     char resolved_path[256];
+    uint8_t fmt;         /* CpaHdTexFormat from the table: 0 RGBA8888, 1 DXT1, 5 DXT5 */
+    uint8_t mips;        /* mip levels from the table (1 = base level only) */
+    uint16_t w, h;       /* override dimensions from the table */
+    uint32_t row;        /* data-row index in <BANK>.hdtab; also the row index in <BANK>.hdpak */
 } HdTexMapping;
 
 typedef struct {
@@ -624,9 +704,13 @@ typedef struct {
     uint32_t count;
     uint32_t capacity;
     bool loaded;
+    bool from_table;     /* entries came from <BANK>.hdtab, which is then authoritative */
+    bool has_pak;        /* <BANK>.hdpak matched the table and is open in pak */
+    uint32_t table_rows; /* number of data rows in <BANK>.hdtab */
+    CpaHdPak pak;
 } HdBankInfo;
 
-#define MAX_HD_BANKS 32
+#define MAX_HD_BANKS 128 /* the game has ~82 texture banks; the cap was 32 and overflowed onto bank 0 */
 static HdBankInfo s_banks[MAX_HD_BANKS];
 static uint32_t s_num_banks = 0;
 static char s_current_level[32] = "LEARN_10";
@@ -711,7 +795,11 @@ static HdBankInfo *get_or_create_bank(const char *bank) {
     for (uint32_t i = 0; i < s_num_banks; i++) {
         if (strcasecmp(s_banks[i].bank, bank) == 0) return &s_banks[i];
     }
-    if (s_num_banks >= MAX_HD_BANKS) return &s_banks[0];
+    if (s_num_banks >= MAX_HD_BANKS) {
+        /* Never alias another bank's entries: a miss simply has no override. */
+        OS_LOG("[cpa_hd_tex] bank table full (%d); no overrides for %s\n", (int)MAX_HD_BANKS, bank);
+        return NULL;
+    }
 
     HdBankInfo *b = &s_banks[s_num_banks++];
     memset(b, 0, sizeof(*b));
@@ -719,18 +807,22 @@ static HdBankInfo *get_or_create_bank(const char *bank) {
     return b;
 }
 
-static void bank_add_entry(HdBankInfo *b, uint32_t va, uint32_t idx, const char *name) {
+static HdTexMapping *bank_add_entry(HdBankInfo *b, uint32_t va, uint32_t idx, const char *name) {
     if (b->count >= b->capacity) {
-        b->capacity = b->capacity ? b->capacity * 2 : 64;
-        b->entries = (HdTexMapping *)realloc(b->entries, b->capacity * sizeof(HdTexMapping));
-        if (!b->entries) return;
+        uint32_t cap = b->capacity ? b->capacity * 2 : 64;
+        HdTexMapping *grown = (HdTexMapping *)realloc(b->entries, cap * sizeof(HdTexMapping));
+        if (!grown) return NULL;
+        b->entries = grown;
+        b->capacity = cap;
     }
     HdTexMapping *e = &b->entries[b->count++];
+    memset(e, 0, sizeof(*e));
     e->va = va;
     e->chunk_idx = idx;
     snprintf(e->name, sizeof(e->name), "%s", name ? name : "");
     e->has_override = 0;
     e->resolved_path[0] = '\0';
+    return e;
 }
 
 static uint8_t *read_entire_file(const char *path, size_t *out_sz) {
@@ -749,6 +841,7 @@ static uint8_t *read_entire_file(const char *path, size_t *out_sz) {
     return buf;
 }
 
+#if CPA_HD_TEX_PROBE_FALLBACK
 static int parse_bank_log(HdBankInfo *b, const char *log_path) {
     size_t sz = 0;
     uint8_t *data = read_entire_file(log_path, &sz);
@@ -818,6 +911,83 @@ static int parse_bank_log(HdBankInfo *b, const char *log_path) {
     b->loaded = (b->count > 0);
     return b->loaded;
 }
+#endif /* CPA_HD_TEX_PROBE_FALLBACK */
+
+/* Loads <root>/<BANK>.hdtab from the first search root that has one (HD_Texture_Plan.md, Phase 1).
+ * Rows are "va chunk fmt w h mips relpath", tab-separated; relpath '-' marks a key without override.
+ * A bank loaded this way never probes the filesystem per texture. */
+static bool load_bank_table(HdBankInfo *b) {
+    char path[1024];
+    for (uint32_t r = 0; r < s_num_search_roots; r++) {
+        snprintf(path, sizeof(path), "%.511s/%.31s.hdtab", s_search_roots[r], b->bank);
+        size_t sz = 0;
+        uint8_t *data = read_entire_file(path, &sz);
+        if (!data) continue;
+
+        uint32_t n_over = 0, n_bad = 0, n_rows = 0;
+        char *line = (char *)data;
+        while (line && *line) {
+            char *eol = strchr(line, '\n');
+            if (eol) *eol++ = '\0';
+            size_t len = strlen(line);
+            if (len && line[len - 1] == '\r') line[--len] = '\0';
+            if (line[0] == '\0' || line[0] == '#') { line = eol; continue; }
+            uint32_t row = n_rows++;
+
+            char *fld[7];
+            int nf = 0;
+            char *p = line;
+            while (nf < 7) {
+                fld[nf++] = p;
+                char *tab = strchr(p, '\t');
+                if (!tab) break;
+                *tab = '\0';
+                p = tab + 1;
+            }
+            HdTexMapping *e = (nf == 7) ? bank_add_entry(b, (uint32_t)strtoul(fld[0], NULL, 16),
+                                                         (uint32_t)strtoul(fld[1], NULL, 10), "")
+                                        : NULL;
+            if (!e) { n_bad++; line = eol; continue; }
+            e->row = row;
+
+            if (fld[6][0] == '-' && fld[6][1] == '\0') {
+                e->has_override = -1;
+            } else {
+                int n = snprintf(e->resolved_path, sizeof(e->resolved_path), "%s/%s", s_search_roots[r], fld[6]);
+                if (n <= 0 || (size_t)n >= sizeof(e->resolved_path)) {
+                    e->resolved_path[0] = '\0';
+                    e->has_override = -1;
+                    n_bad++;
+                } else {
+                    e->has_override = 1;
+                    e->fmt = (uint8_t)strtoul(fld[2], NULL, 10);
+                    e->w = (uint16_t)strtoul(fld[3], NULL, 10);
+                    e->h = (uint16_t)strtoul(fld[4], NULL, 10);
+                    e->mips = (uint8_t)strtoul(fld[5], NULL, 10);
+                    n_over++;
+                }
+            }
+            line = eol;
+        }
+        free(data);
+
+        /* Optional archive (Phase 5): the shared pool plus this bank's index. Used only if both match this table. */
+        char pool_path[1024], pak_path[1024];
+        snprintf(pool_path, sizeof(pool_path), "%.511s/HD.hdpool", s_search_roots[r]);
+        snprintf(pak_path, sizeof(pak_path), "%.511s/%.31s.hdpak", s_search_roots[r], b->bank);
+        if (cpa_hd_pool_open(pool_path) && cpa_hd_pak_open(&b->pak, pak_path, n_rows)) {
+            b->has_pak = true;
+        }
+
+        b->from_table = true;
+        b->table_rows = n_rows;
+        b->loaded = true;
+        OS_LOG("[cpa_hd_tex] bank %s: %u keys from %s (%u overrides, %u rejected, archive %s)\n",
+               b->bank, b->count, path, n_over, n_bad, b->has_pak ? "yes" : "no");
+        return true;
+    }
+    return false;
+}
 
 static void ensure_bank_loaded(HdBankInfo *b) {
     if (b->loaded) return;
@@ -826,6 +996,9 @@ static void ensure_bank_loaded(HdBankInfo *b) {
         return;
     }
 
+    if (load_bank_table(b)) return;
+
+#if CPA_HD_TEX_PROBE_FALLBACK
     /* Build candidate log paths for this bank */
     bool is_fix = (strcasecmp(b->bank, "FIX") == 0);
     char path[1024];
@@ -914,12 +1087,18 @@ static void ensure_bank_loaded(HdBankInfo *b) {
             }
         }
     }
+#else
+    /* No .hdtab for this bank and probing is compiled out: HD overrides are off for it. */
+    OS_LOG("[cpa_hd_tex] no %s.hdtab in any search root; HD overrides off for bank %s\n", b->bank, b->bank);
+    b->loaded = true;
+#endif
 }
 
 bool cpa_hd_tex_is_fix_va(uint32_t struct_va) {
     if (!struct_va || !cpa_hd_tex_is_enabled()) return false;
     if (cpa_hd_manifest_is_fix_va(struct_va)) return true;
     HdBankInfo *fix = get_or_create_bank("FIX");
+    if (!fix) return false;
     ensure_bank_loaded(fix);
     for (uint32_t i = 0; i < fix->count; i++) {
         if (fix->entries[i].va == struct_va) return true;
@@ -959,6 +1138,42 @@ static bool try_load_replacement_ex(const char *file_path, CpaHdTexture *out_tex
     return true;
 }
 
+/* Decodes one row's payload from the bank archive (Phase 5). false = caller falls back to the loose file. */
+static bool load_from_pak(HdBankInfo *b, uint32_t row, CpaHdTexture *out_tex) {
+    size_t sz = 0;
+    uint32_t kind = 0;
+    uint8_t *buf = cpa_hd_pak_read_row(&b->pak, row, &sz, &kind);
+    if (!buf) return false;
+
+    bool ok = false;
+    uint32_t w = 0, h = 0;
+    uint32_t *px = NULL;
+    switch (kind) {
+    case CPA_HD_PAK_KIND_DDS:
+        ok = cpa_dds_load_mem(buf, sz, out_tex);
+        break;
+    case CPA_HD_PAK_KIND_RAW:
+        px = cpa_hd_tex_load_raw_mem(buf, sz, &w, &h);
+        break;
+    case CPA_HD_PAK_KIND_PNG:
+        px = cpa_png_load_mem(buf, sz, &w, &h);
+        break;
+    default:
+        break;
+    }
+    if (px) {
+        out_tex->data = px;
+        out_tex->width = w;
+        out_tex->height = h;
+        out_tex->data_size = w * h * 4;
+        out_tex->format = CPA_HD_TEX_FMT_RGBA8888;
+        out_tex->mip_count = 1;
+        ok = true;
+    }
+    free(buf);
+    return ok;
+}
+
 bool cpa_hd_tex_load_ex(const char *bank, uint32_t struct_va, int chunk_idx,
                         const char *hint_name, CpaHdTexture *out_tex) {
     if (!out_tex) return false;
@@ -980,6 +1195,7 @@ bool cpa_hd_tex_load_ex(const char *bank, uint32_t struct_va, int chunk_idx,
     }
 
     HdBankInfo *b = get_or_create_bank(bank);
+    if (!b) return false;
     ensure_bank_loaded(b);
 
     const char *name = NULL;
@@ -1028,10 +1244,26 @@ bool cpa_hd_tex_load_ex(const char *bank, uint32_t struct_va, int chunk_idx,
             return false;
         }
         if (mapped_entry->has_override > 0 && mapped_entry->resolved_path[0]) {
+            if (b->has_pak && load_from_pak(b, mapped_entry->row, out_tex)) return true;
             return try_load_replacement_ex(mapped_entry->resolved_path, out_tex);
         }
     }
 
+    if (b->from_table) {
+        /* Table-backed bank: the .hdtab is authoritative. A key it does not list is a miss,
+         * cached as negative so it is never looked up again (HD_Texture_Plan.md, 1.3). */
+        if (!mapped_entry) {
+            HdTexMapping *neg = bank_add_entry(b, struct_va, (chunk_idx >= 0) ? (uint32_t)chunk_idx : 0, "");
+            if (neg) neg->has_override = -1;
+        }
+        return false;
+    }
+
+#if !CPA_HD_TEX_PROBE_FALLBACK
+    /* No table for this bank and probing is compiled out. */
+    (void)name;
+    return false;
+#else
     /* If !mapped_entry:
      * - Resolve name using hint_name or cpa_hd_manifest_lookup(bank, struct_va, chunk_idx).
      * - Dynamically insert a cache entry:
@@ -1164,6 +1396,7 @@ bool cpa_hd_tex_load_ex(const char *bank, uint32_t struct_va, int chunk_idx,
         mapped_entry->has_override = -1;
     }
     return false;
+#endif
 }
 
 uint32_t *cpa_hd_tex_load(const char *bank, uint32_t struct_va, int chunk_idx,
@@ -1198,6 +1431,28 @@ uint32_t *cpa_hd_tex_load(const char *bank, uint32_t struct_va, int chunk_idx,
     return rgba;
 }
 
+uint32_t cpa_hd_tex_bank_row_count(const char *bank) {
+    if (!cpa_hd_tex_is_enabled() || s_num_search_roots == 0) return 0;
+    HdBankInfo *b = get_or_create_bank(bank);
+    if (!b) return 0;
+    ensure_bank_loaded(b);
+    return b->from_table ? b->table_rows : 0;
+}
+
+bool cpa_hd_tex_bank_row(const char *bank, uint32_t row, uint32_t *out_va, int *out_chunk, bool *out_has_override) {
+    if (!cpa_hd_tex_is_enabled() || s_num_search_roots == 0) return false;
+    HdBankInfo *b = get_or_create_bank(bank);
+    if (!b) return false;
+    ensure_bank_loaded(b);
+    if (!b->from_table || row >= b->table_rows || row >= b->count) return false;
+    const HdTexMapping *e = &b->entries[row];
+    if (e->row != row) return false; /* malformed rows were skipped; indices no longer line up */
+    if (out_va) *out_va = e->va;
+    if (out_chunk) *out_chunk = (int)e->chunk_idx;
+    if (out_has_override) *out_has_override = (e->has_override > 0);
+    return true;
+}
+
 void cpa_hd_tex_shutdown(void) {
     for (uint32_t i = 0; i < s_num_banks; i++) {
         free(s_banks[i].entries);
@@ -1205,7 +1460,11 @@ void cpa_hd_tex_shutdown(void) {
         s_banks[i].count = 0;
         s_banks[i].capacity = 0;
         s_banks[i].loaded = false;
+        s_banks[i].from_table = false;
+        cpa_hd_pak_close(&s_banks[i].pak);
+        s_banks[i].has_pak = false;
     }
+    cpa_hd_pool_close();
     s_num_banks = 0;
     s_num_search_roots = 0;
     s_initialized = false;

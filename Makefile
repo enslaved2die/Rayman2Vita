@@ -63,7 +63,9 @@ SOURCES         := $(SRC_DIR)/main.c \
                    $(SRC_DIR)/platform/vita/snd_vita.c \
                    $(SRC_DIR)/platform/vita/save_vita.c \
                    $(SRC_DIR)/cpa/cpa_hd_tex.c \
-                   $(SRC_DIR)/cpa/cpa_hd_manifest.c
+                   $(SRC_DIR)/cpa/cpa_hd_manifest.c \
+                   $(SRC_DIR)/cpa/cpa_hd_pak.c \
+                   $(SRC_DIR)/cpa/cpa_hd_stage.c
 
 OBJECTS         := $(BUILD_DIR)/main.o \
                    $(BUILD_DIR)/cpa_engine.o \
@@ -77,7 +79,9 @@ OBJECTS         := $(BUILD_DIR)/main.o \
                    $(BUILD_DIR)/snd_vita.o \
                    $(BUILD_DIR)/save_vita.o \
                    $(BUILD_DIR)/cpa_hd_tex.o \
-                   $(BUILD_DIR)/cpa_hd_manifest.o
+                   $(BUILD_DIR)/cpa_hd_manifest.o \
+                   $(BUILD_DIR)/cpa_hd_pak.o \
+                   $(BUILD_DIR)/cpa_hd_stage.o
 
 ELF             := $(BUILD_DIR)/$(TARGET).elf
 VELF            := $(BUILD_DIR)/$(TARGET).velf
@@ -146,6 +150,12 @@ $(BUILD_DIR)/cpa_hd_tex.o: $(SRC_DIR)/cpa/cpa_hd_tex.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/cpa_hd_manifest.o: $(SRC_DIR)/cpa/cpa_hd_manifest.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cpa_hd_pak.o: $(SRC_DIR)/cpa/cpa_hd_pak.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cpa_hd_stage.o: $(SRC_DIR)/cpa/cpa_hd_stage.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(ELF): $(OBJECTS)

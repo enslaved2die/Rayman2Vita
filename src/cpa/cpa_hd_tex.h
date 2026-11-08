@@ -126,6 +126,17 @@ int cpa_dxt_decompress(const void *dxt_data, uint32_t w, uint32_t h, CpaHdTexFor
 bool cpa_dds_load_file(const char *path, CpaHdTexture *out_tex);
 
 /**
+ * @brief Parses a DDS image already in memory (same rules as cpa_dds_load_file).
+ *        Copies the payload into a new buffer; the caller frees out_tex->data.
+ */
+bool cpa_dds_load_mem(const uint8_t *buf, size_t sz, CpaHdTexture *out_tex);
+
+/**
+ * @brief Parses an R2TX raw image in memory. Returns newly allocated RGBA8888 pixels (caller frees).
+ */
+uint32_t *cpa_hd_tex_load_raw_mem(const uint8_t *buf, size_t sz, uint32_t *out_w, uint32_t *out_h);
+
+/**
  * @brief Master HD texture override query with direct hardware compressed texture support.
  * Checks on disk in priority order:
  *   1. .dds (Hardware-compressed DXT1 / DXT5 - zero CPU decompression overhead)
@@ -162,6 +173,18 @@ uint32_t *cpa_hd_tex_load(const char *bank, uint32_t struct_va, int chunk_idx,
  * @brief Frees all cached bank metadata, name maps, and negative lookup caches.
  */
 void cpa_hd_tex_shutdown(void);
+
+/**
+ * @brief Number of data rows in the bank's <BANK>.hdtab (0 if the bank has no table).
+ *        Loads the bank on first use: not thread-safe, call from the loader's owner thread only.
+ */
+uint32_t cpa_hd_tex_bank_row_count(const char *bank);
+
+/**
+ * @brief Describes table row `row` of a bank (same owner-thread rule as above).
+ * @return false if the row does not exist.
+ */
+bool cpa_hd_tex_bank_row(const char *bank, uint32_t row, uint32_t *out_va, int *out_chunk, bool *out_has_override);
 
 #ifdef __cplusplus
 }
