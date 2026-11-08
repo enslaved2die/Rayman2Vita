@@ -652,14 +652,15 @@ int bake_png_to_dds(const char *in_png_path, const char *out_dds_path,
     bool is_dxt5 = has_alpha;
     uint32_t four_cc = is_dxt5 ? DDS_FOURCC_DXT5 : DDS_FOURCC_DXT1;
 
-    /* Calculate mip levels */
+    /* Calculate mip levels down to 4x4 minimum */
     uint32_t mip_count = 1;
-    if (generate_mipmaps && (w > 16 || h > 16)) {
+    if (generate_mipmaps && (w > 4 || h > 4)) {
         uint32_t cur_w = w, cur_h = h;
-        while (cur_w > 1 || cur_h > 1) {
+        while (cur_w > 4 || cur_h > 4) {
             mip_count++;
             cur_w = (cur_w > 1) ? cur_w / 2 : 1;
             cur_h = (cur_h > 1) ? cur_h / 2 : 1;
+            if (cur_w <= 4 && cur_h <= 4) break;
         }
     }
 

@@ -119,7 +119,7 @@ endif
 # PROFILE=1: per-frame split of GL submit / swap / TA SQ parse time in the [vita] log line (costs two timer reads per TA write).
 ifeq ($(PROFILE),1)
 CFLAGS  += -DR2_VITA_PROFILE
-LDFLAGS += -Wl,--wrap,vita_gl_render_frame -Wl,--wrap,vita_gl_swap -Wl,--wrap,ta_ext_write32
+LDFLAGS += -Wl,--wrap,vita_gl_render_frame -Wl,--wrap,vita_gl_swap -Wl,--wrap,ta_ext_write32 -Wl,--wrap,sceClibMspaceRealloc
 endif
 
 LIBS            := -lvitaGL \

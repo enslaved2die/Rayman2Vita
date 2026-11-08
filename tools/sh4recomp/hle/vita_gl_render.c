@@ -45,6 +45,28 @@
 #if defined(__vita__)
 static inline uint32_t fp_get(void) { uint32_t v; __asm__ volatile("vmrs %0, fpscr" : "=r"(v)); return v & 0x03C00000u; }      /* RMode[23:22], FZ[24], DN[25] */
 static inline void fp_set(uint32_t m) { uint32_t v; __asm__ volatile("vmrs %0, fpscr" : "=r"(v)); v = (v & ~0x03C00000u) | m; __asm__ volatile("vmsr fpscr, %0" : : "r"(v)); }
+
+extern void *gpu_alloc_mapped_aligned_for_gpu(uint32_t alignment, uint32_t size);
+extern void vgl_free(void *ptr);
+extern size_t vgl_malloc_usable_size(void *ptr);
+extern void *__real_sceClibMspaceRealloc(void *mspace, void *ptr, size_t size);
+
+/* Safe wrapper around Sony sceClibMspaceRealloc:
+ * When VitaGL calls sceClibMspaceRealloc on pointers allocated with sceClibMspaceMemalign,
+ * dlmalloc chunk headers are corrupted, crashing _mspace_malloc.
+ * Our wrapper detects when realloc is called on an aligned chunk and performs safe re-allocation. */
+void *__wrap_sceClibMspaceRealloc(void *mspace, void *ptr, size_t size)
+{
+    if (!ptr) return gpu_alloc_mapped_aligned_for_gpu(16, (uint32_t)size);
+    if (!size) { vgl_free(ptr); return NULL; }
+    size_t old_sz = vgl_malloc_usable_size(ptr);
+    if (old_sz >= size) return ptr;
+    void *new_ptr = gpu_alloc_mapped_aligned_for_gpu(16, (uint32_t)size);
+    if (!new_ptr) return NULL;
+    memcpy(new_ptr, ptr, old_sz < size ? old_sz : size);
+    vgl_free(ptr);
+    return new_ptr;
+}
 #else
 #include <fenv.h>
 static inline uint32_t fp_get(void) { return (uint32_t)fegetround(); }
@@ -233,18 +255,24 @@ static void *decode_texture(uint32_t tcw, uint32_t tsp, int *pw, int *ph, uint8_
     }
     if (cpa_hd_tex_is_enabled()) {
         const char *bank = (t && t->struct_va && cpa_hd_tex_is_fix_va(t->struct_va)) ? "FIX" : (level_buf[0] ? level_buf : cpa_hd_tex_get_level());
+        bool is_fix = (strcmp(bank, "FIX") == 0);
+        if (is_fix) {
+            uint32_t hd_w = 0, hd_h = 0;
+            uint32_t *rgba = cpa_hd_tex_load(bank, t ? t->struct_va : 0, -1, NULL, &hd_w, &hd_h);
+            if (rgba) {
+                *pw = (int)hd_w;
+                *ph = (int)hd_h;
+                if (plevels) *plevels = 8;
+                *pfmt = 255; /* RGBA8888 with hardware glGenerateMipmap for smooth anti-aliased fonts */
+                return rgba;
+            }
+        }
         CpaHdTexture hd_tex;
         if (cpa_hd_tex_load_ex(bank, t ? t->struct_va : 0, -1, NULL, &hd_tex)) {
             *pw = (int)hd_tex.width;
             *ph = (int)hd_tex.height;
             if (plevels) *plevels = hd_tex.mip_count;
-            if (hd_tex.format == CPA_HD_TEX_FMT_DXT1) {
-                *pfmt = 254; /* Hardware UBC1 / DXT1 */
-            } else if (hd_tex.format == CPA_HD_TEX_FMT_DXT5) {
-                *pfmt = 253; /* Hardware UBC3 / DXT5 */
-            } else {
-                *pfmt = 255; /* 32-bit RGBA */
-            }
+            *pfmt = (hd_tex.format == CPA_HD_TEX_FMT_DXT1) ? 254 : (hd_tex.format == CPA_HD_TEX_FMT_DXT5) ? 253 : 255;
             return hd_tex.data;
         }
     }
@@ -355,7 +383,7 @@ static void render_exec_ops(RenderJob *j)
         if (e->tex_id) {
             bind_tex(e->tex_id);
             if (op->fmt == 253) {
-                /* Hardware-compressed DXT5 (UBC3) */
+                /* Hardware-compressed DXT5 (UBC3) - multi-level upload with safe vgl_realloc */
                 GLsizei block_bytes = 16;
                 const uint8_t *ptr = (const uint8_t *)op->pix;
                 uint32_t total_sz = 0;
@@ -364,7 +392,6 @@ static void render_exec_ops(RenderJob *j)
                     GLsizei cur_w = (op->w >> lvl) > 0 ? (op->w >> lvl) : 1;
                     GLsizei cur_h = (op->h >> lvl) > 0 ? (op->h >> lvl) : 1;
                     GLsizei lvl_sz = ((cur_w + 3) / 4) * ((cur_h + 3) / 4) * block_bytes;
-                    /* VitaGL hardware swizzler requires width >= 4 && height >= 4 to avoid 0-dimension DMA transfers */
                     if (cur_w >= 4 && cur_h >= 4) {
                         glCompressedTexImage2D(GL_TEXTURE_2D, lvl, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, cur_w, cur_h, 0, lvl_sz, ptr);
                         upload_levels = lvl + 1;
@@ -392,7 +419,7 @@ static void render_exec_ops(RenderJob *j)
                     }
                 }
             } else if (op->fmt == 254) {
-                /* Hardware-compressed DXT1 (UBC1) */
+                /* Hardware-compressed DXT1 (UBC1) - multi-level upload with safe vgl_realloc */
                 GLsizei block_bytes = 8;
                 const uint8_t *ptr = (const uint8_t *)op->pix;
                 uint32_t total_sz = 0;
@@ -401,7 +428,6 @@ static void render_exec_ops(RenderJob *j)
                     GLsizei cur_w = (op->w >> lvl) > 0 ? (op->w >> lvl) : 1;
                     GLsizei cur_h = (op->h >> lvl) > 0 ? (op->h >> lvl) : 1;
                     GLsizei lvl_sz = ((cur_w + 3) / 4) * ((cur_h + 3) / 4) * block_bytes;
-                    /* VitaGL hardware swizzler requires width >= 4 && height >= 4 to avoid 0-dimension DMA transfers */
                     if (cur_w >= 4 && cur_h >= 4) {
                         glCompressedTexImage2D(GL_TEXTURE_2D, lvl, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, cur_w, cur_h, 0, lvl_sz, ptr);
                         upload_levels = lvl + 1;

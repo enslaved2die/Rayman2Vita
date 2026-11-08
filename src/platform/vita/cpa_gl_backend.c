@@ -52,8 +52,8 @@ static void be_upload(void *user, const CpaTexDesc *t) {
      * Filter: bilinear, nearest mip level when a chain exists (GL_LINEAR_MIPMAP_NEAREST) = the PVR filter field value 1 (see WRAPCHK/FILTCHK in shadow_run for what the game uses). */
     if (real) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t->width, t->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, t->rgba);
     else glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, grey);   /* placeholder: the provider could not decode this VA */
-    if (mip) glGenerateMipmap(GL_TEXTURE_2D);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, mip ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     uint8_t wu = real ? t->wrapU : CPA_WRAP_REPEAT, wv = real ? t->wrapV : CPA_WRAP_REPEAT;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_enum(wu)); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_enum(wv));
     b->tex[s].va = t->texVa; b->tex[s].id = id; b->tex[s].wrapU = wu; b->tex[s].wrapV = wv; b->tex[s].mip = (uint8_t)mip; b->tex[s].placeholder = (uint8_t)!real; b->nTex++;
