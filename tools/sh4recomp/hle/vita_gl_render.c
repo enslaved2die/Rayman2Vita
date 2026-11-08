@@ -986,6 +986,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
     static int s_nofog = -1;                          /* A/B switch: empty file ux0:data/rayman2/NO_FOG (host: env R2_NO_FOG) skips every fog pass / pre-fog (visual change; for measuring their draw cost only) */
     if (s_nofog < 0) s_nofog = hle_switch("NO_FOG");
     const uint32_t fog_den = s_nofog ? 0u : PVR_REGJ(job, 0x005F80B8u), fog_ram = PVR_REGJ(job, 0x005F80B0u);
+    const float fog_den_scale = fog_den ? ta_fog_density_scale(fog_den) : 0.0f;
     const float fog_r = ((fog_ram >> 16) & 255) / 255.0f, fog_g = ((fog_ram >> 8) & 255) / 255.0f, fog_b = (fog_ram & 255) / 255.0f;
     vita_gl_perf.frames++; vita_gl_perf.batches += gl.nbatches; pf.batches = gl.nbatches;
     gc_reset();
@@ -1077,21 +1078,33 @@ static void vita_gl_render_frame_impl(RenderJob *job)
         }
         /* Translucent list: ISP_FEED_CFG bit0 = 0 -> the PVR sorts back-to-front (farthest = smallest 1/W first); translucent polygons never write depth
          * (otherwise a transparent texel of a near layer, e.g. foliage, would reject the sky behind it: that was the "periwinkle cut-outs" bug). */
-        static uint32_t s_ord[4096]; static float s_key[4096];
+        static uint32_t s_ord[4096]; static float s_key[4096]; static uint8_t s_hud[4096];
         const int dbg = R2_GL_DEBUG && (s_frame_no <= 12 || s_frame_no % 60 == 0) && list_id == TA_L_TRANS;
         uint32_t n_ord = n_b < 4096 ? n_b : 4096;
         const int sorted = list_id == TA_L_TRANS && trans_sorted;
         const float hud_z = cut * (0.995f / 0.98f);   /* same ceiling as ta_gl_make_clip */
-        if (sorted) {
+        const float hud_thresh = hud_z * 0.999f;
+        if (list_id == TA_L_TRANS) {
             for (uint32_t b = 0; b < n_ord; b++) {
                 const TaBatch *bt = &gl.batches[first_b + b];
+                const TaGlVertex *bv = &gl.verts[bt->first];
                 float sum_z = 0.0f;
-                for (uint32_t i = 0; i < bt->count; i++) sum_z += gl.verts[bt->first + i].z;
-                s_key[b] = bt->count ? (sum_z / (float)bt->count) : 0.0f;
-                if (s_key[b] > hud_z) s_key[b] = hud_z;   /* 2D/HUD layer (1/W clamped to the depth-cut ceiling in ta_gl_make_clip): all one depth -> keep submission order (stable sort), so dialog text stays above the letterbox bars */
-                s_ord[b] = b;
+                uint8_t is_hud = 1;
+                for (uint32_t i = 0; i < bt->count; i++) {
+                    float z = bv[i].z;
+                    sum_z += z;
+                    if (z < hud_thresh) is_hud = 0;
+                }
+                s_hud[b] = is_hud;
+                if (sorted) {
+                    s_key[b] = bt->count ? (sum_z / (float)bt->count) : 0.0f;
+                    if (s_key[b] > hud_z) s_key[b] = hud_z;   /* 2D/HUD layer (1/W clamped to the depth-cut ceiling in ta_gl_make_clip): all one depth -> keep submission order (stable sort), so dialog text stays above the letterbox bars */
+                    s_ord[b] = b;
+                }
             }
-            for (uint32_t i = 1; i < n_ord; i++) { uint32_t o = s_ord[i]; float k = s_key[o]; uint32_t j = i; while (j > 0 && s_key[s_ord[j - 1]] > k) { s_ord[j] = s_ord[j - 1]; j--; } s_ord[j] = o; }   /* stable insertion sort */
+            if (sorted) {
+                for (uint32_t i = 1; i < n_ord; i++) { uint32_t o = s_ord[i]; float k = s_key[o]; uint32_t j = i; while (j > 0 && s_key[s_ord[j - 1]] > k) { s_ord[j] = s_ord[j - 1]; j--; } s_ord[j] = o; }   /* stable insertion sort */
+            }
         }
         if (dbg) {
             uint32_t feed = PVR_REGJ(job, 0x005F8098u);
@@ -1105,11 +1118,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
             const TaState *st = &batch->st;
             if (s_only_tcw && list_id == TA_L_TRANS && st->tcw != s_only_tcw) continue;
 
-            int hud = 0;
-            if (list_id == TA_L_TRANS) {                /* HUD-layer translucent batch (every vertex at the clamped ceiling): coplanar with the bars, so a strict depth func would reject it; draw in order */
-                hud = 1;
-                for (uint32_t i = 0; i < batch->count; i++) if (gl.verts[batch->first + i].z < hud_z * 0.999f) { hud = 0; break; }
-            }
+            int hud = (list_id == TA_L_TRANS) ? s_hud[b] : 0;
 
             /* Batch coalescing: look ahead in sorted draw order. Contiguous batches in vertex buffer
              * that share the exact same render state can be drawn with a single glDrawArrays call. */
@@ -1131,11 +1140,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
                 if (nst->shading != st->shading || nst->fog_ctrl != st->fog_ctrl) break;
                 if (nst->pixel_format != st->pixel_format || nst->textured != st->textured || nst->shadow != st->shadow) break;
 
-                if (list_id == TA_L_TRANS) {
-                    int next_hud = 1;
-                    for (uint32_t i = 0; i < next_bt->count; i++) if (gl.verts[next_bt->first + i].z < hud_z * 0.999f) { next_hud = 0; break; }
-                    if (next_hud != hud) break;
-                }
+                if (list_id == TA_L_TRANS && s_hud[next_b] != hud) break;
                 coalesce_cnt++;
             }
 
@@ -1214,7 +1219,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
                 float amax = 0.0f;
                 for (uint32_t i = 0; i < total_batch_count; i++) {
                     uint32_t vi = batch->first + i;
-                    float a = ta_fog_alpha(gl.verts[vi].z, fog_den, fog_table);
+                    float a = ta_fog_alpha_scaled(gl.verts[vi].z, fog_den_scale, fog_table);
                     s_fc[vi][3] = s_cv[vi].a;
                     if (additive) { s_fc[vi][0] = s_cv[vi].r * (1.0f - a); s_fc[vi][1] = s_cv[vi].g * (1.0f - a); s_fc[vi][2] = s_cv[vi].b * (1.0f - a); }
                     else { s_fc[vi][0] = s_cv[vi].r + (fog_r - s_cv[vi].r) * a; s_fc[vi][1] = s_cv[vi].g + (fog_g - s_cv[vi].g) * a; s_fc[vi][2] = s_cv[vi].b + (fog_b - s_cv[vi].b) * a; }
@@ -1260,7 +1265,7 @@ static void vita_gl_render_frame_impl(RenderJob *job)
                 const int opq = (list_id == TA_L_OPAQUE);                           /* non-opaque: a = vertex alpha * fog; opaque: a = fog */
                 for (uint32_t i = 0; i < total_batch_count; i++) {
                     uint32_t vi = batch->first + i;
-                    float a = ta_fog_alpha(gl.verts[vi].z, fog_den, fog_table);
+                    float a = ta_fog_alpha_scaled(gl.verts[vi].z, fog_den_scale, fog_table);
                     s_fc[vi][0] = fog_r; s_fc[vi][1] = fog_g; s_fc[vi][2] = fog_b;
                     s_fc[vi][3] = opq ? a : s_cv[vi].a * a;
                     if (a > amax) amax = a;
@@ -1397,7 +1402,7 @@ static void gl_warmup(void)
     glVertexPointer(3, GL_FLOAT, sizeof(TaClipVertex), &v[0].px); glTexCoordPointer(2, GL_FLOAT, sizeof(TaClipVertex), &v[0].u);
     gc_reset(); gc_color_ptr(&v[0].r, CV_STRIDE);
     glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_COLOR_ARRAY); glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    static const GLint envs[3] = { GL_REPLACE, GL_MODULATE, GL_DECAL };
+    static const GLint envs[4] = { GL_REPLACE, GL_MODULATE, GL_DECAL, GL_BLEND };
     unsigned draws = 0;
 #define WARM_DRAW(texmode)  do { if ((texmode) < 0) gc_tex2d(0); else { gc_tex2d(1); gc_texenv(envs[texmode]); } glDrawArrays(GL_TRIANGLES, 0, 3); draws++; } while (0)
     if (wu & 1) for (int alpha = 0; alpha < 2; alpha++) {                       /* opaque (alpha 0) and punch-through (alpha test GEQUAL), blend off */
@@ -1414,6 +1419,12 @@ static void gl_warmup(void)
         WARM_DRAW(-1); WARM_DRAW(1);                                 /* untextured + MODULATE for every pair */
         if (p == 0 || p == 1 || p == 3) { WARM_DRAW(0); WARM_DRAW(2); }   /* the common ones also REPLACE / DECAL */
     }
+    /* textured table-fog pass: GL_BLEND texenv + SRC_ALPHA / ONE_MINUS_SRC_ALPHA, with and without 1-bit alpha test */
+    gc_blend_func(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    WARM_DRAW(3);
+    gc_alpha_test(1); gc_alpha_ref(1);
+    WARM_DRAW(3);
+    gc_alpha_test(0);
     }
     if (wu & 4) {
     gc_blend(0);                                                     /* shadow volumes: colour mask off, then the darkening quad (blend SRC_ALPHA/ONE_MINUS_SRC_ALPHA, stencil) */

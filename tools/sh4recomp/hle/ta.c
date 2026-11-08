@@ -980,17 +980,8 @@ float ta_fog_alpha_ref(float inv_w, uint32_t fog_density, const uint32_t table[1
 float ta_fog_alpha(float inv_w, uint32_t fog_density, const uint32_t table[128])
 {
     static uint32_t s_dens_key = 0x80000000u; static float s_den;       /* density multiplier cache (the density register is constant within a frame) */
-    if (fog_density != s_dens_key) { s_dens_key = fog_density; s_den = (float)((fog_density >> 8) & 255) / 128.0f * ldexpf(1.0f, (int8_t)(fog_density & 255)); }
-    float z = inv_w * s_den;
-    if (!(z > 1.0f)) z = 1.0f;
-    if (z > 255.99f) z = 255.99f;
-    uint32_t u; memcpy(&u, &z, 4);
-    int e = (int)((u >> 23) & 0xFF) - 127;
-    int idx = ((int)((u >> 19) & 0xF)) + e * 16;
-    if (idx > 127) idx = 127;
-    float fr = (float)(u & 0x7FFFFu) * (1.0f / 524288.0f);
-    uint32_t t = table[idx];
-    return ((float)((t >> 8) & 255) * (1.0f - fr) + (float)(t & 255) * fr) / 255.0f;
+    if (fog_density != s_dens_key) { s_dens_key = fog_density; s_den = ta_fog_density_scale(fog_density); }
+    return ta_fog_alpha_scaled(inv_w, s_den, table);
 }
 
 /* ------------------------------------------------------------------ texture cache support (shared by vita_gl_render.c and the host cross-check in ta_hle.c) */

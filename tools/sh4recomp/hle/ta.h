@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <math.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -245,6 +246,24 @@ int  ta_tex_decode16(const uint8_t *vram, uint32_t vram_size, uint32_t tcw, uint
  * Result colour = lerp(colour, FOG_COL_RAM, alpha) [DOC; the formula follows the public PVR docs / emulators as remembered]. */
 float ta_fog_alpha(float inv_w, uint32_t fog_density, const uint32_t table[128]);
 float ta_fog_alpha_ref(float inv_w, uint32_t fog_density, const uint32_t table[128]);   /* original log2f/floorf version (tests) */
+
+static inline float ta_fog_density_scale(uint32_t fog_density)
+{
+    return (float)((fog_density >> 8) & 255) * (1.0f / 128.0f) * ldexpf(1.0f, (int8_t)(fog_density & 255));
+}
+
+static inline float ta_fog_alpha_scaled(float inv_w, float fog_den_scale, const uint32_t table[128])
+{
+    float z = inv_w * fog_den_scale;
+    if (!(z > 1.0f)) z = 1.0f;
+    if (z > 255.99f) z = 255.99f;
+    union { float f; uint32_t u; } u = { z };
+    int idx = (int)(u.u >> 19) - (127 * 16);
+    if (idx > 127) idx = 127;
+    float fr = (float)(u.u & 0x7FFFFu) * (1.0f / 524288.0f);
+    uint32_t t = table[idx];
+    return ((float)((t >> 8) & 255) * (1.0f - fr) + (float)(t & 255) * fr) * (1.0f / 255.0f);
+}
 
 /* ---- texture cache helpers ---- */
 uint32_t ta_tex_byte_len(uint32_t tcw, uint32_t tsp);     /* conservative byte length of the texture data in VRAM at tcw*8 (pixels + mip chain + VQ codebook) */
