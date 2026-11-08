@@ -277,8 +277,18 @@ SH4_INLINE uint32_t fp_sat(double d) {
     if (d <= -2147483648.0) return 0x80000000u;
     return (uint32_t)(int32_t)d;
 }
+SH4_INLINE uint32_t fp_satf(float f) {
+    if (SH4_UNLIKELY(f != f)) return 0x7FFFFFFFu;
+    if (SH4_UNLIKELY(f >= 2147483648.0f)) return 0x7FFFFFFFu;
+    if (SH4_UNLIKELY(f <= -2147483648.0f)) return 0x80000000u;
+    return (uint32_t)(int32_t)f;
+}
 SH4_INLINE void fp_ftrc(SH4Ctx *c, int n) {
+#ifdef SH4_FASTFP
+    c->fpul = SH4_UNLIKELY(c->fpscr & SH4_FPSCR_PR) ? fp_sat(fp_getd(c, n)) : fp_satf(fin(c, c->fr[n]));
+#else
     c->fpul = (c->fpscr & SH4_FPSCR_PR) ? fp_sat(fp_getd(c, n)) : fp_sat((double)fin(c, c->fr[n]));
+#endif
 }
 SH4_INLINE void fp_cnvsd(SH4Ctx *c, int n) { fp_setd(c, n, (double)u2f(c->fpul)); }
 SH4_INLINE void fp_cnvds(SH4Ctx *c, int n) { c->fpul = f2u((float)fp_getd(c, n)); }
