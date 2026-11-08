@@ -84,7 +84,7 @@ $(error unknown VARIANT '$(VARIANT)': see Makefile.vita / re_analysis/dc/notes_p
 endif
 
 OPT_HOT         ?= $(if $(V_OPT_HOT),$(V_OPT_HOT),-O3 -fno-math-errno -fomit-frame-pointer)
-OPT_COLD        ?= $(if $(V_OPT_COLD),$(V_OPT_COLD),cold)
+OPT_COLD        ?= $(if $(V_OPT_COLD),$(V_OPT_COLD),none)
 OPT             ?= $(OPT_HOT)
 HOT_LIST        ?= re_analysis/dc/hot_funcs.txt
 ifeq ($(OPT_COLD),none)
