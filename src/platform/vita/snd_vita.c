@@ -178,7 +178,8 @@ static uint32_t            g_nOutputSampleRate = SND_VITA_OUTPUT_RATE;
 
 #if defined(__vita__)
 static SceUID               g_hAudioThread      = -1;
-static SceUID               g_hAudioMutex       = -1;
+static SceKernelLwMutexWork g_lwAudioMutex;
+static int                  g_bMutexInitialized = 0;
 #else
 static pthread_mutex_t      g_hAudioMutex;
 static int                  g_bMutexInitialized = 0;
@@ -233,14 +234,21 @@ static uint32_t             g_chunk_q_head = 0;
 static uint32_t             g_chunk_q_tail = 0;
 static uint32_t             g_chunk_q_count = 0;
 static uint32_t             g_chunk_q_pending_samples[2] = {0, 0};
+static uint32_t             g_stream_total_fed[2] = {0, 0};
+static uint32_t             s_stream_gen = 0;
 
 /* ----------------------------------------------------------------------------
  * 4. Synchronization Primitives
  * ---------------------------------------------------------------------------- */
 void SND_Vita_Lock(void) {
 #if defined(__vita__)
-    if (g_hAudioMutex >= 0) {
-        sceKernelLockMutex(g_hAudioMutex, 1, NULL);
+    if (!g_bMutexInitialized) {
+        if (sceKernelCreateLwMutex(&g_lwAudioMutex, "Rayman2_AudioMutex", 2, 0, NULL) >= 0) {
+            g_bMutexInitialized = 1;
+        }
+    }
+    if (g_bMutexInitialized) {
+        sceKernelLockLwMutex(&g_lwAudioMutex, 1, NULL);
     }
 #else
     if (!g_bMutexInitialized) {
@@ -257,8 +265,8 @@ void SND_Vita_Lock(void) {
 
 void SND_Vita_Unlock(void) {
 #if defined(__vita__)
-    if (g_hAudioMutex >= 0) {
-        sceKernelUnlockMutex(g_hAudioMutex, 1);
+    if (g_bMutexInitialized) {
+        sceKernelUnlockLwMutex(&g_lwAudioMutex, 1);
     }
 #else
     if (g_bMutexInitialized) {
@@ -1099,6 +1107,7 @@ void SND_Vita_FeedStreamChunk(int ch, const uint8_t *data, uint32_t bytes, int f
         g_chunk_q_tail = (g_chunk_q_tail + 1) % SND_CHUNK_QUEUE_SIZE;
         g_chunk_q_count++;
         g_chunk_q_pending_samples[channel] += num_samples;
+        __atomic_store_n(&g_stream_total_fed[channel], g_stream_total_fed[channel] + num_samples, __ATOMIC_RELEASE);
         if (sample_rate > 0) {
             g_stream_sample_rate = sample_rate;
         }
@@ -1109,16 +1118,11 @@ void SND_Vita_FeedStreamChunk(int ch, const uint8_t *data, uint32_t bytes, int f
 }
 
 uint32_t SND_Vita_GetStreamQueuedFrames(void) {
-    SND_Vita_Lock();
-    uint32_t write_head = (g_stream_write_pos[0] < g_stream_write_pos[1]) ? g_stream_write_pos[0] : g_stream_write_pos[1];
-    uint32_t pending_queue_samples = (g_chunk_q_pending_samples[0] < g_chunk_q_pending_samples[1]) ? g_chunk_q_pending_samples[0] : g_chunk_q_pending_samples[1];
-    uint32_t queued = 0;
-    if (write_head > g_stream_read_pos) {
-        queued = write_head - g_stream_read_pos;
-    }
-    queued += pending_queue_samples;
-    SND_Vita_Unlock();
-    return queued;
+    uint32_t fed0 = __atomic_load_n(&g_stream_total_fed[0], __ATOMIC_ACQUIRE);
+    uint32_t fed1 = __atomic_load_n(&g_stream_total_fed[1], __ATOMIC_ACQUIRE);
+    uint32_t total_fed = (fed0 < fed1) ? fed0 : fed1;
+    uint32_t rp = __atomic_load_n(&g_stream_read_pos, __ATOMIC_ACQUIRE);
+    return (total_fed > rp) ? (total_fed - rp) : 0;
 }
 
 uint32_t SND_Vita_GetStreamFreeFrames(void) {
@@ -1127,24 +1131,24 @@ uint32_t SND_Vita_GetStreamFreeFrames(void) {
 }
 
 uint32_t SND_Vita_GetStreamConsumedFrames(void) {
-    SND_Vita_Lock();
-    uint32_t consumed = g_stream_consumed_frames;
-    SND_Vita_Unlock();
-    return consumed;
+    return __atomic_load_n(&g_stream_consumed_frames, __ATOMIC_ACQUIRE);
 }
 
 void SND_Vita_ClearStream(void) {
     SND_Vita_Lock();
+    s_stream_gen++;
     g_chunk_q_head = 0;
     g_chunk_q_tail = 0;
     g_chunk_q_count = 0;
     g_chunk_q_pending_samples[0] = 0;
     g_chunk_q_pending_samples[1] = 0;
-    g_stream_write_pos[0] = 0;
-    g_stream_write_pos[1] = 0;
-    g_stream_read_pos = 0;
+    __atomic_store_n(&g_stream_total_fed[0], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_stream_total_fed[1], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_stream_write_pos[0], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_stream_write_pos[1], 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_stream_read_pos, 0, __ATOMIC_RELEASE);
     g_stream_read_frac = 0;
-    g_stream_consumed_frames = 0;
+    __atomic_store_n(&g_stream_consumed_frames, 0, __ATOMIC_RELEASE);
     s_stream_pred[0] = 0;
     s_stream_pred[1] = 0;
     s_stream_step[0] = 127;
@@ -1239,14 +1243,14 @@ int SND_Vita_PlaySoundEx(int voice_idx, uint32_t bank_id, uint32_t sound_id, flo
 
     /* 3. Assign voice parameters */
     SND_Vita_Voice *v = &g_voices[chosen_slot];
-    v->active           = 0;
+    __atomic_store_n(&v->active, 0, __ATOMIC_RELEASE);
     v->bank_id          = actual_bank_id;
     v->sound_id         = sound_id;
     v->pcm_data         = pSample->pcm_data;
-    v->num_samples      = pSample->num_samples;
+    __atomic_store_n(&v->num_samples, pSample->num_samples, __ATOMIC_RELAXED);
     uint32_t srate      = pSample->sample_rate ? pSample->sample_rate : 22050;
     v->sample_rate      = srate;
-    v->sample_pos       = 0;
+    __atomic_store_n(&v->sample_pos, 0, __ATOMIC_RELAXED);
     v->sample_pos_frac  = 0;
     v->pitch            = fPitch > 0.0f ? fPitch : 1.0f;
     uint32_t out_rate   = g_nOutputSampleRate ? g_nOutputSampleRate : SND_VITA_OUTPUT_RATE;
@@ -1256,7 +1260,7 @@ int SND_Vita_PlaySoundEx(int voice_idx, uint32_t bank_id, uint32_t sound_id, flo
     v->loop             = pSample->loop;
     v->loop_start       = pSample->loop_start;
     v->loop_end         = (pSample->loop_end > 0) ? pSample->loop_end : pSample->num_samples;
-    v->active           = 1;
+    __atomic_store_n(&v->active, 1, __ATOMIC_RELEASE);
 
     SND_Vita_Unlock();
     return chosen_slot;
@@ -1355,10 +1359,7 @@ int SND_Vita_SendCommand(uint8_t uCmd, uint8_t uHandle, int32_t lParam1, int32_t
 
 int SND_Vita_IsVoicePlaying(int voice_index) {
     if (voice_index < 0 || voice_index >= SND_VITA_NUM_VOICES) return 0;
-    SND_Vita_Lock();
-    int active = g_voices[voice_index].active;
-    SND_Vita_Unlock();
-    return active;
+    return __atomic_load_n(&g_voices[voice_index].active, __ATOMIC_ACQUIRE);
 }
 
 int SND_Vita_GetActiveVoiceCount(void) {
@@ -1374,7 +1375,7 @@ int SND_Vita_GetActiveVoiceCount(void) {
 void SND_Vita_StopVoice(int voice_index) {
     if (voice_index >= 0 && voice_index < SND_VITA_NUM_VOICES) {
         SND_Vita_Lock();
-        g_voices[voice_index].active = 0;
+        __atomic_store_n(&g_voices[voice_index].active, 0, __ATOMIC_RELEASE);
         SND_Vita_Unlock();
     }
 }
@@ -1393,11 +1394,9 @@ void SND_Vita_GetVoiceStatus(int voice_index, int *pActive, uint32_t *pPos, uint
         return;
     }
 
-    SND_Vita_Lock();
-    if (pActive) *pActive = g_voices[voice_index].active;
-    if (pPos)    *pPos    = g_voices[voice_index].sample_pos;
-    if (pTotal)  *pTotal  = g_voices[voice_index].num_samples;
-    SND_Vita_Unlock();
+    if (pActive) *pActive = __atomic_load_n(&g_voices[voice_index].active, __ATOMIC_ACQUIRE);
+    if (pPos)    *pPos    = __atomic_load_n(&g_voices[voice_index].sample_pos, __ATOMIC_RELAXED);
+    if (pTotal)  *pTotal  = __atomic_load_n(&g_voices[voice_index].num_samples, __ATOMIC_RELAXED);
 }
 
 /* ----------------------------------------------------------------------------
@@ -1468,58 +1467,87 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
 
     SND_Vita_Lock();
 
-    /* 0. Drain queued streaming chunks (offloaded from game thread) */
+    /* 0. Drain queued streaming chunks (ADPCM decoded outside the mixer lock) */
     while (g_chunk_q_count > 0) {
         SndChunkEntry *entry = &g_chunk_queue[g_chunk_q_head];
         int channel = entry->channel;
-        if (entry->sample_rate > 0) {
-            g_stream_sample_rate = entry->sample_rate;
+        uint32_t num_samples = entry->num_samples;
+        uint32_t sample_rate = entry->sample_rate;
+        int fmt = entry->fmt;
+
+        if (sample_rate > 0) {
+            g_stream_sample_rate = sample_rate;
         }
 
-        if (entry->fmt == 1) {
-            /* Format 1: 16-bit signed PCM */
+        if (fmt == 1) {
+            /* Format 1: 16-bit signed PCM (no ADPCM decode needed) */
             const int16_t *pcm = (const int16_t *)entry->data;
             uint32_t wp = g_stream_write_pos[channel];
-            for (uint32_t i = 0; i < entry->num_samples; i++) {
+            for (uint32_t i = 0; i < num_samples; i++) {
                 uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
                 g_stream_ring[idx * 2 + channel] = pcm[i];
             }
-            g_stream_write_pos[channel] = wp + entry->num_samples;
+            __atomic_store_n(&g_stream_write_pos[channel], wp + num_samples, __ATOMIC_RELEASE);
+            if (g_chunk_q_pending_samples[channel] >= num_samples) {
+                g_chunk_q_pending_samples[channel] -= num_samples;
+            } else {
+                g_chunk_q_pending_samples[channel] = 0;
+            }
+            g_chunk_q_head = (g_chunk_q_head + 1) % SND_CHUNK_QUEUE_SIZE;
+            g_chunk_q_count--;
         } else {
-            /* Format 2 / 0: Yamaha AICA ADPCM */
+            /* Format 2 / 0: Yamaha AICA ADPCM — copy compressed bytes, release mixer lock to decode */
+            static uint8_t s_local_adpcm[SND_CHUNK_MAX_BYTES];
+            static int16_t s_decoded_pcm[SND_CHUNK_MAX_BYTES * 2];
+            uint32_t bytes = entry->bytes;
+            if (bytes > SND_CHUNK_MAX_BYTES) bytes = SND_CHUNK_MAX_BYTES;
+            if (num_samples > SND_CHUNK_MAX_BYTES * 2) num_samples = SND_CHUNK_MAX_BYTES * 2;
+            memcpy(s_local_adpcm, entry->data, bytes);
+
             int32_t pred = s_stream_pred[channel];
             int32_t step = s_stream_step[channel];
             if (step < 127) step = 127;
+            uint32_t gen = s_stream_gen;
 
-            uint32_t wp = g_stream_write_pos[channel];
-            for (uint32_t i = 0; i < entry->num_samples; i++) {
-                uint8_t byte = entry->data[i >> 1];
+            g_chunk_q_head = (g_chunk_q_head + 1) % SND_CHUNK_QUEUE_SIZE;
+            g_chunk_q_count--;
+
+            SND_Vita_Unlock();
+
+            /* Decode ADPCM into temporary buffer without holding the mixer lock */
+            for (uint32_t i = 0; i < num_samples; i++) {
+                uint8_t byte = s_local_adpcm[i >> 1];
                 uint8_t nib = (i & 1) ? (byte >> 4) : (byte & 0x0F);
 
                 pred += (yam_diff[nib] * step) / 8;
                 if (pred > 32767) pred = 32767;
                 else if (pred < -32768) pred = -32768;
 
-                uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
-                g_stream_ring[idx * 2 + channel] = (int16_t)pred;
+                s_decoded_pcm[i] = (int16_t)pred;
 
                 int32_t st = (step * yam_scale[nib & 7]) >> 8;
                 step = (st < 127) ? 127 : ((st > 24576) ? 24576 : st);
             }
 
-            g_stream_write_pos[channel] = wp + entry->num_samples;
-            s_stream_pred[channel] = pred;
-            s_stream_step[channel] = step;
-        }
+            SND_Vita_Lock();
 
-        if (g_chunk_q_pending_samples[channel] >= entry->num_samples) {
-            g_chunk_q_pending_samples[channel] -= entry->num_samples;
-        } else {
-            g_chunk_q_pending_samples[channel] = 0;
+            /* Commit decoded samples if stream was not cleared while unlocked */
+            if (s_stream_gen == gen) {
+                uint32_t wp = g_stream_write_pos[channel];
+                for (uint32_t i = 0; i < num_samples; i++) {
+                    uint32_t idx = (wp + i) & SND_STREAM_RING_MASK;
+                    g_stream_ring[idx * 2 + channel] = s_decoded_pcm[i];
+                }
+                __atomic_store_n(&g_stream_write_pos[channel], wp + num_samples, __ATOMIC_RELEASE);
+                s_stream_pred[channel] = pred;
+                s_stream_step[channel] = step;
+                if (g_chunk_q_pending_samples[channel] >= num_samples) {
+                    g_chunk_q_pending_samples[channel] -= num_samples;
+                } else {
+                    g_chunk_q_pending_samples[channel] = 0;
+                }
+            }
         }
-
-        g_chunk_q_head = (g_chunk_q_head + 1) % SND_CHUNK_QUEUE_SIZE;
-        g_chunk_q_count--;
     }
 
     float master_vol = g_fMasterVolume;
@@ -1622,9 +1650,9 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
             }
         }
 
-        g_stream_read_pos  = curr_pos;
+        __atomic_store_n(&g_stream_read_pos, curr_pos, __ATOMIC_RELEASE);
         g_stream_read_frac = frac;
-        g_stream_consumed_frames = curr_pos;
+        __atomic_store_n(&g_stream_consumed_frames, curr_pos, __ATOMIC_RELEASE);
     }
 
     /* 2. Mix 16 Active SFX Voices */
@@ -1659,7 +1687,7 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
                     if (voice->loop) {
                         pos = loop_start + ((pos - loop_end) % (loop_end - loop_start));
                     } else {
-                        voice->active = 0;
+                        __atomic_store_n(&voice->active, 0, __ATOMIC_RELEASE);
                         break;
                     }
                 }
@@ -1689,7 +1717,7 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
                     if (voice->loop) {
                         pos = loop_start + ((pos - loop_end) % (loop_end - loop_start));
                     } else {
-                        voice->active = 0;
+                        __atomic_store_n(&voice->active, 0, __ATOMIC_RELEASE);
                         break;
                     }
                 }
@@ -1717,7 +1745,7 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
                     if (voice->loop) {
                         pos = loop_start + ((pos - loop_end) % (loop_end - loop_start));
                     } else {
-                        voice->active = 0;
+                        __atomic_store_n(&voice->active, 0, __ATOMIC_RELEASE);
                         break;
                     }
                 }
@@ -1745,7 +1773,7 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
                     if (voice->loop) {
                         pos = loop_start + ((pos - loop_end) % (loop_end - loop_start));
                     } else {
-                        voice->active = 0;
+                        __atomic_store_n(&voice->active, 0, __ATOMIC_RELEASE);
                         break;
                     }
                 }
@@ -1769,7 +1797,7 @@ void SND_Vita_MixStereoBuffer(int16_t *out_samples, uint32_t num_frames) {
             }
         }
 
-        voice->sample_pos       = pos;
+        __atomic_store_n(&voice->sample_pos, pos, __ATOMIC_RELAXED);
         voice->sample_pos_frac  = frac;
     }
 
@@ -1891,10 +1919,13 @@ int SND_Vita_InitEx(int spawn_thread) {
     OS_Vita_LogInfo("[SND] Initializing Yamaha AICA audio streamer subsystem (spawn_thread=%d)...", spawn_thread);
 
 #if defined(__vita__)
-    g_hAudioMutex = sceKernelCreateMutex("Rayman2_AudioMutex", 2, 0, NULL); /* 2 = SCE_KERNEL_MUTEX_ATTR_RECURSIVE */
-    if (g_hAudioMutex < 0) {
-        OS_Vita_LogError("[SND] Failed to create audio mutex: 0x%08X", g_hAudioMutex);
-        return -1;
+    if (!g_bMutexInitialized) {
+        int ret = sceKernelCreateLwMutex(&g_lwAudioMutex, "Rayman2_AudioMutex", 2, 0, NULL); /* 2 = SCE_KERNEL_MUTEX_ATTR_RECURSIVE */
+        if (ret < 0) {
+            OS_Vita_LogError("[SND] Failed to create audio lwmutex: 0x%08X", ret);
+            return -1;
+        }
+        g_bMutexInitialized = 1;
     }
 #endif
 
@@ -1906,11 +1937,13 @@ int SND_Vita_InitEx(int spawn_thread) {
     memset(&g_fix_bank, 0, sizeof(g_fix_bank));
     memset(&g_level_bank, 0, sizeof(g_level_bank));
     memset(g_stream_ring, 0, sizeof(g_stream_ring));
+    s_stream_gen = 0;
     g_chunk_q_head = 0;
     g_chunk_q_tail = 0;
     g_chunk_q_count = 0;
     g_chunk_q_pending_samples[0] = 0;
     g_chunk_q_pending_samples[1] = 0;
+    g_stream_total_fed[0] = g_stream_total_fed[1] = 0;
     g_stream_write_pos[0] = g_stream_write_pos[1] = 0;
     g_stream_read_pos = g_stream_read_frac = 0;
     s_stream_pred[0] = s_stream_pred[1] = 0;
@@ -1986,9 +2019,9 @@ void SND_Vita_Shutdown(void) {
     SND_Vita_Unlock();
 
 #if defined(__vita__)
-    if (g_hAudioMutex >= 0) {
-        sceKernelDeleteMutex(g_hAudioMutex);
-        g_hAudioMutex = -1;
+    if (g_bMutexInitialized) {
+        sceKernelDeleteLwMutex(&g_lwAudioMutex);
+        g_bMutexInitialized = 0;
     }
 #endif
 

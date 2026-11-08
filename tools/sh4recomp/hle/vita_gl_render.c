@@ -663,7 +663,21 @@ static float (*s_fc)[4] = NULL;                   /* fog-pass colours (r,g,b,a),
  * lands on pixels where its batch is the visible one, so a later batch that overwrites those pixels (and carries its own fog pass) hides it either way, and the result equals the interleaved order
  * (up to the 8-bit rounding order of two fog blends on a coplanar tie).  This removes the per-batch colour-pointer / blend / depth state toggles (each one makes vitaGL reload its programs). ---- */
 #if R2_PERF || R2_PF
-static float perf_area(const TaGlVertex *v, uint32_t n);
+/* sum of triangle areas of a GL_TRIANGLES vertex run, in units of the 640x480 screen (vertices are already in 640x480 pixel space) */
+static inline float perf_area(const TaGlVertex *v, uint32_t n)
+{
+#if defined(R2_VITA_PROFILE)
+    float a = 0.0f;
+    for (uint32_t i = 0; i + 2 < n; i += 3) {
+        float ar = (v[i + 1].x - v[i].x) * (v[i + 2].y - v[i].y) - (v[i + 2].x - v[i].x) * (v[i + 1].y - v[i].y);
+        a += ar < 0 ? -ar : ar;
+    }
+    return a * (0.5f / (640.0f * 480.0f));
+#else
+    (void)v; (void)n;
+    return 0.0f;
+#endif
+}
 #endif
 typedef struct FogJob { uint32_t first, count; GLuint tex_id; uint8_t textured, alpha_test; } FogJob;
 static int s_fog_defer = -1;                      /* run-time switch NO_FOG_DEFER (host: env R2_NO_FOG_DEFER): draw every fog pass right after its batch like before */
@@ -761,18 +775,6 @@ static void draw_shadow_volumes(const TaFrame *frame, float cut, const TaClipVer
     glColorPointer(4, GL_FLOAT, sizeof(TaClipVertex), &scene_cv[0].r);
 }
 
-#if R2_PERF || R2_PF
-/* sum of triangle areas of a GL_TRIANGLES vertex run, in units of the 640x480 screen (vertices are already in 640x480 pixel space) */
-static float perf_area(const TaGlVertex *v, uint32_t n)
-{
-    float a = 0.0f;
-    for (uint32_t i = 0; i + 2 < n; i += 3) {
-        float ar = (v[i + 1].x - v[i].x) * (v[i + 2].y - v[i].y) - (v[i + 2].x - v[i].x) * (v[i + 1].y - v[i].y);
-        a += ar < 0 ? -ar : ar;
-    }
-    return a * (0.5f / (640.0f * 480.0f));
-}
-#endif
 #if R2_PERF
 static uint64_t s_t_swap_end; static int s_t_swap_end_prev_valid; static uint64_t s_t_present_end;
 #endif

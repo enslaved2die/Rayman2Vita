@@ -65,6 +65,11 @@ typedef struct SndSlotState {
     int16_t     pitch;          /* Raw pitch/detune delta */
     float       pitch_ratio;    /* Pitch scale ratio */
     int         voice_index;    /* Cleanroom voice index assigned (0..7) */
+    int8_t      raw_vol;        /* Cached raw volume byte */
+    int8_t      raw_pan;        /* Cached raw pan byte */
+    uint8_t     has_vol;        /* 1 if raw_vol is valid */
+    uint8_t     has_pan;        /* 1 if raw_pan is valid */
+    uint8_t     has_pitch;      /* 1 if pitch is valid */
 } SndSlotState;
 
 static SndSlotState s_slots[SND_HLE_MAX_SLOTS];
@@ -289,6 +294,13 @@ static void hle_sdVoicePan(SH4Ctx *c) {
     int8_t   pan_val = (int8_t)(c->r[5] & 0xFF);
 
     s_stat_pan_updates++;
+    if (s_slots[slot_id].has_pan && s_slots[slot_id].raw_pan == pan_val) {
+        c->r[0] = 0;
+        return;
+    }
+    s_slots[slot_id].has_pan = 1;
+    s_slots[slot_id].raw_pan = pan_val;
+
     /* Convert Dreamcast panning: -128 (full left) to +127 (full right) */
     float fPan = (float)pan_val / 127.0f;
     if (fPan < -1.0f) fPan = -1.0f;
@@ -307,6 +319,13 @@ static void hle_sdVoiceVol(SH4Ctx *c) {
     int8_t   vol_val = (int8_t)(c->r[5] & 0xFF);
 
     s_stat_vol_updates++;
+    if (s_slots[slot_id].has_vol && s_slots[slot_id].raw_vol == vol_val) {
+        c->r[0] = 0;
+        return;
+    }
+    s_slots[slot_id].has_vol = 1;
+    s_slots[slot_id].raw_vol = vol_val;
+
     /* Convert Dreamcast attenuation: 0 dB = max volume, negative = attenuation in dB */
     float fVol;
     if (vol_val == 0) {
@@ -334,8 +353,13 @@ static void hle_sdVoicePitch(SH4Ctx *c) {
     uint8_t  slot_id = get_slot_id(handle);
     int16_t  pitch   = (int16_t)(c->r[5] & 0xFFFF);
 
+    if (s_slots[slot_id].has_pitch && s_slots[slot_id].pitch == pitch) {
+        c->r[0] = 0;
+        return;
+    }
+    s_slots[slot_id].has_pitch = 1;
     s_slots[slot_id].pitch = pitch;
-    float ratio = powf(2.0f, (float)pitch / 3072.0f);
+    float ratio = (pitch == 0) ? 1.0f : powf(2.0f, (float)pitch / 3072.0f);
     s_slots[slot_id].pitch_ratio = ratio;
     SND_Vita_SetVoicePitch(slot_id, ratio);
 
@@ -414,8 +438,12 @@ static void hle_sdGetPos(SH4Ctx *c) {
 
 /* Extra Prison investigation trace; disabled unless explicitly enabled. */
 static int hle_prison_trace_enabled(void) {
-    const char *value = getenv("R2_PRISON_TRACE");
-    return value && value[0] && value[0] != '0';
+    static int s_cached = -1;
+    if (s_cached < 0) {
+        const char *value = getenv("R2_PRISON_TRACE");
+        s_cached = (value && value[0] && value[0] != '0') ? 1 : 0;
+    }
+    return s_cached;
 }
 
 static void hle_prison_dump_resource(uint32_t resource) {
@@ -447,8 +475,10 @@ static void hle_prison_dispatch(SH4Ctx *c) {
 /* Game-level stream request (0x8C060D44). Log the sound definition and event
  * before the original dispatcher chooses/opens a stream. */
 static void hle_game_stream_request(SH4Ctx *c) {
-    LOG_INFO("game_stream_request r4=%08x r5=%08x r6=%08x r7=%08x pr=%08x",
-             c->r[4], c->r[5], c->r[6], c->r[7], c->pr);
+    if (hle_prison_trace_enabled()) {
+        LOG_INFO("game_stream_request r4=%08x r5=%08x r6=%08x r7=%08x pr=%08x",
+                 c->r[4], c->r[5], c->r[6], c->r[7], c->pr);
+    }
     hle_orig(c, 0x8C060D44);
 }
 
@@ -584,7 +614,7 @@ static void hle_sdStreamTransferChunk(SH4Ctx *c) {
     s_dbg_chunk++; s_dbg_last_len = byte_len; s_dbg_last_src = src_addr; s_dbg_last_fmt = fmt;
     s_dbg_stream_chunk_idx++;
     s_dbg_stream_bytes += byte_len;
-    if (s_dbg_stream_chunk_idx <= 16 || (s_dbg_stream_chunk_idx % 32) == 0) {
+    if (hle_prison_trace_enabled() && (s_dbg_stream_chunk_idx <= 16 || (s_dbg_stream_chunk_idx % 32) == 0)) {
         LOG_INFO("stream_chunk id=%u n=%u fmt=%u ch=%u bytes=%u total=%u src=%08x state=%u remaining=%u eof=%u rate=%u",
                  s_dbg_stream_id, s_dbg_stream_chunk_idx, fmt, ch, byte_len,
                  s_dbg_stream_bytes, src_addr, LD32(STREAM_CTX_ADDR),
@@ -688,7 +718,7 @@ static void hle_sdStreamGetPos(SH4Ctx *c) {
                 pos = threshold + 1;
             }
         }
-        if (s_dbg_getpos <= 12 || (s_dbg_getpos % 64) == 0 || pos > threshold) {
+        if (hle_prison_trace_enabled() && (s_dbg_getpos <= 12 || (s_dbg_getpos % 64) == 0 || pos > threshold)) {
             LOG_INFO("sdStreamGetPos #%u: state=%u pos=%u threshold=%u consumed=%u queued=%u remaining=%u out=%08x",
                      s_dbg_getpos, LD32(STREAM_CTX_ADDR), pos, threshold, consumed,
                      queued, LD32(STREAM_CTX_ADDR + 0x0C), out_pos_ptr);
@@ -789,6 +819,14 @@ int snd_init(int out_rate) {
     (void)out_rate;
     if (!s_cleanroom_inited) {
         SND_Vita_Init();
+        memset(s_slots, 0, sizeof(s_slots));
+        memset(s_handle_to_slot, 0, sizeof(s_handle_to_slot));
+        for (int i = 0; i < SND_HLE_MAX_SLOTS; i++) {
+            s_slots[i].voice_index = i;
+            s_slots[i].volume = 1.0f;
+            s_slots[i].pan = 0.0f;
+            s_slots[i].pitch_ratio = 1.0f;
+        }
         s_cleanroom_inited = 1;
     }
     return 0;

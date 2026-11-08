@@ -38,11 +38,11 @@
 __attribute__((used)) static const char g_vita_layout_pad[R2_LAYOUT_PAD] = "layout pad";
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
-typedef SceUID snd_lock_t;
-static snd_lock_t g_lk = -1;
-static void lk_init(void) { if (g_lk < 0) g_lk = sceKernelCreateMutex("snd", 0, 0, NULL); }
-static inline void lk_lock(void) { sceKernelLockMutex(g_lk, 1, NULL); }
-static inline void lk_unlock(void) { sceKernelUnlockMutex(g_lk, 1); }
+static SceKernelLwMutexWork g_lk;
+static int g_lk_inited;
+static void lk_init(void) { if (!g_lk_inited) { sceKernelCreateLwMutex(&g_lk, "snd", 0, 0, NULL); g_lk_inited = 1; } }
+static inline void lk_lock(void) { sceKernelLockLwMutex(&g_lk, 1, NULL); }
+static inline void lk_unlock(void) { sceKernelUnlockLwMutex(&g_lk, 1); }
 #else
 #include <pthread.h>
 static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
@@ -1019,8 +1019,13 @@ static void caller_note(uint32_t kind, uint32_t off) {
  * LEGACY MODE (no consumer: plain host run): the machine is advanced from guest accesses to the guest-visible clock (hle_time_us) so the guest sees a live ARM;
  * output goes to the WAV only. */
 static uint64_t g_last_adv_us;
+#if defined(__vita__)
+static volatile int g_pull_mode = 1;
+#else
 static volatile int g_pull_mode;
+#endif
 static void wall_sync_locked(void) {
+    if (g_pull_mode) return;
     uint64_t now = hle_time_us();                 /* guest thread only: hle_time_us is not thread safe */
     if (!g_last_adv_us) { g_last_adv_us = now; return; }
     if (now <= g_last_adv_us) return;
@@ -1269,7 +1274,7 @@ static void sh4_aram_wr(uint32_t a, int sz, uint32_t v) {
     REC(0, sz, a & 0x1FFFFF, v, 0);
     CALLER_NOTE(1, a & 0x1FFFFF);
     if (!g_pull_mode) { lk_lock(); wall_sync_locked(); lk_unlock(); }
-    g_sh4wr[(a >> 16) & 31] += sz; g_sh4wr_n++;
+    if (TRACE) { g_sh4wr[(a >> 16) & 31] += sz; g_sh4wr_n++; }
     if (g_ringlog) { uint32_t o = a & 0x1FFFFF; int ri = (o >= 0x18000 && o < 0x1C000) ? 0 : (o >= 0x1E000 && o < 0x22000) ? 1 : -1;
         if (ri == 0) { static unsigned long lf; static uint32_t fs, fe, fn_; static uint64_t lt; if (hle_frame_count != lf) { if (fn_) fprintf(stderr, "[frm0] f=%lu t=%.3f stores=%u first=%05x last=%05x voice_pos_bytes=%u\n", lf, (double)lt / 44100.0, fn_, fs, fe, chn[53].pos * 2); lf = hle_frame_count; fn_ = 0; } if (!fn_) fs = o; fe = o; fn_++; lt = st_samples; }
         if (ri >= 0) { g_rw_n[ri]++; g_rw_bytes[ri] += sz; if (!g_rw_hi[ri] || o < g_rw_lo[ri]) g_rw_lo[ri] = o; if (o + sz > g_rw_hi[ri]) g_rw_hi[ri] = o + sz; } }
