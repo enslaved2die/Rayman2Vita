@@ -10,16 +10,27 @@
 
 extern uint8_t sh4_sq_buf[];
 
-/* same expressions as runtime.h fp_arith / fp_fmac (PR = 0 path) on fr bit patterns */
-static inline uint32_t L_arith(SH4Ctx *c, int op, uint32_t xa, uint32_t xb) {
+/* same expressions as runtime.h fp_arith / fp_fmac / fp_ftrc (PR = 0 path) on fr bit patterns */
+SH4_INLINE uint32_t L_arith(SH4Ctx *c, int op, uint32_t xa, uint32_t xb) {
     float a = fin(c, xa), b = fin(c, xb), r;
     switch (op) { case 0: r = a + b; break; case 1: r = a - b; break; case 2: r = a * b; break; default: r = a / b; }
+#if defined(SH4_FASTFP) && !defined(R2_STRICT_NAN)
+    return fout(c, r);
+#else
     return nanfix(fout(c, r), xa, xb);
+#endif
 }
 #ifdef SH4_FASTFP
-static inline uint32_t L_fmac(SH4Ctx *c, uint32_t f0, uint32_t m, uint32_t n) { return fout(c, fin(c, f0) * fin(c, m) + fin(c, n)); }
+SH4_INLINE uint32_t L_fmac(SH4Ctx *c, uint32_t f0, uint32_t m, uint32_t n) { return fout(c, fin(c, f0) * fin(c, m) + fin(c, n)); }
+SH4_INLINE uint32_t L_ftrc(SH4Ctx *c, uint32_t x) {
+    float f = fin(c, x);
+    if (SH4_UNLIKELY(f != f || f >= 2147483648.0f)) return 0x7FFFFFFFu;
+    if (SH4_UNLIKELY(f <= -2147483648.0f)) return 0x80000000u;
+    return (uint32_t)(int32_t)f;
+}
 #else
-static inline uint32_t L_fmac(SH4Ctx *c, uint32_t f0, uint32_t m, uint32_t n) { return fout(c, fmaf(fin(c, f0), fin(c, m), fin(c, n))); }
+SH4_INLINE uint32_t L_fmac(SH4Ctx *c, uint32_t f0, uint32_t m, uint32_t n) { return fout(c, fmaf(fin(c, f0), fin(c, m), fin(c, n))); }
+SH4_INLINE uint32_t L_ftrc(SH4Ctx *c, uint32_t x) { return fp_sat((double)fin(c, x)); }
 #endif
 
 /* host diagnostic -DR2_GEOM_STATS: per hook, entries and fallbacks to the original body (by FPSCR.SZ / FPSCR.PR), printed at exit */
@@ -32,12 +43,29 @@ static void GEOM_STAT_ENTER(int i, SH4Ctx *c) { static int init; if (!init) { in
 #define GEOM_STAT_ENTER(i, c) ((void)0)
 #endif
 
+#ifdef R2_CHK_GEOM
+static void chk_inl_enter(int i);
+#define GEOM_CHK_NESTED(i) chk_inl_enter(i)
+#else
+#define GEOM_CHK_NESTED(i) ((void)0)
+#endif
+#if defined(__vita__) && !defined(R2_RING_TRACE)
+#define GEOM_SYNC_PR() ((void)0)
+#else
+#define GEOM_SYNC_PR() (c->pr = pr_)
+#endif
+#define GEOM_INL_ENTER(i, a) \
+    GEOM_STAT_ENTER(i, c); \
+    GEOM_CHK_NESTED(i); \
+    GEOM_SYNC_PR(); \
+    if (SH4_UNLIKELY(hle_trace_on)) { c->pr = pr_; c->r[4] = r4; c->r[5] = r5; c->r[6] = r6; c->r[15] = r15; } \
+    HLE_ENTER(a)
+
 /* 32-bit guest store: SQ window straight into the SQ buffer (== runtime.c sh4_io_write for 0xE0..), everything else as ST32 */
-static inline void STQ(uint32_t a, uint32_t v) {
+SH4_INLINE void STQ(uint32_t a, uint32_t v) {
     if (SH4_LIKELY((a & 0xFC000000u) == 0xE0000000u)) *(uint32_t *)(void *)(sh4_sq_buf + (a & 0x3F)) = v;
     else ST32(a, v);
 }
-
 static void h_geom_8c0352d6(SH4Ctx *c) {
     GEOM_STAT_ENTER(0, c);
     if (c->fpscr & (SH4_FPSCR_SZ | SH4_FPSCR_PR)) { hle_orig(c, 0x8C0352D6); return; }      /* the guest only runs this with SZ = PR = 0; anything else takes the original body */
@@ -270,6 +298,7 @@ static void h_geom_8c035780(SH4Ctx *c) {
     uint32_t r4=c->r[4];
     uint32_t r5=c->r[5];
     uint32_t r6=c->r[6];
+    uint32_t r7=c->r[7];
     uint32_t r8=c->r[8];
     uint32_t r9=c->r[9];
     uint32_t r10=c->r[10];
@@ -326,7 +355,7 @@ static void h_geom_8c035780(SH4Ctx *c) {
   STQ(r1,r4);
   STQ(r2,r4);
   r3=0x8c0d1880u;
-  { pr_=0x8c0357d8u; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0d1880u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c0357d8u; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0d1880u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
   sh4_pref(c,r14);
   r4=0x8c140cfcu;
   r14+=0x20u;
@@ -337,7 +366,34 @@ static void h_geom_8c035780(SH4Ctx *c) {
   STQ(r15,r2);
   { r9+=0x8u; goto L8c0358d8; }
 L8c035820:;
-  { pr_=0x8c035824u; r4=r13; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c035228u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c035824u; r4=r13; { /* inl f_8c035228 */ GEOM_INL_ENTER(1, 0x8C035228);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+48);
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r5=r0;
+  r3<<=2;
+  r6=r0;
+  r5+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r6+=r3;
+  r3=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d04u;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r7+=r3;
+  STQ(r4,r7);
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  { {uint32_t v=r5;r4-=4;STQ(r4,v);}  }
+} }
   r2=LD32(r15);
   r3=LD32(r8);
   r1=LD32(r2);
@@ -422,8 +478,152 @@ L8c03589c:;
   t_=(fin(c,fr2) > fin(c,fr3));
   if(t_) goto L8c0358d2;
   r5=r12;
-  { pr_=0x8c0358ccu; r4=r13; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c03525eu);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
-  { pr_=0x8c0358d0u; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0352d6u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c0358ccu; r4=r13; { /* inl f_8c03525e */ GEOM_INL_ENTER(2, 0x8C03525E);
+  {uint32_t v=r14;r15-=4;STQ(r15,v);}
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r15+=0xfffffffcu;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+0);
+  r3<<=2;
+  t_=r3>>31;r3<<=1;
+  r6=r0;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r14=r0;
+  r2=(int32_t)(int16_t)LD16(r5);
+  r3<<=2;
+  r5=0x8c140d34u;
+  t_=r3>>31;r3<<=1;
+  r2<<=2;
+  t_=r2>>31;r2<<=1;
+  r7+=r2;
+  STQ(r5,r7);
+  r14+=r3;
+  {uint32_t v=r14;r5-=4;STQ(r5,v);}
+  {uint32_t v=r6;r5-=4;STQ(r5,v);}
+  r0=LD32(gbr_+52);
+  r3=(int32_t)(int16_t)LD16(r4);
+  r5=r0;
+  r1=r0;
+  r3<<=2;
+  r7=r0;
+  r5+=r3;
+  r0=LD32(gbr_+56);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r12=r0;
+  r14=r0;
+  r6=r0;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r3<<=2;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r2<<=2;
+  r7+=r2;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d14u;
+  r3<<=2;
+  r2<<=2;
+  r1+=r2;
+  STQ(r15,r2);
+  STQ(r4,r1);
+  r12+=r2;
+  {uint32_t v=r7;r4-=4;STQ(r4,v);}
+  r14+=r3;
+  {uint32_t v=r5;r4-=4;STQ(r4,v);}
+  r4=0x8c140d24u;
+  STQ(r4,r12);
+  {uint32_t v=r14;r4-=4;STQ(r4,v);}
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  r15+=0x4u;
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;}  }
+} }
+  { pr_=0x8c0358d0u; r4=r14; { /* inl f_8c0352d6 */ GEOM_INL_ENTER(0, 0x8C0352D6);
+  {uint32_t v=r13;r15-=4;STQ(r15,v);}
+  r4+=0x20u;
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r0=0x4u;
+  r12=0x8c140d1cu;
+  r13=0x8c140d0cu;
+  r3=LD32(r12);
+  r1=0x8c140d2cu;
+  r2=LD32(r3);
+  r7=r1;
+  r6=0x8c140cfcu;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  {uint32_t v=LD32(r7);r7+=4;r3=v;}
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+4);
+  r4+=0x40u;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  r2=LD32(r3);
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+4);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r7);
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+8);
+  r4+=0x40u;
+  r5=LD32(r6);
+  r6=r1;
+  r2=LD32(r3);
+  r6+=0x8u;
+  fr5=LD32(r5);r5+=4u;
+  fr4=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+8);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r6);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r6);
+  fr3=LD32(r3);
+  r3=0xf0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr4);
+  r4-=4u;STQ(r4,fr5);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  r4+=0x20u;
+  r0=r4;
+  { {uint32_t v=LD32(r15);r15+=4;r13=v;}  }
+} }
   r14=r0;
 L8c0358d2:;
   r12+=0x6u;
@@ -445,7 +645,7 @@ L8c0358d8:;
   {uint32_t v=LD32(r15);r15+=4;r11=v;}
   {uint32_t v=LD32(r15);r15+=4;r12=v;}
   {uint32_t v=LD32(r15);r15+=4;r13=v;}
-  { {uint32_t v=LD32(r15);r15+=4;r14=v;} {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; return; } }
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;} {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; return; } }
 }
 
 static void h_geom_8c035f40(SH4Ctx *c) {
@@ -765,7 +965,34 @@ L8c0359b4:;
   STQ(r15+8,r6);
   { STQ(r15+4,r7); goto L8c035b96; }
 L8c035a20:;
-  { pr_=0x8c035a24u; r4=LD32(r15+20); {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c035228u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c035a24u; r4=LD32(r15+20); { /* inl f_8c035228 */ GEOM_INL_ENTER(1, 0x8C035228);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+48);
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r5=r0;
+  r3<<=2;
+  r6=r0;
+  r5+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r6+=r3;
+  r3=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d04u;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r7+=r3;
+  STQ(r4,r7);
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  { {uint32_t v=r5;r4-=4;STQ(r4,v);}  }
+} }
   r2=LD32(r15+4);
   r1=LD32(r15+8);
   r3=LD32(r2);
@@ -865,7 +1092,67 @@ L8c035ab6:;
   t_=(fin(c,fr3) > fin(c,fr2));
   if(t_) goto L8c035b84;
   r5=LD32(r15+36);
-  { pr_=0x8c035aecu; r4=LD32(r15+20); {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c03525eu);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c035aecu; r4=LD32(r15+20); { /* inl f_8c03525e */ GEOM_INL_ENTER(2, 0x8C03525E);
+  {uint32_t v=r14;r15-=4;STQ(r15,v);}
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r15+=0xfffffffcu;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+0);
+  r3<<=2;
+  t_=r3>>31;r3<<=1;
+  r6=r0;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r14=r0;
+  r2=(int32_t)(int16_t)LD16(r5);
+  r3<<=2;
+  r5=0x8c140d34u;
+  t_=r3>>31;r3<<=1;
+  r2<<=2;
+  t_=r2>>31;r2<<=1;
+  r7+=r2;
+  STQ(r5,r7);
+  r14+=r3;
+  {uint32_t v=r14;r5-=4;STQ(r5,v);}
+  {uint32_t v=r6;r5-=4;STQ(r5,v);}
+  r0=LD32(gbr_+52);
+  r3=(int32_t)(int16_t)LD16(r4);
+  r5=r0;
+  r1=r0;
+  r3<<=2;
+  r7=r0;
+  r5+=r3;
+  r0=LD32(gbr_+56);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r12=r0;
+  r14=r0;
+  r6=r0;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r3<<=2;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r2<<=2;
+  r7+=r2;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d14u;
+  r3<<=2;
+  r2<<=2;
+  r1+=r2;
+  STQ(r15,r2);
+  STQ(r4,r1);
+  r12+=r2;
+  {uint32_t v=r7;r4-=4;STQ(r4,v);}
+  r14+=r3;
+  {uint32_t v=r5;r4-=4;STQ(r4,v);}
+  r4=0x8c140d24u;
+  STQ(r4,r12);
+  {uint32_t v=r14;r4-=4;STQ(r4,v);}
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  r15+=0x4u;
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;}  }
+} }
   t_=(r8&r8)==0;
   if(t_) goto L8c035b7e;
   r3=LD32(r15+12);
@@ -937,7 +1224,91 @@ L8c035ab6:;
   sh4_pref(c,r14);
   r14+=0x20u;
 L8c035b7e:;
-  { pr_=0x8c035b82u; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0352d6u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c035b82u; r4=r14; { /* inl f_8c0352d6 */ GEOM_INL_ENTER(0, 0x8C0352D6);
+  {uint32_t v=r13;r15-=4;STQ(r15,v);}
+  r4+=0x20u;
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r0=0x4u;
+  r12=0x8c140d1cu;
+  r13=0x8c140d0cu;
+  r3=LD32(r12);
+  r1=0x8c140d2cu;
+  r2=LD32(r3);
+  r7=r1;
+  r6=0x8c140cfcu;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  {uint32_t v=LD32(r7);r7+=4;r3=v;}
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+4);
+  r4+=0x40u;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  r2=LD32(r3);
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+4);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r7);
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+8);
+  r4+=0x40u;
+  r5=LD32(r6);
+  r6=r1;
+  r2=LD32(r3);
+  r6+=0x8u;
+  fr5=LD32(r5);r5+=4u;
+  fr4=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+8);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r6);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r6);
+  fr3=LD32(r3);
+  r3=0xf0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr4);
+  r4-=4u;STQ(r4,fr5);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  r4+=0x20u;
+  r0=r4;
+  { {uint32_t v=LD32(r15);r15+=4;r13=v;}  }
+} }
   r14=r0;
 L8c035b84:;
   r3=LD32(r15+32);
@@ -983,6 +1354,7 @@ static void h_geom_8c0353c0(SH4Ctx *c) {
     uint32_t r4=c->r[4];
     uint32_t r5=c->r[5];
     uint32_t r6=c->r[6];
+    uint32_t r7=c->r[7];
     uint32_t r8=c->r[8];
     uint32_t r9=c->r[9];
     uint32_t r10=c->r[10];
@@ -1040,7 +1412,7 @@ static void h_geom_8c0353c0(SH4Ctx *c) {
   STQ(r2,r4);
   r3=0x8c0d1880u;
   r5=r9;
-  { pr_=0x8c03541au; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0d1880u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c03541au; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0d1880u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
   sh4_pref(c,r14);
   r6=0x8c140d2cu;
   r0=0x48u;
@@ -1105,7 +1477,34 @@ static void h_geom_8c0353c0(SH4Ctx *c) {
   STQ(r15+60,r1);
   { STQ(r15+52,r2); goto L8c03571e; }
 L8c035500:;
-  { pr_=0x8c035504u; r4=r13; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c035228u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c035504u; r4=r13; { /* inl f_8c035228 */ GEOM_INL_ENTER(1, 0x8C035228);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+48);
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r5=r0;
+  r3<<=2;
+  r6=r0;
+  r5+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r6+=r3;
+  r3=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d04u;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r7+=r3;
+  STQ(r4,r7);
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  { {uint32_t v=r5;r4-=4;STQ(r4,v);}  }
+} }
   r2=LD32(r15);
   r1=LD32(r2);
   r2=LD32(r8);
@@ -1202,9 +1601,69 @@ L8c0355a6:;
   {  goto L8c0356a0; }
 L8c0355c2:;
   r5=r12;
-  { pr_=0x8c0355c8u; r4=r13; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c03525eu);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c0355c8u; r4=r13; { /* inl f_8c03525e */ GEOM_INL_ENTER(2, 0x8C03525E);
+  {uint32_t v=r14;r15-=4;STQ(r15,v);}
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r15+=0xfffffffcu;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+0);
+  r3<<=2;
+  t_=r3>>31;r3<<=1;
+  r6=r0;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r14=r0;
+  r2=(int32_t)(int16_t)LD16(r5);
+  r3<<=2;
+  r5=0x8c140d34u;
+  t_=r3>>31;r3<<=1;
+  r2<<=2;
+  t_=r2>>31;r2<<=1;
+  r7+=r2;
+  STQ(r5,r7);
+  r14+=r3;
+  {uint32_t v=r14;r5-=4;STQ(r5,v);}
+  {uint32_t v=r6;r5-=4;STQ(r5,v);}
+  r0=LD32(gbr_+52);
+  r3=(int32_t)(int16_t)LD16(r4);
+  r5=r0;
+  r1=r0;
+  r3<<=2;
+  r7=r0;
+  r5+=r3;
+  r0=LD32(gbr_+56);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r12=r0;
+  r14=r0;
+  r6=r0;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r3<<=2;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r2<<=2;
+  r7+=r2;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d14u;
+  r3<<=2;
+  r2<<=2;
+  r1+=r2;
+  STQ(r15,r2);
+  STQ(r4,r1);
+  r12+=r2;
+  {uint32_t v=r7;r4-=4;STQ(r4,v);}
+  r14+=r3;
+  {uint32_t v=r5;r4-=4;STQ(r4,v);}
+  r4=0x8c140d24u;
+  STQ(r4,r12);
+  {uint32_t v=r14;r4-=4;STQ(r4,v);}
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  r15+=0x4u;
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;}  }
+} }
   r5=r14;
-  { pr_=0x8c0355ceu; r4=r13; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c034e40u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c0355ceu; r4=r13; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c034e40u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
   t_=(r0&r0)==0;
   { uint32_t k=!t_; STQ(r15+44,r0); if(k) goto L8c0355d8; }
   {  goto L8c035718; }
@@ -1250,7 +1709,91 @@ L8c0355d8:;
   r3=LD32(r15+4);
   r2=LD32(r15+16);
   STQ(r2,r3);
-  { pr_=0x8c03562eu; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0352d6u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c03562eu; r4=r14; { /* inl f_8c0352d6 */ GEOM_INL_ENTER(0, 0x8C0352D6);
+  {uint32_t v=r13;r15-=4;STQ(r15,v);}
+  r4+=0x20u;
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r0=0x4u;
+  r12=0x8c140d1cu;
+  r13=0x8c140d0cu;
+  r3=LD32(r12);
+  r1=0x8c140d2cu;
+  r2=LD32(r3);
+  r7=r1;
+  r6=0x8c140cfcu;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  {uint32_t v=LD32(r7);r7+=4;r3=v;}
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+4);
+  r4+=0x40u;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  r2=LD32(r3);
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+4);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r7);
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+8);
+  r4+=0x40u;
+  r5=LD32(r6);
+  r6=r1;
+  r2=LD32(r3);
+  r6+=0x8u;
+  fr5=LD32(r5);r5+=4u;
+  fr4=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+8);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r6);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r6);
+  fr3=LD32(r3);
+  r3=0xf0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr4);
+  r4-=4u;STQ(r4,fr5);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  r4+=0x20u;
+  r0=r4;
+  { {uint32_t v=LD32(r15);r15+=4;r13=v;}  }
+} }
   r14=r0;
   r0=LD32(r15+44);
   t_=(int32_t)r0==4;
@@ -1279,7 +1822,91 @@ L8c03563a:;
   r3=LD32(r15+52);
   r2=LD32(r15+16);
   STQ(r2,r3);
-  { pr_=0x8c03566au; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0352d6u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c03566au; r4=r14; { /* inl f_8c0352d6 */ GEOM_INL_ENTER(0, 0x8C0352D6);
+  {uint32_t v=r13;r15-=4;STQ(r15,v);}
+  r4+=0x20u;
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r0=0x4u;
+  r12=0x8c140d1cu;
+  r13=0x8c140d0cu;
+  r3=LD32(r12);
+  r1=0x8c140d2cu;
+  r2=LD32(r3);
+  r7=r1;
+  r6=0x8c140cfcu;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  {uint32_t v=LD32(r7);r7+=4;r3=v;}
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+4);
+  r4+=0x40u;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  r2=LD32(r3);
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+4);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r7);
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+8);
+  r4+=0x40u;
+  r5=LD32(r6);
+  r6=r1;
+  r2=LD32(r3);
+  r6+=0x8u;
+  fr5=LD32(r5);r5+=4u;
+  fr4=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+8);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r6);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r6);
+  fr3=LD32(r3);
+  r3=0xf0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr4);
+  r4-=4u;STQ(r4,fr5);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  r4+=0x20u;
+  r0=r4;
+  { {uint32_t v=LD32(r15);r15+=4;r13=v;}  }
+} }
   { r14=r0; goto L8c035718; }
 L8c0356a0:;
   r0=LD32(gbr_+28);
@@ -1338,8 +1965,152 @@ L8c0356e0:;
   if(t_) goto L8c035718;
 L8c03570c:;
   r5=r12;
-  { pr_=0x8c035712u; r4=r13; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c03525eu);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
-  { pr_=0x8c035716u; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0352d6u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c035712u; r4=r13; { /* inl f_8c03525e */ GEOM_INL_ENTER(2, 0x8C03525E);
+  {uint32_t v=r14;r15-=4;STQ(r15,v);}
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r15+=0xfffffffcu;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+0);
+  r3<<=2;
+  t_=r3>>31;r3<<=1;
+  r6=r0;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r14=r0;
+  r2=(int32_t)(int16_t)LD16(r5);
+  r3<<=2;
+  r5=0x8c140d34u;
+  t_=r3>>31;r3<<=1;
+  r2<<=2;
+  t_=r2>>31;r2<<=1;
+  r7+=r2;
+  STQ(r5,r7);
+  r14+=r3;
+  {uint32_t v=r14;r5-=4;STQ(r5,v);}
+  {uint32_t v=r6;r5-=4;STQ(r5,v);}
+  r0=LD32(gbr_+52);
+  r3=(int32_t)(int16_t)LD16(r4);
+  r5=r0;
+  r1=r0;
+  r3<<=2;
+  r7=r0;
+  r5+=r3;
+  r0=LD32(gbr_+56);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r12=r0;
+  r14=r0;
+  r6=r0;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r3<<=2;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r2<<=2;
+  r7+=r2;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d14u;
+  r3<<=2;
+  r2<<=2;
+  r1+=r2;
+  STQ(r15,r2);
+  STQ(r4,r1);
+  r12+=r2;
+  {uint32_t v=r7;r4-=4;STQ(r4,v);}
+  r14+=r3;
+  {uint32_t v=r5;r4-=4;STQ(r4,v);}
+  r4=0x8c140d24u;
+  STQ(r4,r12);
+  {uint32_t v=r14;r4-=4;STQ(r4,v);}
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  r15+=0x4u;
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;}  }
+} }
+  { pr_=0x8c035716u; r4=r14; { /* inl f_8c0352d6 */ GEOM_INL_ENTER(0, 0x8C0352D6);
+  {uint32_t v=r13;r15-=4;STQ(r15,v);}
+  r4+=0x20u;
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r0=0x4u;
+  r12=0x8c140d1cu;
+  r13=0x8c140d0cu;
+  r3=LD32(r12);
+  r1=0x8c140d2cu;
+  r2=LD32(r3);
+  r7=r1;
+  r6=0x8c140cfcu;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  {uint32_t v=LD32(r7);r7+=4;r3=v;}
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+4);
+  r4+=0x40u;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  r2=LD32(r3);
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+4);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r7);
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+8);
+  r4+=0x40u;
+  r5=LD32(r6);
+  r6=r1;
+  r2=LD32(r3);
+  r6+=0x8u;
+  fr5=LD32(r5);r5+=4u;
+  fr4=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+8);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r6);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r6);
+  fr3=LD32(r3);
+  r3=0xf0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr4);
+  r4-=4u;STQ(r4,fr5);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  r4+=0x20u;
+  r0=r4;
+  { {uint32_t v=LD32(r15);r15+=4;r13=v;}  }
+} }
   r14=r0;
 L8c035718:;
   r12+=0x6u;
@@ -1364,7 +2135,7 @@ L8c035726:;
   {uint32_t v=LD32(r15);r15+=4;r11=v;}
   {uint32_t v=LD32(r15);r15+=4;r12=v;}
   {uint32_t v=LD32(r15);r15+=4;r13=v;}
-  { {uint32_t v=LD32(r15);r15+=4;r14=v;} {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; return; } }
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;} {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; return; } }
 }
 
 static void h_geom_8c035be0(SH4Ctx *c) {
@@ -1387,6 +2158,9 @@ static void h_geom_8c035be0(SH4Ctx *c) {
     uint32_t r13=c->r[13];
     uint32_t r14=c->r[14];
     uint32_t r15=c->r[15];
+    uint32_t fr3=c->fr[3];
+    uint32_t fr4=c->fr[4];
+    uint32_t fr5=c->fr[5];
     uint32_t t_=c->t, pr_=c->pr; const uint32_t gbr_=c->gbr;
   {uint32_t v=r14;r15-=4;STQ(r15,v);}
   {uint32_t v=r13;r15-=4;STQ(r15,v);}
@@ -1459,7 +2233,7 @@ static void h_geom_8c035be0(SH4Ctx *c) {
   STQ(r1,r4);
   STQ(r9,r4);
   r5=LD32(r15+20);
-  { uint32_t tg=r3; pr_=0x8c035c72u; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->t=t_;c->pr=pr_; sh4_call(c,tg);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];t_=c->t;pr_=c->pr;} }
+  { uint32_t tg=r3; pr_=0x8c035c72u; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,tg);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
   sh4_pref(c,r14);
   r14+=0x20u;
 L8c035c76:;
@@ -1484,7 +2258,34 @@ L8c035c76:;
   STQ(r15,r6);
   { STQ(r15+8,r5); goto L8c035e06; }
 L8c035cc0:;
-  { pr_=0x8c035cc4u; r4=LD32(r15+24); {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->t=t_;c->pr=pr_; sh4_call(c,0x8c035228u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c035cc4u; r4=LD32(r15+24); { /* inl f_8c035228 */ GEOM_INL_ENTER(1, 0x8C035228);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+48);
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r5=r0;
+  r3<<=2;
+  r6=r0;
+  r5+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r6+=r3;
+  r3=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d04u;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r7+=r3;
+  STQ(r4,r7);
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  { {uint32_t v=r5;r4-=4;STQ(r4,v);}  }
+} }
   r2=LD32(r15+4);
   r1=LD32(r15);
   r3=LD32(r2);
@@ -1559,7 +2360,67 @@ L8c035d08:;
   if(t_) goto L8c035df4;
 L8c035d52:;
   r5=LD32(r15+36);
-  { pr_=0x8c035d58u; r4=LD32(r15+24); {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->t=t_;c->pr=pr_; sh4_call(c,0x8c03525eu);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c035d58u; r4=LD32(r15+24); { /* inl f_8c03525e */ GEOM_INL_ENTER(2, 0x8C03525E);
+  {uint32_t v=r14;r15-=4;STQ(r15,v);}
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r15+=0xfffffffcu;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+0);
+  r3<<=2;
+  t_=r3>>31;r3<<=1;
+  r6=r0;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r14=r0;
+  r2=(int32_t)(int16_t)LD16(r5);
+  r3<<=2;
+  r5=0x8c140d34u;
+  t_=r3>>31;r3<<=1;
+  r2<<=2;
+  t_=r2>>31;r2<<=1;
+  r7+=r2;
+  STQ(r5,r7);
+  r14+=r3;
+  {uint32_t v=r14;r5-=4;STQ(r5,v);}
+  {uint32_t v=r6;r5-=4;STQ(r5,v);}
+  r0=LD32(gbr_+52);
+  r3=(int32_t)(int16_t)LD16(r4);
+  r5=r0;
+  r1=r0;
+  r3<<=2;
+  r7=r0;
+  r5+=r3;
+  r0=LD32(gbr_+56);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r12=r0;
+  r14=r0;
+  r6=r0;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r3<<=2;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r2<<=2;
+  r7+=r2;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d14u;
+  r3<<=2;
+  r2<<=2;
+  r1+=r2;
+  STQ(r15,r2);
+  STQ(r4,r1);
+  r12+=r2;
+  {uint32_t v=r7;r4-=4;STQ(r4,v);}
+  r14+=r3;
+  {uint32_t v=r5;r4-=4;STQ(r4,v);}
+  r4=0x8c140d24u;
+  STQ(r4,r12);
+  {uint32_t v=r14;r4-=4;STQ(r4,v);}
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  r15+=0x4u;
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;}  }
+} }
   r2=LD32(r15+16);
   t_=(r2&r2)==0;
   if(t_) goto L8c035dee;
@@ -1594,11 +2455,11 @@ L8c035d52:;
   r12=r14;
   STQ(r9,r4);
   r5=LD32(r15+16);
-  { uint32_t tg=r3; pr_=0x8c035da0u; r4=r12; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->t=t_;c->pr=pr_; sh4_call(c,tg);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];t_=c->t;pr_=c->pr;} }
+  { uint32_t tg=r3; pr_=0x8c035da0u; r4=r12; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,tg);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
   sh4_pref(c,r14);
   r2=0x8c033b80u;
   r14+=0x20u;
-  { pr_=0x8c035daau; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->t=t_;c->pr=pr_; sh4_call(c,0x8c033b80u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c035daau; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c033b80u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
   r4=r0;
   r3=LD32(r13);
   r4-=r12;
@@ -1629,11 +2490,95 @@ L8c035d52:;
   STQ(r2,r4);
   STQ(r9,r4);
   r5=LD32(r15+20);
-  { uint32_t tg=r3; pr_=0x8c035deau; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->t=t_;c->pr=pr_; sh4_call(c,tg);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];t_=c->t;pr_=c->pr;} }
+  { uint32_t tg=r3; pr_=0x8c035deau; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,tg);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
   sh4_pref(c,r14);
   r14+=0x20u;
 L8c035dee:;
-  { pr_=0x8c035df2u; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0352d6u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c035df2u; r4=r14; { /* inl f_8c0352d6 */ GEOM_INL_ENTER(0, 0x8C0352D6);
+  {uint32_t v=r13;r15-=4;STQ(r15,v);}
+  r4+=0x20u;
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r0=0x4u;
+  r12=0x8c140d1cu;
+  r13=0x8c140d0cu;
+  r3=LD32(r12);
+  r1=0x8c140d2cu;
+  r2=LD32(r3);
+  r7=r1;
+  r6=0x8c140cfcu;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  {uint32_t v=LD32(r7);r7+=4;r3=v;}
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+4);
+  r4+=0x40u;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  r2=LD32(r3);
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+4);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r7);
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+8);
+  r4+=0x40u;
+  r5=LD32(r6);
+  r6=r1;
+  r2=LD32(r3);
+  r6+=0x8u;
+  fr5=LD32(r5);r5+=4u;
+  fr4=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+8);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r6);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r6);
+  fr3=LD32(r3);
+  r3=0xf0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr4);
+  r4-=4u;STQ(r4,fr5);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  r4+=0x20u;
+  r0=r4;
+  { {uint32_t v=LD32(r15);r15+=4;r13=v;}  }
+} }
   r14=r0;
 L8c035df4:;
   r3=LD32(r15+32);
@@ -1665,7 +2610,7 @@ L8c035e10:;
   {uint32_t v=LD32(r15);r15+=4;r11=v;}
   {uint32_t v=LD32(r15);r15+=4;r12=v;}
   {uint32_t v=LD32(r15);r15+=4;r13=v;}
-  { {uint32_t v=LD32(r15);r15+=4;r14=v;} {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->t=t_;c->pr=pr_; return; } }
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;} {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; return; } }
 }
 
 static void h_geom_8c034480(SH4Ctx *c) {
@@ -1836,7 +2781,34 @@ static void h_geom_8c034480(SH4Ctx *c) {
   STQ(r15+4,r14);
   { STQ(r15+8,r12); goto L8c034a6a; }
 L8c034600:;
-  { pr_=0x8c034604u; r4=LD32(r15+52); {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c035228u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c034604u; r4=LD32(r15+52); { /* inl f_8c035228 */ GEOM_INL_ENTER(1, 0x8C035228);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+48);
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r5=r0;
+  r3<<=2;
+  r6=r0;
+  r5+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r6+=r3;
+  r3=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d04u;
+  r2=r3;
+  t_=r3>>31;r3<<=1;
+  r3+=r2;
+  r3<<=2;
+  r7+=r3;
+  STQ(r4,r7);
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  { {uint32_t v=r5;r4-=4;STQ(r4,v);}  }
+} }
   r2=LD32(r15+8);
   r3=LD32(r2);
   r1=r3;
@@ -1956,7 +2928,67 @@ L8c0346c6:;
 L8c0346ee:;
   r0=0x40u;
   r5=LD32(r15+r0);
-  { pr_=0x8c0346f6u; r4=LD32(r15+52); {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c03525eu);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c0346f6u; r4=LD32(r15+52); { /* inl f_8c03525e */ GEOM_INL_ENTER(2, 0x8C03525E);
+  {uint32_t v=r14;r15-=4;STQ(r15,v);}
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r15+=0xfffffffcu;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+0);
+  r3<<=2;
+  t_=r3>>31;r3<<=1;
+  r6=r0;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r14=r0;
+  r2=(int32_t)(int16_t)LD16(r5);
+  r3<<=2;
+  r5=0x8c140d34u;
+  t_=r3>>31;r3<<=1;
+  r2<<=2;
+  t_=r2>>31;r2<<=1;
+  r7+=r2;
+  STQ(r5,r7);
+  r14+=r3;
+  {uint32_t v=r14;r5-=4;STQ(r5,v);}
+  {uint32_t v=r6;r5-=4;STQ(r5,v);}
+  r0=LD32(gbr_+52);
+  r3=(int32_t)(int16_t)LD16(r4);
+  r5=r0;
+  r1=r0;
+  r3<<=2;
+  r7=r0;
+  r5+=r3;
+  r0=LD32(gbr_+56);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r12=r0;
+  r14=r0;
+  r6=r0;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r3<<=2;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r2<<=2;
+  r7+=r2;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d14u;
+  r3<<=2;
+  r2<<=2;
+  r1+=r2;
+  STQ(r15,r2);
+  STQ(r4,r1);
+  r12+=r2;
+  {uint32_t v=r7;r4-=4;STQ(r4,v);}
+  r14+=r3;
+  {uint32_t v=r5;r4-=4;STQ(r4,v);}
+  r4=0x8c140d24u;
+  STQ(r4,r12);
+  {uint32_t v=r14;r4-=4;STQ(r4,v);}
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  r15+=0x4u;
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;}  }
+} }
   r5=r13;
   { pr_=0x8c0346fcu; r4=LD32(r15+52); {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c034e40u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
   r11=r0;
@@ -2139,7 +3171,91 @@ L8c0347ec:;
   r3=LD32(r15+12);
   r2=LD32(r15+20);
   STQ(r2,r3);
-  { pr_=0x8c03486eu; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0352d6u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c03486eu; r4=r14; { /* inl f_8c0352d6 */ GEOM_INL_ENTER(0, 0x8C0352D6);
+  {uint32_t v=r13;r15-=4;STQ(r15,v);}
+  r4+=0x20u;
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r0=0x4u;
+  r12=0x8c140d1cu;
+  r13=0x8c140d0cu;
+  r3=LD32(r12);
+  r1=0x8c140d2cu;
+  r2=LD32(r3);
+  r7=r1;
+  r6=0x8c140cfcu;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  {uint32_t v=LD32(r7);r7+=4;r3=v;}
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+4);
+  r4+=0x40u;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  r2=LD32(r3);
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+4);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r7);
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+8);
+  r4+=0x40u;
+  r5=LD32(r6);
+  r6=r1;
+  r2=LD32(r3);
+  r6+=0x8u;
+  fr5=LD32(r5);r5+=4u;
+  fr4=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+8);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r6);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r6);
+  fr3=LD32(r3);
+  r3=0xf0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr4);
+  r4-=4u;STQ(r4,fr5);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  r4+=0x20u;
+  r0=r4;
+  { {uint32_t v=LD32(r15);r15+=4;r13=v;}  }
+} }
   r13=r0;
   r0=r11;
   t_=(int32_t)r0==4;
@@ -2174,7 +3290,91 @@ L8c03487a:;
   r2=LD32(r15+r0);
   r3=LD32(r15+20);
   STQ(r3,r2);
-  { pr_=0x8c0348b6u; r4=r13; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0352d6u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c0348b6u; r4=r13; { /* inl f_8c0352d6 */ GEOM_INL_ENTER(0, 0x8C0352D6);
+  {uint32_t v=r13;r15-=4;STQ(r15,v);}
+  r4+=0x20u;
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r0=0x4u;
+  r12=0x8c140d1cu;
+  r13=0x8c140d0cu;
+  r3=LD32(r12);
+  r1=0x8c140d2cu;
+  r2=LD32(r3);
+  r7=r1;
+  r6=0x8c140cfcu;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  {uint32_t v=LD32(r7);r7+=4;r3=v;}
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+4);
+  r4+=0x40u;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  r2=LD32(r3);
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+4);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r7);
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+8);
+  r4+=0x40u;
+  r5=LD32(r6);
+  r6=r1;
+  r2=LD32(r3);
+  r6+=0x8u;
+  fr5=LD32(r5);r5+=4u;
+  fr4=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+8);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r6);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r6);
+  fr3=LD32(r3);
+  r3=0xf0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr4);
+  r4-=4u;STQ(r4,fr5);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  r4+=0x20u;
+  r0=r4;
+  { {uint32_t v=LD32(r15);r15+=4;r13=v;}  }
+} }
   { r13=r0; goto L8c034a50; }
 L8c034900:;
   r0=LD32(gbr_+28);
@@ -2240,7 +3440,67 @@ L8c034980:;
 L8c0349b0:;
   r0=0x40u;
   r5=LD32(r15+r0);
-  { pr_=0x8c0349b8u; r4=LD32(r15+52); {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c03525eu);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c0349b8u; r4=LD32(r15+52); { /* inl f_8c03525e */ GEOM_INL_ENTER(2, 0x8C03525E);
+  {uint32_t v=r14;r15-=4;STQ(r15,v);}
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r15+=0xfffffffcu;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r0=LD32(gbr_+0);
+  r3<<=2;
+  t_=r3>>31;r3<<=1;
+  r6=r0;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r5);r5+=2;r3=(uint32_t)v;}
+  r7=r0;
+  r14=r0;
+  r2=(int32_t)(int16_t)LD16(r5);
+  r3<<=2;
+  r5=0x8c140d34u;
+  t_=r3>>31;r3<<=1;
+  r2<<=2;
+  t_=r2>>31;r2<<=1;
+  r7+=r2;
+  STQ(r5,r7);
+  r14+=r3;
+  {uint32_t v=r14;r5-=4;STQ(r5,v);}
+  {uint32_t v=r6;r5-=4;STQ(r5,v);}
+  r0=LD32(gbr_+52);
+  r3=(int32_t)(int16_t)LD16(r4);
+  r5=r0;
+  r1=r0;
+  r3<<=2;
+  r7=r0;
+  r5+=r3;
+  r0=LD32(gbr_+56);
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r12=r0;
+  r14=r0;
+  r6=r0;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r3<<=2;
+  r6+=r3;
+  {int32_t v=(int16_t)LD16(r4);r4+=2;r3=(uint32_t)v;}
+  r2<<=2;
+  r7+=r2;
+  r2=(int32_t)(int16_t)LD16(r4);
+  r4=0x8c140d14u;
+  r3<<=2;
+  r2<<=2;
+  r1+=r2;
+  STQ(r15,r2);
+  STQ(r4,r1);
+  r12+=r2;
+  {uint32_t v=r7;r4-=4;STQ(r4,v);}
+  r14+=r3;
+  {uint32_t v=r5;r4-=4;STQ(r4,v);}
+  r4=0x8c140d24u;
+  STQ(r4,r12);
+  {uint32_t v=r14;r4-=4;STQ(r4,v);}
+  {uint32_t v=r6;r4-=4;STQ(r4,v);}
+  r15+=0x4u;
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  { {uint32_t v=LD32(r15);r15+=4;r14=v;}  }
+} }
   r2=LD32(r10);
   r13-=r9;
   r4=0x7u;
@@ -2311,7 +3571,91 @@ L8c0349b0:;
   { pr_=0x8c034a46u; r4=r9; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0d1880u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
   sh4_pref(c,r14);
   r14+=0x20u;
-  { pr_=0x8c034a4eu; r4=r14; {c->r[0]=r0;c->r[1]=r1;c->r[2]=r2;c->r[3]=r3;c->r[4]=r4;c->r[5]=r5;c->r[6]=r6;c->r[7]=r7;c->r[8]=r8;c->r[9]=r9;c->r[10]=r10;c->r[11]=r11;c->r[12]=r12;c->r[13]=r13;c->r[14]=r14;c->r[15]=r15;c->fr[1]=fr1;c->fr[2]=fr2;c->fr[3]=fr3;c->fr[4]=fr4;c->fr[5]=fr5;c->t=t_;c->pr=pr_; sh4_call(c,0x8c0352d6u);r0=c->r[0];r1=c->r[1];r2=c->r[2];r3=c->r[3];r4=c->r[4];r5=c->r[5];r6=c->r[6];r7=c->r[7];r8=c->r[8];r9=c->r[9];r10=c->r[10];r11=c->r[11];r12=c->r[12];r13=c->r[13];r14=c->r[14];r15=c->r[15];fr1=c->fr[1];fr2=c->fr[2];fr3=c->fr[3];fr4=c->fr[4];fr5=c->fr[5];t_=c->t;pr_=c->pr;} }
+  { pr_=0x8c034a4eu; r4=r14; { /* inl f_8c0352d6 */ GEOM_INL_ENTER(0, 0x8C0352D6);
+  {uint32_t v=r13;r15-=4;STQ(r15,v);}
+  r4+=0x20u;
+  {uint32_t v=r12;r15-=4;STQ(r15,v);}
+  r0=0x4u;
+  r12=0x8c140d1cu;
+  r13=0x8c140d0cu;
+  r3=LD32(r12);
+  r1=0x8c140d2cu;
+  r2=LD32(r3);
+  r7=r1;
+  r6=0x8c140cfcu;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  {uint32_t v=LD32(r7);r7+=4;r3=v;}
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+4);
+  r4+=0x40u;
+  {uint32_t v=LD32(r6);r6+=4;r5=v;}
+  r2=LD32(r3);
+  fr4=LD32(r5);r5+=4u;
+  fr5=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+4);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r7);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r7);
+  fr3=LD32(r3);
+  r3=0xe0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr5);
+  r4-=4u;STQ(r4,fr4);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  r3=LD32(r12+8);
+  r4+=0x40u;
+  r5=LD32(r6);
+  r6=r1;
+  r2=LD32(r3);
+  r6+=0x8u;
+  fr5=LD32(r5);r5+=4u;
+  fr4=LD32(r5);r5+=4u;
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r13+8);
+  r2=LD32(r3);
+  {uint32_t v=r2;r4-=4;STQ(r4,v);}
+  r3=LD32(r6);
+  fr3=LD32(r0+r3);
+  r4-=4u;STQ(r4,fr3);
+  r3=LD32(r6);
+  fr3=LD32(r3);
+  r3=0xf0000000u;
+  r4-=4u;STQ(r4,fr3);
+  fr3=LD32(r5);
+  r4-=4u;STQ(r4,fr3);
+  r4-=4u;STQ(r4,fr4);
+  r4-=4u;STQ(r4,fr5);
+  {uint32_t v=r3;r4-=4;STQ(r4,v);}
+  sh4_pref(c,r4);
+  {uint32_t v=LD32(r15);r15+=4;r12=v;}
+  r4+=0x20u;
+  r0=r4;
+  { {uint32_t v=LD32(r15);r15+=4;r13=v;}  }
+} }
   r13=r0;
 L8c034a50:;
   r0=0x64u;
@@ -2396,6 +3740,7 @@ static const char *chk_names[10] = { "f_8c0352d6", "f_8c035228", "f_8c03525e", "
 static const uint32_t chk_addrs[10] = { 0x8C0352D6U, 0x8C035228U, 0x8C03525EU, 0x8C035780U, 0x8C035F40U, 0x8C035920U, 0x8C0353C0U, 0x8C035BE0U, 0x8C034480U, 0x8C0E3E90U };
 static unsigned long chk_every, chk_seq;
 static int chk_mode;                 /* 0 = top level, 1 = running the original (nested hooked calls take their original too), 2 = running the hooks */
+static void chk_inl_enter(int i) { if (chk_mode == 2) chk_st[i].nested++; }
 static unsigned long chk_pref_total;
 static hle_pref_fn chk_real_pref;
 static double now_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
