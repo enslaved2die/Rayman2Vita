@@ -212,7 +212,11 @@ SH4_INLINE uint32_t fout(SH4Ctx *c, float f) { return fz(c, f2u(f)); }
 #endif
 /* SH-4 default NaN for invalid operations (0/0, inf-inf, 0*inf, sqrt(<0)): 0x7FBFFFFF (single), 0x7FF7FFFFFFFFFFFF (double) */
 SH4_INLINE int isnan32(uint32_t b) { return (b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu); }
+#if defined(SH4_FASTFP) && !defined(R2_STRICT_NAN)
+SH4_INLINE uint32_t nanfix(uint32_t r, uint32_t a, uint32_t b) { (void)a; (void)b; return r; }
+#else
 SH4_INLINE uint32_t nanfix(uint32_t r, uint32_t a, uint32_t b) { return (isnan32(r) && !isnan32(a) && !isnan32(b)) ? 0x7FBFFFFFu : r; }
+#endif
 SH4_INLINE uint32_t fp_sz(SH4Ctx *c) { return (c->fpscr & SH4_FPSCR_SZ) ? 8 : 4; }
 SH4_INLINE double  fp_getd(SH4Ctx *c, int n) { return u2d(c->fr[n & 14], c->fr[(n & 14) + 1]); }
 SH4_INLINE void    fp_setd(SH4Ctx *c, int n, double d) { uint64_t x; memcpy(&x, &d, 8); c->fr[n & 14] = (uint32_t)(x >> 32); c->fr[(n & 14) + 1] = (uint32_t)x; }
