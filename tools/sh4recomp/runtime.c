@@ -48,11 +48,13 @@ __attribute__((destructor)) static void io_hist_dump(void) {
 #define IO_HIST(a, s, w) ((void)0)
 #endif
 uint8_t sh4_sq_buf[64 + 8];                          /* +8: an unaligned access at offset 63 stays inside the array */
+uint32_t sh4_qacr[2];                                /* QACR0 (0xFF000038) / QACR1 (0xFF00003C) */
 uint32_t sh4_io_read(uint32_t a, int size) {
 #ifdef R2_FASTCHK_SUB
     if (SH4_FAST(a)) { uint32_t v = 0; memcpy(&v, &sh4_ram[a & 0xFFFFFFu], (size_t)size); return v; }      /* 0xAC.. mirror of RAM (the inline fast path only takes 0x8C..) */
 #endif
     if (SH4_LIKELY((a & 0xFC000000u) == 0xE0000000u)) { uint32_t v = 0; memcpy(&v, sh4_sq_buf + (a & 0x3F), (size_t)size); return v; }
+    if ((a & 0xFFFFFFFBu) == 0xFF000038u) return sh4_qacr[(a >> 2) & 1];
     sh4_stat_unmapped++; sh4_stat_io_rd++; IO_HIST(a, size, 0);
     if (sh4_io_read_hook) return sh4_io_read_hook(a, size);
     sh4_fault_handler("unmapped read", a, size); return 0;
@@ -66,6 +68,7 @@ void sh4_io_write(uint32_t a, int size, uint32_t v) {
         if (size == 4) memcpy(d, &v, 4); else if (size == 2) memcpy(d, &v, 2); else *d = (uint8_t)v;
         return;
     }
+    if (SH4_LIKELY((a & 0xFFFFFFFBu) == 0xFF000038u)) { sh4_qacr[(a >> 2) & 1] = v; return; }
     sh4_stat_unmapped++; sh4_stat_io_wr++; IO_HIST(a, size, 1);
     if (sh4_io_write_hook) { sh4_io_write_hook(a, size, v); return; }
     sh4_fault_handler("unmapped write", a, v);

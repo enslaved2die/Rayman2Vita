@@ -197,7 +197,8 @@ static uint32_t norm(uint32_t a) { return (a >= 0xE0000000u) ? a : (a & 0x1FFFFF
  * a plain array load.  pal_epoch / fog_epoch change only when a palette-relevant resp. fog-relevant register word really changes value. */
 #define PVR_BASE 0x005F8000u
 #define PVR_WORDS 2048u
-static uint32_t pvr_regs[PVR_WORDS], qacr_v[2], pal_epoch = 1, fog_epoch = 1;
+static uint32_t pvr_regs[PVR_WORDS], pal_epoch = 1, fog_epoch = 1;
+#define qacr_v sh4_qacr
 static inline void flat_store(uint32_t k, uint32_t v) {            /* k = normalised word address; mirror a RegEnt value */
     uint32_t i = (k - PVR_BASE) >> 2;
     if (k - PVR_BASE < PVR_WORDS * 4u) {
@@ -206,8 +207,8 @@ static inline void flat_store(uint32_t k, uint32_t v) {            /* k = normal
             if (k >= 0x005F9000u || k == 0x005F8108u || k == 0x005F80E4u) pal_epoch++;     /* palette RAM, PAL_RAM_CTRL, TEXT_CONTROL */
             else if ((k >= 0x005F8200u && k < 0x005F8400u) || (k >= 0x005F80B0u && k <= 0x005F80C0u)) fog_epoch++;   /* fog table, FOG_COL_RAM/VERT/DENSITY/CLAMP */
         }
-    } else if (k == 0xFF000038u) qacr_v[0] = v;
-    else if (k == 0xFF00003Cu) qacr_v[1] = v;
+    } else if (k == 0xFF000038u) sh4_qacr[0] = v;
+    else if (k == 0xFF00003Cu) sh4_qacr[1] = v;
 }
 const uint32_t *hle_pvr_regs(void) { return pvr_regs; }
 uint32_t hle_pvr_pal_epoch(void) { return pal_epoch; }
@@ -215,8 +216,8 @@ uint32_t hle_pvr_fog_epoch(void) { return fog_epoch; }
 uint32_t hle_reg_get(uint32_t addr) {
     uint32_t k = norm(addr) & ~3u;
     if (k - PVR_BASE < PVR_WORDS * 4u) return pvr_regs[(k - PVR_BASE) >> 2];
-    if (k == 0xFF000038u) return qacr_v[0];
-    if (k == 0xFF00003Cu) return qacr_v[1];
+    if (k == 0xFF000038u) return sh4_qacr[0];
+    if (k == 0xFF00003Cu) return sh4_qacr[1];
     return reg_slot(k)->val;
 }
 void hle_reg_set(uint32_t addr, uint32_t v) { uint32_t k = norm(addr) & ~3u; reg_slot(k)->val = v; flat_store(k, v); }
@@ -264,16 +265,17 @@ static uint8_t vram[8 << 20], waveram[2 << 20];
  * 32-bit offset = (A&3) | ((A&0x7FFFF8)>>1) | (((A>>2)&1)<<22). Kamui's texture upload (CPU stores to 0xA5xxxxxx) lands here. */
 static uint32_t vram_off(uint32_t k) { uint32_t o = k & 0x7FFFFF; if ((k >> 24) == 5) o = (o & 3) | ((o & 0x7FFFF8) >> 1) | (((o >> 2) & 1) << 22); return o; }
 uint8_t *hle_vram_ptr(void) { return vram; }
-/* VRAM dirty-page epochs (texture-cache validity).  One stamp per 4 KiB page of the 8 MiB image.  Every write that changes bytes of vram[] stamps the pages it touches with the
- * current epoch (vram_stamp); writes into the frame-buffer shadow (fbshadow, see below) do not touch vram[] and therefore never stamp.  hle_vram_max_epoch() returns the newest
- * stamp over a byte range and then opens a new epoch, so any later write gets a strictly larger stamp: a cached texture whose recorded value still equals the current max over its
- * pages has not been written since (O(1), no hashing). Only the guest thread writes VRAM and queries (the renderer runs synchronously at STARTRENDER). */
+/* VRAM dirty-page epochs (texture-cache validity).  One stamp per 4 KiB page of the 8 MiB image.  Every write that changes bytes of vram[] advances vram_cur_epoch and stamps
+ * the pages it touches (vram_stamp); writes into the frame-buffer shadow (fbshadow, see below) do not touch vram[] and therefore never stamp.  hle_vram_max_epoch() is a pure
+ * read-only query that returns the newest stamp over a byte range: a cached texture whose recorded value still equals the current max over its pages has not been written since
+ * (O(pages), no hashing, and vram_cur_epoch does not advance on read). Only the guest thread writes VRAM and queries (the renderer runs synchronously at STARTRENDER). */
 #define VRAM_PAGES 2048u
 static uint32_t vram_pg_epoch[VRAM_PAGES], vram_cur_epoch = 1;
 static inline void vram_stamp(uint32_t off, uint32_t len) {
     if (!len || off >= (8u << 20)) return;
+    uint32_t e = ++vram_cur_epoch;
     uint32_t p0 = off >> 12, p1 = (off + len - 1) >> 12; if (p1 >= VRAM_PAGES) p1 = VRAM_PAGES - 1;
-    for (uint32_t p = p0; p <= p1; p++) vram_pg_epoch[p] = vram_cur_epoch;
+    for (uint32_t p = p0; p <= p1; p++) vram_pg_epoch[p] = e;
 }
 uint32_t hle_vram_max_epoch(uint32_t off, uint32_t len) {
     uint32_t m = 0;
@@ -281,7 +283,6 @@ uint32_t hle_vram_max_epoch(uint32_t off, uint32_t len) {
         uint32_t p0 = off >> 12, p1 = (off + len - 1) >> 12; if (p1 >= VRAM_PAGES) p1 = VRAM_PAGES - 1;
         for (uint32_t p = p0; p <= p1; p++) if (vram_pg_epoch[p] > m) m = vram_pg_epoch[p];
     }
-    vram_cur_epoch++;
     return m;
 }
 /* Frame-buffer regions.  The PVR renders into / scans out of FB_W_SOFn / FB_R_SOFn (64-bit-area byte offsets), and we never render into VRAM (the TA stream is drawn by the host
@@ -372,6 +373,7 @@ static uint32_t def_read(uint32_t a, int size) {
           static unsigned long cnt; if ((++cnt & 0xFFFFF) == 0) for (int j = 0; j < nt; j++) fprintf(stderr, "[tcnt] pr=%08x n=%lu\n", t[j].pr, t[j].n); }
 #endif
         v = tmu_tcnt0(); break;                                       /* TCNT0 */
+    case 0xFF000038u: case 0xFF00003Cu: v = sh4_qacr[(k >> 2) & 1]; break;
     case 0xFF800030u: v = 0x300 | (r->val & ~0x300u); break;                        /* PDTRA: cable type 3 = composite/NTSC */
     case 0x005F810Cu: v = spg_status(); break;                                      /* SPG_STATUS */
     case 0x005F6904u: v = 0; break;                                                 /* ISTEXT: no external (GD-ROM/AICA/modem) interrupts raised
