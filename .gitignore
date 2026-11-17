@@ -67,3 +67,6 @@ re_analysis/flycast_ref/*.png
 # Reverse-engineering / decode notes - kept local only
 re_analysis/
 tools/DC_LEVEL_FORMAT.md
+docs/NATIVE_ENGINE.md
+docs/ALPHA_BLENDING_PLAN.md
+HD_Texture_Plan.md
