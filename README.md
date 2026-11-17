@@ -11,7 +11,7 @@ The Dreamcast release is the primary baseline and the PC release is secondary re
 > - **Native CPA engine (`src/cpa/`): experimental, opt-in.** It is a clean-room rewrite that is
 >   switched on by an empty `ux0:data/rayman2/NATIVE_GFX` file. It is not complete. It renders
 >   decoded level geometry and the player model, but gameplay, physics, AI, collision, and menus
->   are not implemented. [Plan.md](Plan.md) tracks this path.
+>   are not implemented.
 
 > Rayman 2 and all of its assets belong to Ubisoft. **This repository contains no game data.**
 > You need your own legally obtained copy of the Dreamcast disc (GD-ROM image).
@@ -238,7 +238,6 @@ step 4 (index) and before copying the folder to the Vita. Skip them to keep the 
 | `tools/VitaDebugger/` | Debugger tooling for the Vita |
 | `extras/` | Optional add-ons (PlayStation button prompts) |
 | `sce_sys/` | Vita LiveArea and package metadata |
-| `Plan.md` | Status and plan for the native engine |
 
 Git-ignored, created locally: `ISOs/`, `assets/`, `extracted_textures/`, `upscaled_textures/`,
 `build_vita_*/`, `build/`.
