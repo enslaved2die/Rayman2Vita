@@ -7,7 +7,7 @@ The Dreamcast release is the primary baseline and the PC release is secondary re
 >
 > - **Default build (`Rayman2_Recomp.vpk`): the full game.** It runs the original Dreamcast
 >   executable through the SH-4 recompiler and a high-level emulation layer (`tools/sh4recomp/`).
->   [docs/NATIVE_ENGINE.md](docs/NATIVE_ENGINE.md) records this path as playable on the Vita.
+>   It is playable on the Vita.
 > - **Native CPA engine (`src/cpa/`): experimental, opt-in.** It is a clean-room rewrite that is
 >   switched on by an empty `ux0:data/rayman2/NATIVE_GFX` file. It is not complete. It renders
 >   decoded level geometry and the player model, but gameplay, physics, AI, collision, and menus
@@ -211,8 +211,15 @@ ux0:data/rayman2/upscaled_textures/
 
 The engine also searches `ux0:data/rayman2/textures/`.
 
-**Status:** HD texture loading is not yet measured on hardware. See the
-[HD texture plan](HD_Texture_Plan.md) for the open phases.
+**Status:** HD texture loading is not yet measured on hardware.
+
+### Optional: PlayStation button prompts
+
+[extras/ps_buttons/FIX/](extras/ps_buttons/FIX/) holds replacement button icons for the
+in-game prompts (`s_padx_aaa.png`, `s_pady_aaa.png`, `s_padb_aaa.png`, `s_pada_aaa.png`).
+They are optional. To use them, copy the four PNGs into `upscaled_textures/FIX/` before
+step 4 (index) and before copying the folder to the Vita. Skip them to keep the original icons.
+`upscale_alpha_helper.py` leaves button prompts alone, so upscaling will not overwrite them.
 
 ---
 
@@ -226,9 +233,9 @@ The engine also searches `ux0:data/rayman2/textures/`.
 | `tools/vita/` | Data staging for the Vita (`stage_data.sh`) |
 | `tools/sh4recomp/` | SH-4 to ARM recompilation pipeline and HLE tests |
 | `tools/VitaDebugger/` | Debugger tooling for the Vita |
-| `docs/` | Design notes |
+| `extras/` | Optional add-ons (PlayStation button prompts) |
 | `sce_sys/` | Vita LiveArea and package metadata |
-| `Plan.md`, `HD_Texture_Plan.md` | Status and plans |
+| `Plan.md` | Status and plan for the native engine |
 
 Git-ignored, created locally: `ISOs/`, `assets/`, `extracted_textures/`, `upscaled_textures/`,
 `build_vita_*/`, `build/`.
