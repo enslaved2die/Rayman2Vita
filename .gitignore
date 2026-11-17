@@ -76,3 +76,9 @@ optimization_plan.md
 AGENTS.md
 Plan.md
 tools/VitaDebugger/
+tools/kubridge/
+tools/ai_ledger.py
+tools/sh4recomp/TESTING.md
+tools/sh4recomp/lift_stats.json
+tools/sh4recomp/lift_stats_fix.json
+tools/sh4recomp/tests_snd/stats_before_after.txt
