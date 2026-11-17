@@ -100,6 +100,13 @@ RENDER_THREAD   ?= 1
 ifeq ($(RENDER_THREAD),0)
 V_DEFS          += -DR2_RENDER_THREAD=0
 endif
+
+# Disable vitaGL boot splashscreen (NO_SPLASHSCREEN=1): avoids startup stalls and Vita3K crashes
+NO_SPLASHSCREEN ?= 1
+ifeq ($(NO_SPLASHSCREEN),1)
+V_DEFS          += -DNO_SPLASHSCREEN=1
+EXTRA_OBJS      += $(BUILD_DIR)/vitagl_nosplash.o
+endif
 # HD texture staging test switch: HD_STAGE_SYNC=1 disables the stager worker thread (loads run on the game thread)
 HD_STAGE_SYNC   ?= 0
 ifeq ($(HD_STAGE_SYNC),1)
@@ -292,6 +299,9 @@ $(BUILD_DIR)/hle_%.o: $(HLE_DIR)/%.c $(HLE_DIR)/hle.h $(HLE_DIR)/hle_priv.h $(RE
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/snd_vita.o: src/platform/vita/snd_vita.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vitagl_nosplash.o: src/platform/vita/vitagl_nosplash.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(ELF): $(ALL_OBJS) $(if $(V_ORDER),$(HOT_ORDER)) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(filter-out %.ld,$^) $(LIBS) -o $@

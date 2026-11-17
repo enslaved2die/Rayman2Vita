@@ -3,9 +3,15 @@
 An in-progress native port of *Rayman 2: The Great Escape* to the PlayStation Vita.
 The Dreamcast release is the primary baseline and the PC release is secondary reference.
 
-> **Not playable yet.** See [Plan.md](Plan.md) for the audited status. The engine boots on
-> the Vita and renders decoded level geometry and the player model. Gameplay, physics, AI,
-> collision, and menus are not implemented.
+> **Two rendering paths, two levels of maturity:**
+>
+> - **Default build (`Rayman2_Recomp.vpk`): the full game.** It runs the original Dreamcast
+>   executable through the SH-4 recompiler and a high-level emulation layer (`tools/sh4recomp/`).
+>   [docs/NATIVE_ENGINE.md](docs/NATIVE_ENGINE.md) records this path as playable on the Vita.
+> - **Native CPA engine (`src/cpa/`): experimental, opt-in.** It is a clean-room rewrite that is
+>   switched on by an empty `ux0:data/rayman2/NATIVE_GFX` file. It is not complete. It renders
+>   decoded level geometry and the player model, but gameplay, physics, AI, collision, and menus
+>   are not implemented. [Plan.md](Plan.md) tracks this path.
 
 > Rayman 2 and all of its assets belong to Ubisoft. **This repository contains no game data.**
 > You need your own legally obtained copy of the Dreamcast disc (GD-ROM image).

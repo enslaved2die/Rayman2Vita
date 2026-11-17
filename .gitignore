@@ -63,3 +63,7 @@ tools/sh4recomp/tests_snd/snd_test
 
 # Emulator screenshots of the original game (copyrighted)
 re_analysis/flycast_ref/*.png
+
+# Reverse-engineering / decode notes - kept local only
+re_analysis/
+tools/DC_LEVEL_FORMAT.md

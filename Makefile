@@ -50,6 +50,13 @@ LIBS            := -lvitaGL \
                    -lstdc++ \
                    -lm
 
+NO_SPLASHSCREEN ?= 1
+ifeq ($(NO_SPLASHSCREEN),1)
+CFLAGS          += -DNO_SPLASHSCREEN=1
+SOURCES         += $(SRC_DIR)/platform/vita/vitagl_nosplash.c
+OBJECTS         += $(BUILD_DIR)/vitagl_nosplash.o
+endif
+
 # Source Files
 SOURCES         := $(SRC_DIR)/main.c \
                    $(SRC_DIR)/engine/cpa_engine.c \
@@ -144,6 +151,9 @@ $(BUILD_DIR)/snd_vita.o: $(SRC_DIR)/platform/vita/snd_vita.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/save_vita.o: $(SRC_DIR)/platform/vita/save_vita.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vitagl_nosplash.o: $(SRC_DIR)/platform/vita/vitagl_nosplash.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/cpa_hd_tex.o: $(SRC_DIR)/cpa/cpa_hd_tex.c | $(BUILD_DIR)
