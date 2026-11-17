@@ -82,12 +82,15 @@ python3 tools/verify_assets.py --root .
 
 ```bash
 source env.sh
-make -f Makefile.vita BUILD_DIR=build_vita_pkg -j
+make -f Makefile.vita BUILD_DIR=build_vita_pkg BUNDLE_1ST_READ=0 -j
 ```
 
 The output is `build_vita_pkg/Rayman2_Recomp.vpk`.
-The VPK holds only the executable, LiveArea art, and `1ST_READ.BIN`. The game data
-is **not** inside it. You copy that separately (section 5).
+With `BUNDLE_1ST_READ=0` the VPK holds only the executable and LiveArea art. It does **not**
+contain `1ST_READ.BIN` or any game data. You copy those separately (section 5).
+(Without that flag the build packs `assets/dc/1ST_READ.BIN` into the VPK. Do not redistribute such a VPK.)
+
+For the lean build used for releases (no profiling instrumentation), add `VARIANT=v10_lean`.
 
 To build a single variant for performance experiments, see `tools/vita_variants.sh`.
 
@@ -128,7 +131,7 @@ The Vita should end up with:
 ux0:data/rayman2/
     DCDATA/            the disc's DCDATA tree (~900 MB)
     ALIASES.TXT
-    1ST_READ.BIN       optional override
+    1ST_READ.BIN       required (from your disc; the VPK does not include it)
     Save/              created automatically
 ```
 

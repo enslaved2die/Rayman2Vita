@@ -238,6 +238,8 @@ LIVEAREA_START  := sce_sys/livearea/contents/startup.png
 LIVEAREA_XML    := sce_sys/livearea/contents/template.xml
 PIC0            := sce_sys/pic0.png
 DC_IMAGE        := assets/dc/1ST_READ.BIN
+# BUNDLE_1ST_READ=0 builds a VPK without Ubisoft's executable (users copy it to ux0:data/rayman2/)
+BUNDLE_1ST_READ ?= 1
 
 .PHONY: all clean stubs vpk elf velf eboot
 
@@ -315,14 +317,14 @@ $(EBOOT): $(VELF)
 $(PARAM_SFO): | $(BUILD_DIR)
 	$(VITA_MKSFOEX) -s TITLE_ID=$(TITLE_ID) -s APP_VER=$(APP_VER) $(APP_TITLE) $@
 
-$(VPK): $(EBOOT) $(PARAM_SFO) $(ICON0) $(LIVEAREA_BG) $(LIVEAREA_START) $(LIVEAREA_XML) $(DC_IMAGE) $(wildcard $(PIC0)) | $(BUILD_DIR)
+$(VPK): $(EBOOT) $(PARAM_SFO) $(ICON0) $(LIVEAREA_BG) $(LIVEAREA_START) $(LIVEAREA_XML) $(wildcard $(PIC0)) $(if $(filter 1,$(BUNDLE_1ST_READ)),$(DC_IMAGE)) | $(BUILD_DIR)
 	$(VITA_PACK_VPK) -s $(PARAM_SFO) -b $(EBOOT) \
 		-a $(ICON0)=sce_sys/icon0.png \
 		-a $(LIVEAREA_BG)=sce_sys/livearea/contents/bg.png \
 		-a $(LIVEAREA_START)=sce_sys/livearea/contents/startup.png \
 		-a $(LIVEAREA_XML)=sce_sys/livearea/contents/template.xml \
 		$(if $(wildcard $(PIC0)),-a $(PIC0)=sce_sys/pic0.png) \
-		-a $(DC_IMAGE)=1ST_READ.BIN \
+		$(if $(filter 1,$(BUNDLE_1ST_READ)),-a $(DC_IMAGE)=1ST_READ.BIN) \
 		$@
 	@echo "=========================================================="
 	@echo "SUCCESS: Built $(VPK)"
