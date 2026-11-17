@@ -235,7 +235,6 @@ step 4 (index) and before copying the folder to the Vita. Skip them to keep the 
 | `tools/` | Extraction, texture, HD, and verification tools |
 | `tools/vita/` | Data staging for the Vita (`stage_data.sh`) |
 | `tools/sh4recomp/` | SH-4 to ARM recompilation pipeline and HLE tests |
-| `tools/VitaDebugger/` | Debugger tooling for the Vita |
 | `extras/` | Optional add-ons (PlayStation button prompts) |
 | `sce_sys/` | Vita LiveArea and package metadata |
 
